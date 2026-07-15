@@ -1,10 +1,62 @@
 import { execFile } from "node:child_process";
-import { closeSync, fstatSync, openSync, readSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  copyFileSync,
+  fstatSync,
+  openSync,
+  readSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+} from "node:fs";
 import { promisify } from "node:util";
 
 import { z } from "zod";
 
 const execFileAsync = promisify(execFile);
+
+export interface MoveFileOperations {
+  readonly rename: (source: string, destination: string) => void;
+  readonly copy: (source: string, destination: string) => void;
+  readonly unlink: (path: string) => void;
+  readonly remove: (path: string) => void;
+}
+
+const defaultMoveFileOperations: MoveFileOperations = {
+  rename: renameSync,
+  copy: copyFileSync,
+  unlink: unlinkSync,
+  remove: (path) => rmSync(path, { force: true }),
+};
+
+/**
+ * Move a file without exposing a partially copied destination. Docker bind
+ * mounts can share the same host filesystem while still returning EXDEV, so
+ * callers must not rely on rename(2) alone.
+ */
+export function moveFile(
+  source: string,
+  destination: string,
+  operations: MoveFileOperations = defaultMoveFileOperations,
+): void {
+  try {
+    operations.rename(source, destination);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+  }
+
+  const temporary = `${destination}.${randomUUID()}.tmp`;
+  try {
+    operations.copy(source, temporary);
+    operations.rename(temporary, destination);
+    operations.unlink(source);
+  } catch (error) {
+    operations.remove(temporary);
+    throw error;
+  }
+}
 
 const streamSchema = z.object({
   codec_type: z.enum(["video", "audio", "subtitle"]).or(z.string()),

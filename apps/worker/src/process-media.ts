@@ -1,7 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
-  copyFileSync,
   createReadStream,
   mkdirSync,
   renameSync,
@@ -13,7 +12,7 @@ import {
 import { basename, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
-import { probeFile } from "@simplewatch/media";
+import { moveFile, probeFile } from "@simplewatch/media";
 
 const execFileAsync = promisify(execFile);
 
@@ -137,43 +136,6 @@ export async function remuxForBrowser(
     maxBuffer: 4 * 1024 * 1024,
     windowsHide: true,
   });
-}
-
-interface MoveOperations {
-  readonly rename: (source: string, destination: string) => void;
-  readonly copy: (source: string, destination: string) => void;
-  readonly unlink: (path: string) => void;
-  readonly remove: (path: string) => void;
-}
-
-const defaultMoveOperations: MoveOperations = {
-  rename: renameSync,
-  copy: copyFileSync,
-  unlink: unlinkSync,
-  remove: (path) => rmSync(path, { force: true }),
-};
-
-export function moveFile(
-  source: string,
-  destination: string,
-  operations: MoveOperations = defaultMoveOperations,
-) {
-  try {
-    operations.rename(source, destination);
-    return;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
-  }
-
-  const temporary = `${destination}.${randomUUID()}.tmp`;
-  try {
-    operations.copy(source, temporary);
-    operations.rename(temporary, destination);
-    operations.unlink(source);
-  } catch (error) {
-    operations.remove(temporary);
-    throw error;
-  }
 }
 
 export function processSubtitleJob(

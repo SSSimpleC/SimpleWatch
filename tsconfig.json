@@ -10,6 +10,7 @@
     "playwright.rtc.config.ts",
     "playwright.revocation.config.ts",
     "playwright.fullstack.config.ts",
+    "playwright.focused.config.ts",
     "playwright.server.config.ts",
     "vitest.coverage.config.ts",
     "tests/**/*.ts"

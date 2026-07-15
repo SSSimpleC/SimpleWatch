@@ -585,6 +585,21 @@ input {
   font-size: 0.7rem;
   line-height: 1.6;
 }
+.high-load-warning {
+  display: grid;
+  grid-template-columns: auto auto minmax(16rem, 1fr);
+  gap: 0.5rem 1rem;
+  align-items: baseline;
+  border-left-color: var(--rust);
+  background: linear-gradient(90deg, #2b1712, #17130f);
+}
+.high-load-warning strong {
+  color: #f0aa70;
+  letter-spacing: 0.08em;
+}
+.high-load-warning span:last-child {
+  color: var(--muted);
+}
 .blank-screen {
   display: grid;
   place-content: center;
@@ -603,11 +618,42 @@ input {
   display: flex;
   gap: 0.5rem;
   padding-top: 0.8rem;
+  align-items: center;
+  flex-wrap: wrap;
 }
 .transport-bar button,
 .transport-bar select {
   padding: 0.7rem 0.9rem;
   font-size: 0.7rem;
+}
+.playback-scrubber {
+  display: grid;
+  grid-template-columns: minmax(10rem, 1fr) auto;
+  gap: 0.65rem;
+  align-items: center;
+  flex: 1 1 20rem;
+  min-width: 14rem;
+  padding: 0 0.35rem;
+}
+.playback-scrubber input[type="range"] {
+  width: 100%;
+  accent-color: var(--rust);
+  background: linear-gradient(
+    90deg,
+    var(--rust) 0 var(--playhead-percent),
+    #6a6257 var(--playhead-percent) var(--buffered-percent),
+    #29251f var(--buffered-percent) 100%
+  );
+}
+.playback-scrubber input:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+.playback-scrubber output {
+  min-width: 6.2rem;
+  color: #c9bda9;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 .local-mix,
 .host-controls {
@@ -691,6 +737,30 @@ input {
 }
 .obs-preset span {
   line-height: 1.5;
+}
+.obs-audio-checklist {
+  display: grid;
+  gap: 0.3rem;
+  padding: 0.8rem;
+  border: 1px solid #6f3828;
+  background: #261712;
+  color: #d4c1b2;
+}
+.obs-audio-checklist strong {
+  color: #efa071;
+}
+.live-track-status {
+  color: #a9c9df;
+  font-family: var(--mono);
+  letter-spacing: 0.06em;
+}
+@media (max-width: 760px) {
+  .high-load-warning {
+    grid-template-columns: 1fr;
+  }
+  .transport-bar > select {
+    margin-left: 0;
+  }
 }
 .transport-bar select {
   margin-left: auto;

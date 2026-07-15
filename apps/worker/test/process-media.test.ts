@@ -9,12 +9,8 @@ import { join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import {
-  moveFile,
-  processProbeJob,
-  processSubtitleJob,
-} from "../src/process-media.js";
-import { probeFile } from "@simplewatch/media";
+import { processProbeJob, processSubtitleJob } from "../src/process-media.js";
+import { moveFile, probeFile } from "@simplewatch/media";
 
 const roots: string[] = [];
 

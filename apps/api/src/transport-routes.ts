@@ -120,14 +120,19 @@ export function registerTransportRoutes(
             token: z.string().optional(),
             action: z.string().min(1),
             path: z.string(),
-            id: z.string().optional(),
+            // MediaMTX sends null before a WebRTC session id exists. Rejecting
+            // that protocol phase causes needless authentication retries.
+            id: z.string().nullish(),
           })
           .passthrough(),
         response: { 204: z.null() },
       },
     },
     async (request, reply) => {
-      await transportService.authorizeMedia(request.body);
+      await transportService.authorizeMedia({
+        ...request.body,
+        id: request.body.id ?? undefined,
+      });
       reply.status(204);
       return null;
     },

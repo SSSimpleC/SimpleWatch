@@ -197,6 +197,8 @@ export class TransportService {
     readonly state: "offline" | "online" | "unknown";
     readonly hasVideo: boolean;
     readonly hasAudio: boolean;
+    readonly videoTrackCount: number;
+    readonly audioTrackCount: number;
     readonly checkedAt: string;
   }> {
     const checkedAt = new Date(this.now()).toISOString();
@@ -223,6 +225,8 @@ export class TransportService {
           state: "offline",
           hasVideo: false,
           hasAudio: false,
+          videoTrackCount: 0,
+          audioTrackCount: 0,
           checkedAt,
         };
       }
@@ -232,16 +236,31 @@ export class TransportService {
           : JSON.stringify(track)
         ).toLowerCase(),
       );
-      const hasVideo = tracks.some((track) => track.includes("h264"));
-      const hasAudio = tracks.some((track) => track.includes("opus"));
+      const videoTrackCount = tracks.filter((track) =>
+        track.includes("h264"),
+      ).length;
+      const audioTrackCount = tracks.filter((track) =>
+        track.includes("opus"),
+      ).length;
+      const hasVideo = videoTrackCount > 0;
+      const hasAudio = audioTrackCount > 0;
       return {
         state: hasVideo && hasAudio ? "online" : "offline",
         hasVideo,
         hasAudio,
+        videoTrackCount,
+        audioTrackCount,
         checkedAt,
       };
     } catch {
-      return { state: "unknown", hasVideo: false, hasAudio: false, checkedAt };
+      return {
+        state: "unknown",
+        hasVideo: false,
+        hasAudio: false,
+        videoTrackCount: 0,
+        audioTrackCount: 0,
+        checkedAt,
+      };
     }
   }
 

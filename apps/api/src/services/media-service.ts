@@ -1,7 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import {
+  existsSync,
   mkdirSync,
-  renameSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -14,6 +14,7 @@ import { v7 as uuidv7 } from "uuid";
 import type { UploadAuthorizeRequest } from "@simplewatch/contracts";
 import {
   evaluateCompatibility,
+  moveFile,
   sanitizeDisplayName,
   validateWebVtt,
 } from "@simplewatch/media";
@@ -123,10 +124,26 @@ export class MediaService {
     const cutoff = this.now() - 24 * 60 * 60 * 1000;
     const rows = this.database
       .prepare(
-        "SELECT storage_key, trashed_at FROM media WHERE trashed_at IS NOT NULL AND trashed_at <= ?",
+        "SELECT id, storage_key, trashed_at FROM media WHERE trashed_at IS NOT NULL AND trashed_at <= ?",
       )
-      .all(cutoff) as Array<{ storage_key: string; trashed_at: number }>;
+      .all(cutoff) as Array<{
+      id: string;
+      storage_key: string;
+      trashed_at: number;
+    }>;
     for (const row of rows) {
+      const activeReference = this.database
+        .prepare(
+          `SELECT 1 FROM room_state s
+           JOIN rooms r ON r.id = s.room_id
+           WHERE r.status = 'active' AND s.media_id = ?`,
+        )
+        .get(row.id);
+      if (activeReference) continue;
+
+      const subtitles = this.database
+        .prepare("SELECT storage_key FROM subtitles WHERE media_id = ?")
+        .all(row.id) as Array<{ storage_key: string }>;
       rmSync(
         join(this.options.trashRoot, `${row.storage_key}-${row.trashed_at}`),
         {
@@ -134,9 +151,33 @@ export class MediaService {
           force: true,
         },
       );
-      this.database
-        .prepare("DELETE FROM media WHERE storage_key = ?")
-        .run(row.storage_key);
+      rmSync(join(this.options.mediaRoot, row.storage_key), {
+        recursive: true,
+        force: true,
+      });
+      rmSync(join(this.options.inboxRoot, row.storage_key), {
+        recursive: true,
+        force: true,
+      });
+      for (const subtitle of subtitles) {
+        rmSync(join(this.options.subtitleRoot, `${subtitle.storage_key}.vtt`), {
+          force: true,
+        });
+      }
+      this.database.transaction(() => {
+        this.database
+          .prepare(
+            `UPDATE room_state SET media_id = NULL, transport_json = NULL
+             WHERE media_id = ? AND room_id IN (
+               SELECT id FROM rooms WHERE status = 'closed'
+             )`,
+          )
+          .run(row.id);
+        this.database
+          .prepare("DELETE FROM media_jobs WHERE media_id = ?")
+          .run(row.id);
+        this.database.prepare("DELETE FROM media WHERE id = ?").run(row.id);
+      })();
     }
   }
 
@@ -147,21 +188,58 @@ export class MediaService {
   public trashMedia(adminId: string, mediaId: string): void {
     void adminId;
     const row = this.getMediaRow(mediaId);
-    const source = storedFinalPath(row.probe_json);
-    if (source) {
-      const root =
-        row.state === "incompatible"
-          ? this.options.inboxRoot
-          : this.options.mediaRoot;
-      const safeSource = requirePathWithin(source, root);
-      renameSync(
-        safeSource,
-        join(this.options.trashRoot, `${row.storage_key}-${this.now()}`),
+    const activeReference = this.database
+      .prepare(
+        `SELECT 1 FROM room_state s
+         JOIN rooms r ON r.id = s.room_id
+         WHERE r.status = 'active' AND s.media_id = ?`,
+      )
+      .get(row.id);
+    if (activeReference) {
+      throw conflict(
+        "MEDIA_IN_USE",
+        "当前放映室正在使用这条影片，请先换片或关闭房间",
       );
     }
-    this.database
-      .prepare("UPDATE media SET trashed_at = ? WHERE id = ?")
-      .run(this.now(), row.id);
+
+    const trashedAt = this.now();
+    const source = storedFinalPath(row.probe_json);
+    let safeSource: string | null = null;
+    let destination: string | null = null;
+    if (source && existsSync(source)) {
+      safeSource = requirePathWithinAny(source, [
+        this.options.mediaRoot,
+        this.options.inboxRoot,
+        this.options.uploadRoot,
+      ]);
+      destination = join(
+        this.options.trashRoot,
+        `${row.storage_key}-${trashedAt}`,
+      );
+      try {
+        moveFile(safeSource, destination);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        safeSource = null;
+        destination = null;
+      }
+    }
+    try {
+      this.database
+        .prepare("UPDATE media SET trashed_at = ? WHERE id = ?")
+        .run(trashedAt, row.id);
+    } catch (error) {
+      if (safeSource && destination) moveFile(destination, safeSource);
+      throw error;
+    }
+    rmSync(join(this.options.mediaRoot, row.storage_key), {
+      recursive: true,
+      force: true,
+    });
+    rmSync(join(this.options.inboxRoot, row.storage_key), {
+      recursive: true,
+      force: true,
+    });
   }
 
   public rescanMedia(adminId: string, mediaId: string): { jobId: string } {
@@ -972,6 +1050,22 @@ function requirePathWithin(path: string, root: string): string {
     throw new AppError(400, "PATH_OUTSIDE_ROOT", "文件路径超出允许目录");
   }
   return absolute;
+}
+
+function requirePathWithinAny(path: string, roots: string[]): string {
+  for (const root of roots) {
+    try {
+      return requirePathWithin(path, root);
+    } catch (error) {
+      if (
+        error instanceof AppError &&
+        new Set(["PATH_OUTSIDE_ROOT", "INVALID_FILE_PATH"]).has(error.code)
+      )
+        continue;
+      throw error;
+    }
+  }
+  throw new AppError(400, "PATH_OUTSIDE_ROOT", "文件路径超出允许目录");
 }
 
 function safeEqual(left: string, right: string): boolean {

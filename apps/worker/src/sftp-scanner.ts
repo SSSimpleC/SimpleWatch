@@ -3,9 +3,7 @@ import { basename, join, resolve, sep } from "node:path";
 
 import { v7 as uuidv7 } from "uuid";
 
-import { sanitizeDisplayName } from "@simplewatch/media";
-
-import { moveFile } from "./process-media.js";
+import { moveFile, sanitizeDisplayName } from "@simplewatch/media";
 
 interface Observation {
   readonly size: number;

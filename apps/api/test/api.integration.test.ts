@@ -40,6 +40,7 @@ beforeEach(async () => {
     uploadRoot: join(testRoot, "uploads"),
     inboxRoot: join(testRoot, "inbox"),
     subtitleRoot: join(testRoot, "subtitles"),
+    trashRoot: join(testRoot, "trash"),
     tusEndpoint: `${origin}/files/`,
     contentSigningSecret: "test-content-signing-secret-32-bytes",
     internalHookToken: internalToken,
@@ -173,6 +174,19 @@ describe("SimpleWatch API", () => {
     });
     expect(allowed.statusCode).toBe(204);
 
+    const allowedWithoutSessionId = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/internal/mediamtx/auth",
+      headers: { origin },
+      payload: {
+        token: mediaCredential.token,
+        action: "read",
+        path: mediaCredential.path,
+        id: null,
+      },
+    });
+    expect(allowedWithoutSessionId.statusCode).toBe(204);
+
     const wrongPath = await built.app.inject({
       method: "POST",
       url: "/api/v1/internal/mediamtx/auth",
@@ -244,6 +258,8 @@ describe("SimpleWatch API", () => {
       state: "online",
       hasVideo: true,
       hasAudio: true,
+      videoTrackCount: 1,
+      audioTrackCount: 1,
       checkedAt: new Date(fixedNow).toISOString(),
     });
     await expect(
@@ -252,6 +268,8 @@ describe("SimpleWatch API", () => {
       state: "offline",
       hasVideo: false,
       hasAudio: false,
+      videoTrackCount: 0,
+      audioTrackCount: 0,
       checkedAt: new Date(fixedNow).toISOString(),
     });
     await expect(
@@ -260,6 +278,8 @@ describe("SimpleWatch API", () => {
       state: "offline",
       hasVideo: false,
       hasAudio: false,
+      videoTrackCount: 0,
+      audioTrackCount: 0,
       checkedAt: new Date(fixedNow).toISOString(),
     });
     await expect(
@@ -268,6 +288,8 @@ describe("SimpleWatch API", () => {
       state: "unknown",
       hasVideo: false,
       hasAudio: false,
+      videoTrackCount: 0,
+      audioTrackCount: 0,
       checkedAt: new Date(fixedNow).toISOString(),
     });
     await expect(
@@ -276,6 +298,8 @@ describe("SimpleWatch API", () => {
       state: "unknown",
       hasVideo: false,
       hasAudio: false,
+      videoTrackCount: 0,
+      audioTrackCount: 0,
       checkedAt: new Date(fixedNow).toISOString(),
     });
   });
@@ -715,6 +739,161 @@ describe("SimpleWatch API", () => {
     ).toThrowError("房间状态版本已变化");
   });
 
+  it("clamps host seeks to the selected media duration", async () => {
+    const room = await createRoom();
+    const identity = built.roomService.authenticate(
+      cookieValue(room.roomCookie),
+      room.roomId,
+    );
+    const mediaId = insertPublishedMedia("seek-clamp", 90_000);
+    const selected = built.roomService.applyCommand(identity, {
+      commandId: uuidv7(),
+      expectedRevision: 0,
+      effectiveAtServerMs: 0,
+      command: { kind: "select-vod", mediaId },
+    });
+    const seeked = built.roomService.applyCommand(identity, {
+      commandId: uuidv7(),
+      expectedRevision: selected.revision,
+      effectiveAtServerMs: 0,
+      command: { kind: "seek", positionSec: 9_999 },
+    });
+
+    expect(seeked.transport?.positionSec).toBe(90);
+  });
+
+  it("moves media to one timestamped trash entry and compensates database failures", async () => {
+    const admin = await loginAdmin();
+    const mediaId = insertPublishedMedia("delete-success", 1_000);
+    const deleted = await built.app.inject({
+      method: "DELETE",
+      url: `/api/v1/admin/media/${mediaId}`,
+      headers: {
+        cookie: admin.cookie,
+        origin,
+        "x-csrf-token": admin.csrfToken,
+      },
+    });
+    expect(deleted.statusCode).toBe(204);
+    expect(
+      existsSync(join(testRoot, "trash", `delete-success-${fixedNow}`)),
+    ).toBe(true);
+    expect(existsSync(join(testRoot, "media", "delete-success"))).toBe(false);
+    expect(
+      (
+        built.database
+          .prepare("SELECT trashed_at FROM media WHERE id = ?")
+          .get(mediaId) as { trashed_at: number }
+      ).trashed_at,
+    ).toBe(fixedNow);
+
+    const compensatedId = insertPublishedMedia("delete-compensated", 1_000);
+    built.database.exec(`
+      CREATE TRIGGER reject_media_trash
+      BEFORE UPDATE OF trashed_at ON media
+      BEGIN SELECT RAISE(FAIL, 'forced trash failure'); END;
+    `);
+    expect(() => built.mediaService.trashMedia("admin", compensatedId)).toThrow(
+      "forced trash failure",
+    );
+    expect(
+      existsSync(join(testRoot, "media", "delete-compensated", "content.mp4")),
+    ).toBe(true);
+    expect(
+      existsSync(join(testRoot, "trash", `delete-compensated-${fixedNow}`)),
+    ).toBe(false);
+  });
+
+  it("blocks deleting media referenced by an active room", async () => {
+    const room = await createRoom();
+    const admin = await loginAdmin();
+    const mediaId = insertPublishedMedia("active-media", 1_000);
+    built.database
+      .prepare(
+        "UPDATE room_state SET mode = 'vod', media_id = ? WHERE room_id = ?",
+      )
+      .run(mediaId, room.roomId);
+
+    const response = await built.app.inject({
+      method: "DELETE",
+      url: `/api/v1/admin/media/${mediaId}`,
+      headers: {
+        cookie: admin.cookie,
+        origin,
+        "x-csrf-token": admin.csrfToken,
+      },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: { code: "MEDIA_IN_USE" } });
+    expect(
+      existsSync(join(testRoot, "media", "active-media", "content.mp4")),
+    ).toBe(true);
+  });
+
+  it("purges expired trash artifacts and closed-room references after 24 hours", async () => {
+    const room = await createRoom();
+    const mediaId = insertPublishedMedia("expired-media", 1_000);
+    const trashedAt = fixedNow - 24 * 60 * 60 * 1000;
+    const subtitleId = uuidv7();
+    const subtitleKey = "expired-subtitle";
+    built.database
+      .prepare(
+        `INSERT INTO subtitles(id, media_id, storage_key, language, label, format, created_at)
+         VALUES (?, ?, ?, 'zh-CN', '中文', 'webvtt', ?)`,
+      )
+      .run(subtitleId, mediaId, subtitleKey, fixedNow);
+    built.database
+      .prepare(
+        `INSERT INTO media_jobs(
+          id, media_id, kind, state, attempts, not_before,
+          created_at, updated_at, payload_json
+        ) VALUES (?, ?, 'probe', 'completed', 1, ?, ?, ?, '{}')`,
+      )
+      .run(uuidv7(), mediaId, fixedNow, fixedNow, fixedNow);
+    built.database
+      .prepare("UPDATE media SET trashed_at = ? WHERE id = ?")
+      .run(trashedAt, mediaId);
+    built.database
+      .prepare("UPDATE rooms SET status = 'closed', closed_at = ? WHERE id = ?")
+      .run(fixedNow, room.roomId);
+    built.database
+      .prepare("UPDATE room_state SET media_id = ? WHERE room_id = ?")
+      .run(mediaId, room.roomId);
+    rmSync(join(testRoot, "media", "expired-media"), {
+      recursive: true,
+      force: true,
+    });
+    const trashDirectory = join(
+      testRoot,
+      "trash",
+      `expired-media-${trashedAt}`,
+    );
+    mkdirSync(trashDirectory, { recursive: true });
+    writeFileSync(join(trashDirectory, "content.mp4"), "test");
+    writeFileSync(
+      join(testRoot, "subtitles", `${subtitleKey}.vtt`),
+      "WEBVTT\n",
+    );
+
+    built.mediaService.listMedia();
+
+    expect(
+      built.database.prepare("SELECT id FROM media WHERE id = ?").get(mediaId),
+    ).toBeUndefined();
+    expect(
+      (
+        built.database
+          .prepare("SELECT media_id FROM room_state WHERE room_id = ?")
+          .get(room.roomId) as { media_id: string | null }
+      ).media_id,
+    ).toBeNull();
+    expect(existsSync(trashDirectory)).toBe(false);
+    expect(existsSync(join(testRoot, "subtitles", `${subtitleKey}.vtt`))).toBe(
+      false,
+    );
+  });
+
   it("immediately revokes a member kicked by the host", async () => {
     const room = await createRoom();
     const hostBootstrap = await built.app.inject({
@@ -883,7 +1062,7 @@ describe("SimpleWatch API", () => {
       .prepare(
         "SELECT closed_at FROM media_transport_sessions WHERE mediamtx_session_id = ?",
       )
-      .get("host-media-session") as { closed_at: number | null };
+      .get("member-media-session") as { closed_at: number | null };
     expect(completedCount.count).toBe(2);
     expect(closedMediaSession.closed_at).toBe(fixedNow);
   });
@@ -1097,7 +1276,7 @@ describe("SimpleWatch API", () => {
     const sftpRoot = join(testRoot, "sftp-incoming");
     const trashRoot = join(testRoot, "trash");
     mkdirSync(sftpRoot);
-    mkdirSync(trashRoot);
+    mkdirSync(trashRoot, { recursive: true });
     writeFileSync(join(sftpRoot, "uploading.part"), "sftp");
     writeFileSync(join(trashRoot, "trashed.mp4"), "trash");
 
@@ -1221,6 +1400,38 @@ async function createRoom(): Promise<{ roomId: string; roomCookie: string }> {
     roomId: response.json<{ room: { id: string } }>().room.id,
     roomCookie: readCookie(response, "sw_room"),
   };
+}
+
+function insertPublishedMedia(storageKey: string, durationMs: number): string {
+  const mediaId = uuidv7();
+  const directory = join(testRoot, "media", storageKey);
+  mkdirSync(directory, { recursive: true });
+  const finalPath = join(directory, "content.mp4");
+  writeFileSync(finalPath, "test");
+  built.database
+    .prepare(
+      `INSERT INTO media(
+        id, storage_key, display_name, state, bytes, sha256, mime,
+        probe_json, duration_ms, created_at, trashed_at, video_codec,
+        playback_support, video_width, video_height, video_fps,
+        video_pixel_format
+      ) VALUES (?, ?, ?, 'published', 4, ?, 'video/mp4', ?, ?, ?, NULL,
+        'h264', 'broad', 1920, 1080, 30, 'yuv420p')`,
+    )
+    .run(
+      mediaId,
+      storageKey,
+      `${storageKey}.mp4`,
+      createHash("sha256").update("test").digest("hex"),
+      JSON.stringify({
+        probe: compatibleH264Probe(),
+        reasons: [],
+        finalPath,
+      }),
+      durationMs,
+      fixedNow,
+    );
+  return mediaId;
 }
 
 function joinRoom(nickname: string) {

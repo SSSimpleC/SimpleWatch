@@ -419,6 +419,8 @@ function registerApiRoutes(
               state: "offline" as const,
               hasVideo: false,
               hasAudio: false,
+              videoTrackCount: 0,
+              audioTrackCount: 0,
               checkedAt: new Date(now()).toISOString(),
             };
       return { ...room, live };
@@ -779,12 +781,10 @@ function registerWebSocketRoute(
         try {
           const raw: unknown = JSON.parse(rawDataToText(data));
           if (isEnvelopeType(raw, "room.hello")) {
-            sendEnvelope(
-              socket,
+            const snapshot = roomService.getSnapshot(identity.roomId);
+            hub.broadcast(
               identity.roomId,
-              "room.snapshot",
-              roomService.getSnapshot(identity.roomId),
-              now,
+              createEnvelope(identity.roomId, "room.snapshot", snapshot, now),
             );
             return;
           }

@@ -17,6 +17,9 @@ export function DiagnosticsPage() {
     userAgent: navigator.userAgent.replace(/\([^)]*\)/g, "(redacted)"),
     roomState:
       sessionStorage.getItem("simplewatch.room-state") ?? "not-connected",
+    programState:
+      sessionStorage.getItem("simplewatch.program-diagnostics") ??
+      "not-playing",
   };
   return (
     <main className="console-shell settings-shell">
@@ -37,6 +40,8 @@ export function DiagnosticsPage() {
           <dd>{report.downlinkMbps ?? "—"} Mbps</dd>
           <dt>房间状态</dt>
           <dd>{report.roomState}</dd>
+          <dt>节目状态</dt>
+          <dd>{report.programState}</dd>
         </dl>
         <button
           onClick={() =>

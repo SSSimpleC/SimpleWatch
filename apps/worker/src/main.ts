@@ -18,6 +18,7 @@ const configSchema = z.object({
   subtitleRoot: z.string().min(1),
   sftpIncomingRoot: z.string().min(1).optional(),
   ffprobePath: z.string().min(1).default("ffprobe"),
+  ffmpegPath: z.string().min(1).default("ffmpeg"),
   livekitInternalUrl: z.url(),
   livekitApiKey: z.string().min(1),
   livekitApiSecret: z.string().min(1),
@@ -44,6 +45,7 @@ const config = configSchema.parse({
   subtitleRoot: process.env.SUBTITLE_ROOT,
   sftpIncomingRoot: process.env.SFTP_INCOMING_ROOT,
   ffprobePath: process.env.FFPROBE_PATH,
+  ffmpegPath: process.env.FFMPEG_PATH,
   livekitInternalUrl: process.env.LIVEKIT_INTERNAL_URL,
   livekitApiKey: process.env.LIVEKIT_API_KEY,
   livekitApiSecret: process.env.LIVEKIT_API_SECRET,
@@ -178,6 +180,7 @@ while (true) {
           subtitleRoot: config.subtitleRoot,
         },
         config.ffprobePath,
+        config.ffmpegPath,
       );
   const resultPath = isSubtitle ? "subtitle-result" : "result";
   const submitted = await callApi(

@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -10,15 +11,17 @@ import { join, resolve } from "node:path";
 
 import { v7 as uuidv7 } from "uuid";
 import { AccessToken } from "livekit-server-sdk";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RawData, WebSocket } from "ws";
 
 import { buildApp, type BuiltApp } from "../src/app.js";
 import { openDatabase } from "../src/database.js";
+import { clearLibraryData } from "../src/services/library-reset-service.js";
 
 const origin = "https://watch.example.test";
 const fixedNow = 1_750_000_000_000;
 const internalToken = "test-internal-service-token-32-bytes";
+const friendInviteToken = "long-fixed-friend-invite-token-32-characters";
 const temporaryRoots: string[] = [];
 let built: BuiltApp;
 let testRoot: string;
@@ -32,6 +35,7 @@ beforeEach(async () => {
     databasePath: join(testRoot, "simplewatch.sqlite3"),
     migrationsPath: resolve("migrations"),
     publicOrigin: origin,
+    friendInviteToken,
     mediaRoot: join(testRoot, "media"),
     uploadRoot: join(testRoot, "uploads"),
     inboxRoot: join(testRoot, "inbox"),
@@ -41,13 +45,11 @@ beforeEach(async () => {
     internalHookToken: internalToken,
     now: () => fixedNow,
   });
-  await built.authService.bootstrapAdmin(
-    "admin",
-    "correct-horse-battery-staple",
-  );
+  await built.authService.bootstrapAdmin("admin", "260713");
 });
 
 afterEach(async () => {
+  vi.unstubAllGlobals();
   await built.app.close();
   for (const path of temporaryRoots.splice(0))
     rmSync(path, { recursive: true, force: true });
@@ -192,6 +194,92 @@ describe("SimpleWatch API", () => {
     expect(publish.json()).toMatchObject({ purpose: "whip" });
   });
 
+  it("reports OBS live state from the MediaMTX control API and fails closed", async () => {
+    const room = await createRoom();
+    const livePath = (
+      built.database
+        .prepare("SELECT live_path FROM room_state WHERE room_id = ?")
+        .get(room.roomId) as { live_path: string }
+    ).live_path;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [
+              null,
+              { name: "another-path", ready: true, source: {} },
+              {
+                name: livePath,
+                ready: true,
+                source: { type: "webRTCSession" },
+                tracks: [{ codec: "H264" }, "Opus"],
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            items: [{ name: livePath, ready: false, tracks: ["H264"] }],
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ items: [{ name: livePath, ready: true }] }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockRejectedValueOnce(new Error("control API unavailable"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      built.transportService.getLiveStatus(room.roomId),
+    ).resolves.toEqual({
+      state: "online",
+      hasVideo: true,
+      hasAudio: true,
+      checkedAt: new Date(fixedNow).toISOString(),
+    });
+    await expect(
+      built.transportService.getLiveStatus(room.roomId),
+    ).resolves.toEqual({
+      state: "offline",
+      hasVideo: false,
+      hasAudio: false,
+      checkedAt: new Date(fixedNow).toISOString(),
+    });
+    await expect(
+      built.transportService.getLiveStatus(room.roomId),
+    ).resolves.toEqual({
+      state: "offline",
+      hasVideo: false,
+      hasAudio: false,
+      checkedAt: new Date(fixedNow).toISOString(),
+    });
+    await expect(
+      built.transportService.getLiveStatus(room.roomId),
+    ).resolves.toEqual({
+      state: "unknown",
+      hasVideo: false,
+      hasAudio: false,
+      checkedAt: new Date(fixedNow).toISOString(),
+    });
+    await expect(
+      built.transportService.getLiveStatus(room.roomId),
+    ).resolves.toEqual({
+      state: "unknown",
+      hasVideo: false,
+      hasAudio: false,
+      checkedAt: new Date(fixedNow).toISOString(),
+    });
+  });
+
   it("registers only SFTP files already moved into the inbox", async () => {
     const inboxPath = join(testRoot, "inbox", "stable-movie.mp4");
     writeFileSync(inboxPath, "test");
@@ -299,6 +387,53 @@ describe("SimpleWatch API", () => {
     ).toBe(upload.uploadId);
   });
 
+  it("cancels one active upload and removes its temporary bytes idempotently", async () => {
+    const admin = await loginAdmin();
+    const authorize = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/uploads/authorize",
+      headers: {
+        cookie: admin.cookie,
+        origin,
+        "x-csrf-token": admin.csrfToken,
+      },
+      payload: { filename: "cancel.mp4", bytes: 8, mime: "video/mp4" },
+    });
+    const upload = authorize.json<{ uploadId: string; uploadToken: string }>();
+    writeFileSync(join(testRoot, "uploads", upload.uploadId), "partial");
+    writeFileSync(join(testRoot, "uploads", `${upload.uploadId}.info`), "{}");
+
+    const cancelled = await built.app.inject({
+      method: "DELETE",
+      url: `/api/v1/uploads/${upload.uploadId}`,
+      headers: {
+        cookie: admin.cookie,
+        origin,
+        "x-csrf-token": admin.csrfToken,
+      },
+    });
+    expect(cancelled.statusCode).toBe(204);
+    expect(existsSync(join(testRoot, "uploads", upload.uploadId))).toBe(false);
+    expect(
+      existsSync(join(testRoot, "uploads", `${upload.uploadId}.info`)),
+    ).toBe(false);
+    const row = built.database
+      .prepare("SELECT state, reserved_bytes FROM uploads WHERE id = ?")
+      .get(upload.uploadId) as { state: string; reserved_bytes: number };
+    expect(row).toEqual({ state: "cancelled", reserved_bytes: 0 });
+
+    const repeated = await built.app.inject({
+      method: "DELETE",
+      url: `/api/v1/uploads/${upload.uploadId}`,
+      headers: {
+        cookie: admin.cookie,
+        origin,
+        "x-csrf-token": admin.csrfToken,
+      },
+    });
+    expect(repeated.statusCode).toBe(204);
+  });
+
   it("authorizes, probes, publishes, and protects uploaded media", async () => {
     const admin = await loginAdmin();
     const authorize = await built.app.inject({
@@ -371,7 +506,7 @@ describe("SimpleWatch API", () => {
       payload: {
         leaseToken: job.leaseToken,
         compatible: true,
-        probe: {},
+        probe: compatibleH264Probe(),
         reasons: [],
         sha256:
           "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
@@ -492,9 +627,7 @@ describe("SimpleWatch API", () => {
         "x-csrf-token": admin.csrfToken,
       },
       payload: {
-        password: "shared-room-password",
         hostNickname: "主持人",
-        maxMembers: 5,
       },
     });
 
@@ -505,7 +638,7 @@ describe("SimpleWatch API", () => {
       csrfToken: string;
     }>();
     expect(createdBody).toMatchObject({
-      room: { joinUrl: `${origin}/join/${createdBody.room.id}` },
+      room: { joinUrl: `${origin}/join/${friendInviteToken}` },
       member: { role: "host" },
     });
 
@@ -537,20 +670,20 @@ describe("SimpleWatch API", () => {
   });
 
   it("enforces room capacity and active nickname uniqueness", async () => {
-    const room = await createRoom();
-    const firstJoin = await joinRoom(room.roomId, "Alice");
+    await createRoom();
+    const firstJoin = await joinRoom("Alice");
     expect(firstJoin.statusCode).toBe(200);
 
-    const duplicate = await joinRoom(room.roomId, "alice");
+    const duplicate = await joinRoom("alice");
     expect(duplicate.statusCode).toBe(409);
     expect(duplicate.json()).toMatchObject({
       error: { code: "NICKNAME_IN_USE" },
     });
 
-    await joinRoom(room.roomId, "Bob");
-    await joinRoom(room.roomId, "Carol");
-    await joinRoom(room.roomId, "Dave");
-    const full = await joinRoom(room.roomId, "Eve");
+    await joinRoom("Bob");
+    await joinRoom("Carol");
+    await joinRoom("Dave");
+    const full = await joinRoom("Eve");
     expect(full.statusCode).toBe(429);
     expect(full.json()).toMatchObject({ error: { code: "ROOM_FULL" } });
   });
@@ -619,7 +752,7 @@ describe("SimpleWatch API", () => {
     });
     expect(mediaConnected.statusCode).toBe(204);
 
-    const joined = await joinRoom(room.roomId, "Next Host");
+    const joined = await joinRoom("Next Host");
     const joinedBody = joined.json<{
       member: { id: string };
       csrfToken: string;
@@ -789,9 +922,7 @@ describe("SimpleWatch API", () => {
         "x-csrf-token": admin.csrfToken,
       },
       payload: {
-        password: "shared-room-password",
         hostNickname: "Host",
-        maxMembers: 5,
       },
     });
     const roomId = created.json<{ room: { id: string } }>().room.id;
@@ -815,6 +946,79 @@ describe("SimpleWatch API", () => {
       headers: { cookie: roomCookie },
     });
     expect(bootstrap.statusCode).toBe(401);
+  });
+
+  it("monitors the one active room, re-enters as host, and force-closes everyone", async () => {
+    const admin = await loginAdmin();
+    const created = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/rooms",
+      headers: {
+        cookie: admin.cookie,
+        origin,
+        "x-csrf-token": admin.csrfToken,
+      },
+      payload: { hostNickname: "Console Host" },
+    });
+    const roomId = created.json<{ room: { id: string } }>().room.id;
+    const member = await joinRoom("Friend");
+    const memberCookie = readCookie(member, "sw_room");
+
+    const summary = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/admin/active-room",
+      headers: { cookie: admin.cookie },
+    });
+    expect(summary.statusCode).toBe(200);
+    expect(summary.json()).toMatchObject({
+      id: roomId,
+      inviteUrl: `${origin}/join/${friendInviteToken}`,
+      memberCount: 2,
+      maxMembers: 5,
+      host: { nickname: "Console Host" },
+      mode: "idle",
+      content: null,
+      live: { state: "offline" },
+    });
+
+    const hostSession = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/admin/active-room/host-session",
+      headers: {
+        cookie: admin.cookie,
+        origin,
+        "x-csrf-token": admin.csrfToken,
+      },
+      payload: {},
+    });
+    expect(hostSession.statusCode).toBe(200);
+    const reentryCookie = readCookie(hostSession, "sw_room");
+
+    const closed = await built.app.inject({
+      method: "DELETE",
+      url: "/api/v1/admin/active-room",
+      headers: {
+        cookie: admin.cookie,
+        origin,
+        "x-csrf-token": admin.csrfToken,
+      },
+    });
+    expect(closed.statusCode).toBe(200);
+    expect(closed.json()).toEqual({ id: roomId, status: "closed" });
+    for (const cookie of [memberCookie, reentryCookie]) {
+      const rejected = await built.app.inject({
+        method: "GET",
+        url: `/api/v1/rooms/${roomId}/bootstrap`,
+        headers: { cookie },
+      });
+      expect(rejected.statusCode).toBe(401);
+    }
+    const empty = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/admin/active-room",
+      headers: { cookie: admin.cookie },
+    });
+    expect(empty.json()).toBeNull();
   });
 
   it("authenticates WebSocket messages and returns clock/snapshot envelopes", async () => {
@@ -869,7 +1073,7 @@ describe("SimpleWatch API", () => {
 
   it("expires a disconnected host lease and transfers authority", async () => {
     const room = await createRoom();
-    const joined = await joinRoom(room.roomId, "Oldest Member");
+    const joined = await joinRoom("Oldest Member");
     const nextMemberId = joined.json<{ member: { id: string } }>().member.id;
     const hostIdentity = built.roomService.authenticate(
       cookieValue(room.roomCookie),
@@ -883,38 +1087,106 @@ describe("SimpleWatch API", () => {
     });
   });
 
-  it("rotates the shared password and optionally revokes existing members", async () => {
+  it("uses one fixed unguessable friend link and rejects invalid invite tokens", async () => {
     const room = await createRoom();
-    const joined = await joinRoom(room.roomId, "Existing Member");
-    const memberCookie = readCookie(joined, "sw_room");
-    const admin = built.database
-      .prepare("SELECT id FROM admin_users")
-      .get() as { id: string };
-
-    await built.roomService.updateRoom(admin.id, room.roomId, {
-      rotatePassword: "new-shared-room-password",
-      revokeMembers: true,
-    });
-
-    const revoked = await built.app.inject({
-      method: "GET",
-      url: `/api/v1/rooms/${room.roomId}/bootstrap`,
-      headers: { cookie: memberCookie },
-    });
-    expect(revoked.statusCode).toBe(401);
-
-    const oldPassword = await joinRoom(room.roomId, "Old Password");
-    expect(oldPassword.statusCode).toBe(401);
-    const newPassword = await built.app.inject({
+    expect(room.roomId).toBeTruthy();
+    const invalid = await built.app.inject({
       method: "POST",
-      url: `/api/v1/rooms/${room.roomId}/join`,
+      url: "/api/v1/rooms/active/join",
       headers: { origin },
       payload: {
-        nickname: "New Password",
-        password: "new-shared-room-password",
+        nickname: "Invalid Link",
+        inviteToken: "invalid-friend-token-with-32-characters",
       },
     });
-    expect(newPassword.statusCode).toBe(200);
+    expect(invalid.statusCode).toBe(404);
+
+    const valid = await joinRoom("Valid Friend");
+    expect(valid.statusCode).toBe(200);
+  });
+
+  it("atomically clears all rooms, uploads and library files while preserving the admin", async () => {
+    await createRoom();
+    const admin = await loginAdmin();
+    const upload = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/uploads/authorize",
+      headers: {
+        cookie: admin.cookie,
+        origin,
+        "x-csrf-token": admin.csrfToken,
+      },
+      payload: { filename: "partial.mp4", bytes: 4, mime: "video/mp4" },
+    });
+    const uploadId = upload.json<{ uploadId: string }>().uploadId;
+    writeFileSync(join(testRoot, "uploads", uploadId), "part");
+    writeFileSync(join(testRoot, "uploads", `${uploadId}.info`), "{}");
+    writeFileSync(join(testRoot, "media", "old.mp4"), "media");
+    writeFileSync(join(testRoot, "inbox", "waiting.mp4"), "inbox");
+    writeFileSync(join(testRoot, "subtitles", "old.vtt"), "WEBVTT\n");
+    const sftpRoot = join(testRoot, "sftp-incoming");
+    const trashRoot = join(testRoot, "trash");
+    mkdirSync(sftpRoot);
+    mkdirSync(trashRoot);
+    writeFileSync(join(sftpRoot, "uploading.part"), "sftp");
+    writeFileSync(join(trashRoot, "trashed.mp4"), "trash");
+
+    const quarantine = join(testRoot, "quarantine", "reset-1");
+    mkdirSync(join(testRoot, "quarantine"));
+    const result = await clearLibraryData(built.database, {
+      quarantine,
+      roots: [
+        join(testRoot, "media"),
+        join(testRoot, "uploads"),
+        join(testRoot, "inbox"),
+        join(testRoot, "subtitles"),
+        sftpRoot,
+        trashRoot,
+        join(testRoot, "optional-root-that-does-not-exist"),
+      ],
+      now: () => fixedNow,
+    });
+
+    expect(result.movedEntries).toBe(7);
+    for (const table of [
+      "rooms",
+      "room_members",
+      "room_sessions",
+      "uploads",
+      "media",
+      "subtitles",
+      "media_jobs",
+      "token_jti",
+      "service_outbox",
+      "audit_events",
+    ]) {
+      const row = built.database
+        .prepare(`SELECT COUNT(*) AS count FROM ${table}`)
+        .get() as { count: number };
+      expect(row.count, table).toBe(0);
+    }
+    expect(
+      (
+        built.database
+          .prepare("SELECT COUNT(*) AS count FROM admin_users")
+          .get() as { count: number }
+      ).count,
+    ).toBe(1);
+    expect(
+      (
+        built.database
+          .prepare(
+            "SELECT COUNT(*) AS count FROM admin_sessions WHERE revoked_at IS NULL",
+          )
+          .get() as { count: number }
+      ).count,
+    ).toBe(0);
+    expect(existsSync(join(quarantine, "simplewatch.sqlite3"))).toBe(true);
+    expect(existsSync(join(quarantine, "CLEAR_COMPLETE.json"))).toBe(true);
+    expect(existsSync(join(quarantine, "files", "uploads", uploadId))).toBe(
+      true,
+    );
+    expect(existsSync(join(testRoot, "media", "old.mp4"))).toBe(false);
   });
 
   it("refuses to start when an applied migration checksum changes", async () => {
@@ -955,7 +1227,7 @@ async function loginAdmin(): Promise<{ cookie: string; csrfToken: string }> {
     method: "POST",
     url: "/api/v1/admin/login",
     headers: { origin },
-    payload: { username: "admin", password: "correct-horse-battery-staple" },
+    payload: { code: "260713" },
   });
   expect(response.statusCode).toBe(200);
   return {
@@ -971,9 +1243,7 @@ async function createRoom(): Promise<{ roomId: string; roomCookie: string }> {
     url: "/api/v1/rooms",
     headers: { cookie: admin.cookie, origin, "x-csrf-token": admin.csrfToken },
     payload: {
-      password: "shared-room-password",
       hostNickname: "Host",
-      maxMembers: 5,
     },
   });
   expect(response.statusCode).toBe(201);
@@ -983,13 +1253,41 @@ async function createRoom(): Promise<{ roomId: string; roomCookie: string }> {
   };
 }
 
-function joinRoom(roomId: string, nickname: string) {
+function joinRoom(nickname: string) {
   return built.app.inject({
     method: "POST",
-    url: `/api/v1/rooms/${roomId}/join`,
+    url: "/api/v1/rooms/active/join",
     headers: { origin },
-    payload: { nickname, password: "shared-room-password" },
+    payload: { nickname, inviteToken: friendInviteToken },
   });
+}
+
+function compatibleH264Probe() {
+  return {
+    streams: [
+      {
+        codec_type: "video",
+        codec_name: "h264",
+        codec_tag_string: "avc1",
+        pix_fmt: "yuv420p",
+        width: 1920,
+        height: 1080,
+        avg_frame_rate: "30/1",
+      },
+      {
+        codec_type: "audio",
+        codec_name: "aac",
+        sample_rate: "48000",
+        channels: 2,
+        channel_layout: "stereo",
+      },
+    ],
+    format: {
+      duration: "1.000",
+      size: "4",
+      format_name: "mov,mp4,m4a,3gp,3g2,mj2",
+    },
+  };
 }
 
 function readCookie(

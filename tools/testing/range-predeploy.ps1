@@ -30,6 +30,7 @@ $env:HOST = '127.0.0.1'
 $env:PORT = '13900'
 $env:DATABASE_PATH = Join-Path $stateRoot 'simplewatch.sqlite3'
 $env:PUBLIC_ORIGIN = 'http://127.0.0.1:18080'
+$env:FRIEND_INVITE_TOKEN = 'predeploy-friend-invite-token-at-least-32-bytes'
 $env:SESSION_SECRET = 'predeploy-session-secret-at-least-32-bytes'
 $env:CONTENT_SIGNING_SECRET = 'predeploy-content-secret-at-least-32-bytes'
 $env:INTERNAL_HOOK_TOKEN = 'predeploy-internal-token-at-least-32-bytes'
@@ -44,8 +45,7 @@ $env:INBOX_ROOT = $inboxRoot
 $env:SUBTITLE_ROOT = $subtitleRoot
 $env:TUS_ENDPOINT = 'http://127.0.0.1:18080/files/'
 $env:ALLOW_NONINTERACTIVE_BOOTSTRAP = 'true'
-$env:BOOTSTRAP_ADMIN_USERNAME = 'predeploy-admin'
-$env:BOOTSTRAP_ADMIN_PASSWORD = 'predeploy-password-strong'
+$env:BOOTSTRAP_ADMIN_CODE = '260713'
 $env:WORKER_ID = 'predeploy-worker'
 $env:API_ORIGIN = 'http://127.0.0.1:13900'
 $env:FFPROBE_PATH = $ffprobe
@@ -83,7 +83,7 @@ try {
   if ($edgeHeaders.Headers['X-Frame-Options'] -ne 'DENY') { throw '边缘缺少 frame 拒绝策略' }
   if ($edgeHeaders.Headers['Content-Security-Policy'] -notmatch "default-src 'self'") { throw '边缘缺少 CSP' }
 
-  $login = Invoke-WebRequest -Method Post -Uri 'http://127.0.0.1:18080/api/v1/admin/login' -Headers @{ Origin = $env:PUBLIC_ORIGIN } -ContentType 'application/json' -Body '{"username":"predeploy-admin","password":"predeploy-password-strong"}'
+  $login = Invoke-WebRequest -Method Post -Uri 'http://127.0.0.1:18080/api/v1/admin/login' -Headers @{ Origin = $env:PUBLIC_ORIGIN } -ContentType 'application/json' -Body '{"code":"260713"}'
   $cookie = ($login.Headers['Set-Cookie'] -split ';')[0]
   $csrf = ($login.Content | ConvertFrom-Json).csrfToken
   if (-not $cookie -or -not $csrf) { throw '登录未返回会话或 CSRF' }

@@ -1,23 +1,49 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import * as tus from "tus-js-client";
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
-import { api, ApiError, type MediaItem } from "../api.js";
+import {
+  api,
+  ApiError,
+  type ActiveRoomSummary,
+  type MediaItem,
+} from "../api.js";
 import { useSession } from "../store.js";
+
+interface UploadProgress {
+  id: string;
+  filename: string;
+  uploaded: number;
+  total: number;
+  bytesPerSecond: number;
+  state: "uploading" | "cancelling" | "processing" | "cancelled" | "failed";
+  message?: string;
+}
 
 export function AdminPage() {
   const { adminCsrf, setAdminCsrf, setRoomCsrf, setMemberId } = useSession();
-  const [username, setUsername] = useState("admin");
-  const [password, setPassword] = useState("");
+  const [code, setCode] = useState("");
   const [message, setMessage] = useState("");
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(
+    null,
+  );
+  const uploadRef = useRef<tus.Upload | null>(null);
+  const speedRef = useRef({ at: 0, bytes: 0, smoothed: 0 });
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+
   const media = useQuery({
     queryKey: ["media"],
     queryFn: () => api<MediaItem[]>("/api/v1/media"),
     enabled: Boolean(adminCsrf),
     refetchInterval: 3000,
+  });
+  const activeRoom = useQuery({
+    queryKey: ["admin-active-room"],
+    queryFn: () => api<ActiveRoomSummary | null>("/api/v1/admin/active-room"),
+    enabled: Boolean(adminCsrf),
+    refetchInterval: 2000,
   });
 
   async function login(event: FormEvent) {
@@ -25,10 +51,12 @@ export function AdminPage() {
     try {
       const result = await api<{ csrfToken: string }>("/api/v1/admin/login", {
         method: "POST",
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify({ code }),
       });
       setAdminCsrf(result.csrfToken);
+      setCode("");
       setMessage("控制台已解锁");
+      await queryClient.invalidateQueries();
     } catch (error) {
       setMessage(error instanceof ApiError ? error.message : "登录失败");
     }
@@ -36,60 +64,185 @@ export function AdminPage() {
 
   async function createRoom(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!adminCsrf) return;
     const data = new FormData(event.currentTarget);
-    const result = await api<{
-      room: { id: string };
-      member: { id: string };
-      csrfToken: string;
-    }>("/api/v1/rooms", {
-      method: "POST",
-      headers: { "x-csrf-token": adminCsrf ?? "" },
-      body: JSON.stringify({
-        password: data.get("roomPassword"),
-        hostNickname: data.get("nickname"),
-        maxMembers: 5,
-      }),
-    });
-    setRoomCsrf(result.csrfToken);
-    setMemberId(result.member.id);
-    void navigate(`/room/${result.room.id}`);
+    try {
+      const result = await api<{
+        room: { id: string; joinUrl: string };
+        member: { id: string };
+        csrfToken: string;
+      }>("/api/v1/rooms", {
+        method: "POST",
+        headers: { "x-csrf-token": adminCsrf },
+        body: JSON.stringify({ hostNickname: data.get("nickname") }),
+      });
+      setRoomCsrf(result.csrfToken);
+      setMemberId(result.member.id);
+      setMessage("放映室已开放，可复制好友链接");
+      await queryClient.invalidateQueries({ queryKey: ["admin-active-room"] });
+    } catch (error) {
+      setMessage(error instanceof ApiError ? error.message : "无法开启放映室");
+    }
+  }
+
+  async function enterHostRoom() {
+    if (!adminCsrf || !activeRoom.data) return;
+    try {
+      const result = await api<{
+        room: { id: string };
+        member: { id: string };
+        csrfToken: string;
+      }>("/api/v1/admin/active-room/host-session", {
+        method: "POST",
+        headers: { "x-csrf-token": adminCsrf },
+        body: "{}",
+      });
+      setRoomCsrf(result.csrfToken);
+      setMemberId(result.member.id);
+      void navigate(`/room/${result.room.id}`);
+    } catch (error) {
+      setMessage(
+        error instanceof ApiError ? error.message : "无法进入主持房间",
+      );
+    }
+  }
+
+  async function forceCloseRoom() {
+    if (!adminCsrf || !activeRoom.data) return;
+    if (!confirm("强制关闭后，房间内所有人会立即断开。确定继续吗？")) return;
+    try {
+      await api("/api/v1/admin/active-room", {
+        method: "DELETE",
+        headers: { "x-csrf-token": adminCsrf },
+      });
+      setRoomCsrf(null);
+      setMemberId(null);
+      setMessage("房间已强制关闭，所有成员凭据均已撤销");
+      await queryClient.invalidateQueries({ queryKey: ["admin-active-room"] });
+    } catch (error) {
+      setMessage(error instanceof ApiError ? error.message : "强制关闭失败");
+    }
   }
 
   async function uploadFile(file: File) {
-    if (!adminCsrf) return;
-    setMessage("正在申请上传席位…");
-    const auth = await api<{
+    if (!adminCsrf || uploadProgress?.state === "uploading") return;
+    setMessage("");
+    let auth: {
       uploadId: string;
       tusEndpoint: string;
       uploadToken: string;
-    }>("/api/v1/uploads/authorize", {
-      method: "POST",
-      headers: { "x-csrf-token": adminCsrf },
-      body: JSON.stringify({
-        filename: file.name,
-        bytes: file.size,
-        mime: file.type || "video/mp4",
-      }),
-    });
-    await new Promise<void>((resolveUpload, rejectUpload) => {
-      const upload = new tus.Upload(file, {
-        endpoint: auth.tusEndpoint,
-        headers: { "Upload-Token": auth.uploadToken },
-        metadata: { filename: file.name, filetype: file.type || "video/mp4" },
-        chunkSize: 16 * 1024 * 1024,
-        retryDelays: [0, 1000, 3000, 5000],
-        onProgress(bytesUploaded, bytesTotal) {
-          setMessage(
-            `上传中 ${Math.round((bytesUploaded / bytesTotal) * 100)}%`,
-          );
-        },
-        onError: rejectUpload,
-        onSuccess: () => resolveUpload(),
+    };
+    try {
+      auth = await api("/api/v1/uploads/authorize", {
+        method: "POST",
+        headers: { "x-csrf-token": adminCsrf },
+        body: JSON.stringify({
+          filename: file.name,
+          bytes: file.size,
+          mime: "video/mp4",
+        }),
       });
-      upload.start();
+    } catch (error) {
+      setMessage(error instanceof ApiError ? error.message : "无法开始上传");
+      return;
+    }
+    speedRef.current = { at: performance.now(), bytes: 0, smoothed: 0 };
+    setUploadProgress({
+      id: auth.uploadId,
+      filename: file.name,
+      uploaded: 0,
+      total: file.size,
+      bytesPerSecond: 0,
+      state: "uploading",
     });
-    setMessage("上传完成，正在检查兼容性");
-    await queryClient.invalidateQueries({ queryKey: ["media"] });
+    const upload = new tus.Upload(file, {
+      endpoint: auth.tusEndpoint,
+      headers: { "Upload-Token": auth.uploadToken },
+      metadata: { filename: file.name, filetype: "video/mp4" },
+      chunkSize: 16 * 1024 * 1024,
+      retryDelays: [0, 1000, 3000, 5000],
+      removeFingerprintOnSuccess: true,
+      onProgress(bytesUploaded, bytesTotal) {
+        const current = performance.now();
+        const elapsed = Math.max(1, current - speedRef.current.at) / 1000;
+        const instant = (bytesUploaded - speedRef.current.bytes) / elapsed;
+        const smoothed =
+          speedRef.current.smoothed === 0
+            ? Math.max(0, instant)
+            : speedRef.current.smoothed * 0.72 + Math.max(0, instant) * 0.28;
+        speedRef.current = { at: current, bytes: bytesUploaded, smoothed };
+        setUploadProgress((previous) =>
+          previous
+            ? {
+                ...previous,
+                uploaded: bytesUploaded,
+                total: bytesTotal,
+                bytesPerSecond: smoothed,
+              }
+            : null,
+        );
+      },
+      onError(error) {
+        uploadRef.current = null;
+        setUploadProgress((previous) =>
+          previous
+            ? { ...previous, state: "failed", message: error.message }
+            : null,
+        );
+      },
+      onSuccess() {
+        uploadRef.current = null;
+        setUploadProgress((previous) =>
+          previous
+            ? {
+                ...previous,
+                uploaded: previous.total,
+                state: "processing",
+                message: "上传完成，正在检片入库",
+              }
+            : null,
+        );
+        void queryClient.invalidateQueries({ queryKey: ["media"] });
+      },
+    });
+    uploadRef.current = upload;
+    upload.start();
+  }
+
+  async function cancelUpload() {
+    const current = uploadProgress;
+    if (!adminCsrf || !current || current.state !== "uploading") return;
+    setUploadProgress({
+      ...current,
+      state: "cancelling",
+      message: "正在终止上传…",
+    });
+    try {
+      try {
+        await uploadRef.current?.abort(true);
+      } catch {
+        // 即使浏览器端 tus 中止失败，也必须继续请求服务端撤销并清理临时数据。
+      }
+      await api(`/api/v1/uploads/${current.id}`, {
+        method: "DELETE",
+        headers: { "x-csrf-token": adminCsrf },
+      });
+      setUploadProgress({
+        ...current,
+        state: "cancelled",
+        bytesPerSecond: 0,
+        message: "本条上传已终止，临时数据已清理",
+      });
+    } catch (error) {
+      setUploadProgress({
+        ...current,
+        state: "failed",
+        bytesPerSecond: 0,
+        message: error instanceof ApiError ? error.message : "终止上传失败",
+      });
+    } finally {
+      uploadRef.current = null;
+    }
   }
 
   async function uploadSubtitle(mediaId: string, file: File) {
@@ -117,28 +270,40 @@ export function AdminPage() {
           <p className="eyebrow">PROJECTIONIST ONLY</p>
           <h1>放映员控制台</h1>
           <label>
-            账号
-            <input
-              value={username}
-              onChange={(event) => setUsername(event.target.value)}
-              autoComplete="username"
-            />
-          </label>
-          <label>
-            口令
+            6 位放映口令
             <input
               type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
+              inputMode="numeric"
+              pattern="[0-9]{6}"
+              maxLength={6}
+              value={code}
+              onChange={(event) =>
+                setCode(event.target.value.replace(/\D/g, "").slice(0, 6))
+              }
               autoComplete="current-password"
+              autoFocus
             />
           </label>
-          <button type="submit">解锁控制台</button>
+          <button type="submit" disabled={code.length !== 6}>
+            解锁控制台
+          </button>
           <output aria-live="polite">{message}</output>
         </form>
       </main>
     );
   }
+
+  const progressPercent = uploadProgress
+    ? Math.min(
+        100,
+        (uploadProgress.uploaded / Math.max(1, uploadProgress.total)) * 100,
+      )
+    : 0;
+  const remainingSeconds =
+    uploadProgress && uploadProgress.bytesPerSecond > 0
+      ? (uploadProgress.total - uploadProgress.uploaded) /
+        uploadProgress.bytesPerSecond
+      : null;
 
   return (
     <main className="console-shell">
@@ -155,51 +320,141 @@ export function AdminPage() {
         <section className="panel room-panel">
           <div className="panel-title">
             <span>01</span>
-            <h2>开启一场放映</h2>
+            <h2>放映控制模块</h2>
           </div>
-          <form onSubmit={createRoom} className="stack-form">
-            <label>
-              主持昵称
-              <input
-                name="nickname"
-                required
-                maxLength={24}
-                defaultValue="Host"
-              />
-            </label>
-            <label>
-              房间口令
-              <input
-                name="roomPassword"
-                required
-                minLength={8}
-                type="password"
-              />
-            </label>
-            <button type="submit">建立五席放映室 →</button>
-          </form>
+          {activeRoom.data ? (
+            <div className="room-monitor">
+              <div className="monitor-primary">
+                <strong>
+                  {activeRoom.data.content?.title ?? "等待选择观看内容"}
+                </strong>
+                <span>{modeLabel(activeRoom.data.mode)}</span>
+              </div>
+              <dl>
+                <div>
+                  <dt>主持人</dt>
+                  <dd>{activeRoom.data.host?.nickname ?? "—"}</dd>
+                </div>
+                <div>
+                  <dt>在场</dt>
+                  <dd>
+                    {activeRoom.data.memberCount} / {activeRoom.data.maxMembers}
+                  </dd>
+                </div>
+                <div>
+                  <dt>在线</dt>
+                  <dd>{activeRoom.data.onlineCount}</dd>
+                </div>
+                <div>
+                  <dt>OBS</dt>
+                  <dd>{liveLabel(activeRoom.data.live.state)}</dd>
+                </div>
+              </dl>
+              <div className="invite-copy">
+                <code>{activeRoom.data.inviteUrl}</code>
+                <button
+                  type="button"
+                  onClick={() =>
+                    void navigator.clipboard.writeText(
+                      activeRoom.data!.inviteUrl,
+                    )
+                  }
+                >
+                  复制好友链接
+                </button>
+              </div>
+              <div className="room-actions">
+                <button type="button" onClick={() => void enterHostRoom()}>
+                  进入主持房间
+                </button>
+                <button
+                  type="button"
+                  className="danger-button"
+                  onClick={() => void forceCloseRoom()}
+                >
+                  强制关闭房间
+                </button>
+              </div>
+            </div>
+          ) : (
+            <form onSubmit={createRoom} className="stack-form">
+              <p className="muted-copy">
+                系统同时只开放一间放映室。无需设置房间编号或好友口令。
+              </p>
+              <label>
+                主持人昵称
+                <input
+                  name="nickname"
+                  required
+                  maxLength={24}
+                  defaultValue="Host"
+                />
+              </label>
+              <button type="submit">开启放映室 →</button>
+            </form>
+          )}
         </section>
+
         <section className="panel upload-panel">
           <div className="panel-title">
             <span>02</span>
             <h2>送片入库</h2>
           </div>
-          <label className="drop-zone">
+          <label
+            className={`drop-zone ${uploadProgress?.state === "uploading" ? "disabled" : ""}`}
+          >
             <input
               type="file"
-              accept="video/mp4"
+              accept=".mp4,video/mp4"
+              disabled={
+                uploadProgress?.state === "uploading" ||
+                uploadProgress?.state === "cancelling"
+              }
               onChange={(event) => {
                 const file = event.target.files?.[0];
+                event.currentTarget.value = "";
                 if (file) void uploadFile(file);
               }}
             />
-            <strong>选择 MP4 影片</strong>
-            <small>H.264 · AAC 48k · 双声道 · 1080p30</small>
+            <strong>选择影片</strong>
+            <small>选择一条 MP4 文件送入片库</small>
           </label>
+          {uploadProgress && (
+            <div className="upload-progress" aria-live="polite">
+              <div className="upload-progress-head">
+                <strong>{uploadProgress.filename}</strong>
+                <span>{progressPercent.toFixed(1)}%</span>
+              </div>
+              <progress max={100} value={progressPercent} />
+              <div className="upload-metrics">
+                <span>
+                  {formatBytes(uploadProgress.uploaded)} /{" "}
+                  {formatBytes(uploadProgress.total)}
+                </span>
+                <span>{formatSpeed(uploadProgress.bytesPerSecond)}</span>
+                <span>
+                  {remainingSeconds === null
+                    ? "剩余时间计算中"
+                    : `约 ${formatEta(remainingSeconds)}`}
+                </span>
+              </div>
+              {uploadProgress.message && <p>{uploadProgress.message}</p>}
+              {uploadProgress.state === "uploading" && (
+                <button
+                  type="button"
+                  className="danger-button"
+                  onClick={() => void cancelUpload()}
+                >
+                  终止本条上传
+                </button>
+              )}
+            </div>
+          )}
           <output className="upload-status" aria-live="polite">
             {message}
           </output>
         </section>
+
         <section className="panel media-panel">
           <div className="panel-title">
             <span>03</span>
@@ -218,7 +473,8 @@ export function AdminPage() {
                     {formatBytes(item.bytes)} ·{" "}
                     {item.durationMs
                       ? formatDuration(item.durationMs)
-                      : "检查中"}
+                      : "检查中"}{" "}
+                    · {codecLabel(item)}
                   </p>
                 </div>
                 <span className={`media-state state-${item.state}`}>
@@ -241,7 +497,7 @@ export function AdminPage() {
               </article>
             ))}
             {!media.data?.length && (
-              <p className="empty-state">片架还是空的。先送来第一卷影片。</p>
+              <p className="empty-state">片库为空。选择一条影片开始入库。</p>
             )}
           </div>
         </section>
@@ -251,12 +507,25 @@ export function AdminPage() {
 }
 
 function formatBytes(bytes: number) {
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+}
+function formatSpeed(bytesPerSecond: number) {
+  return bytesPerSecond > 0 ? `${formatBytes(bytesPerSecond)}/s` : "测速中";
+}
+function formatEta(seconds: number) {
+  if (seconds < 60) return `${Math.ceil(seconds)} 秒`;
+  return `${Math.ceil(seconds / 60)} 分钟`;
 }
 function formatDuration(ms: number) {
   const minutes = Math.floor(ms / 60_000);
   const seconds = Math.floor((ms % 60_000) / 1000);
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+function codecLabel(item: MediaItem) {
+  if (item.video.codec === "hevc") return "H.265 · 终端相关";
+  if (item.video.codec === "h264") return "H.264 · 广泛兼容";
+  return "编码待识别";
 }
 function stateLabel(state: MediaItem["state"]) {
   return (
@@ -267,5 +536,15 @@ function stateLabel(state: MediaItem["state"]) {
       incompatible: "不兼容",
       failed: "失败",
     } as const
+  )[state];
+}
+function modeLabel(mode: ActiveRoomSummary["mode"]) {
+  return ({ idle: "等待节目", vod: "片库点播", live: "OBS 直播" } as const)[
+    mode
+  ];
+}
+function liveLabel(state: ActiveRoomSummary["live"]["state"]) {
+  return (
+    { online: "推流在线", offline: "未推流", unknown: "状态未知" } as const
   )[state];
 }

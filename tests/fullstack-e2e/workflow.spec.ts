@@ -5,8 +5,7 @@ test("real admin creates a room and a second browser joins read-only", async ({
   page,
 }) => {
   await page.goto("/admin");
-  await page.getByLabel("账号").fill("predeploy-admin");
-  await page.getByLabel("口令").fill("predeploy-password-strong");
+  await page.getByLabel("6 位放映口令").fill("260713");
   await page.getByRole("button", { name: "解锁控制台" }).click();
   await expect(page.getByRole("heading", { name: "放映控制" })).toBeVisible();
 
@@ -24,22 +23,21 @@ test("real admin creates a room and a second browser joins read-only", async ({
     page.getByText(/字幕 predeploy.vtt 已进入处理队列/),
   ).toBeVisible();
 
-  await page.getByLabel("主持昵称").fill("Predeploy Host");
-  await page.getByLabel("房间口令").fill("browser-room-password");
-  await page.getByRole("button", { name: /建立五席放映室/ }).click();
+  await page.getByLabel("主持人昵称").fill("Predeploy Host");
+  await page.getByRole("button", { name: /开启放映室/ }).click();
+  const inviteUrl = await page.locator(".invite-copy code").textContent();
+  expect(inviteUrl).toBeTruthy();
+  await page.getByRole("button", { name: "进入主持房间" }).click();
   await expect(page.getByText("主持控制")).toBeVisible();
   await expect(page.getByLabel("选择点播影片")).toBeVisible();
   await page
     .getByLabel("选择点播影片")
     .selectOption({ label: "media-smoke.mp4" });
   await expect(page.locator("video")).toBeVisible();
-  const roomUrl = page.url();
-
   const memberContext = await browser.newContext();
   const member = await memberContext.newPage();
-  await member.goto(roomUrl);
+  await member.goto(inviteUrl!);
   await member.getByLabel("昵称").fill("Second Browser");
-  await member.getByLabel("房间口令").fill("browser-room-password");
   await member.getByRole("button", { name: "进入放映室" }).click();
   await expect(member.getByText("同场观众")).toBeVisible();
   await expect(

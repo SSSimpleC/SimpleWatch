@@ -13,6 +13,7 @@ services:
       PORT: "3000"
       DATABASE_PATH: /state/simplewatch.sqlite3
       PUBLIC_ORIGIN: http://127.0.0.1:18080
+      FRIEND_INVITE_TOKEN: local-friend-invite-token-at-least-32-bytes
       SESSION_SECRET: local-session-secret-change-before-prod
       CONTENT_SIGNING_SECRET: local-content-signing-secret-prod
       INTERNAL_HOOK_TOKEN: local-internal-hook-token-predeploy
@@ -21,6 +22,7 @@ services:
       LIVEKIT_API_KEY: local-api-key
       LIVEKIT_API_SECRET: local-livekit-secret-change-before-prod
       LIVEKIT_URL: ws://127.0.0.1:17880
+      MEDIAMTX_CONTROL_URL: http://mediamtx:9997
       MEDIA_ROOT: /media
       UPLOAD_ROOT: /uploads
       INBOX_ROOT: /inbox
@@ -61,6 +63,7 @@ services:
       INBOX_ROOT: /inbox
       SUBTITLE_ROOT: /subtitles
       FFPROBE_PATH: /usr/bin/ffprobe
+      FFMPEG_PATH: /usr/bin/ffmpeg
       SFTP_INCOMING_ROOT: /sftp-incoming
       LIVEKIT_INTERNAL_URL: http://livekit:7880
       LIVEKIT_API_KEY: local-api-key

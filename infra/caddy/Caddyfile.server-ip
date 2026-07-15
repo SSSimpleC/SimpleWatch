@@ -4,6 +4,17 @@
 }
 
 http://:8080 {
+	@acme path /.well-known/acme-challenge/*
+	handle @acme {
+		root * /var/www/acme
+		file_server
+	}
+	handle {
+		redir https://8.134.239.34{uri} 308
+	}
+}
+
+http://:8081 {
 	@hook path /api/v1/internal/tus/hooks
 	@health path /health/live /health/ready
 	handle @hook {
@@ -18,7 +29,7 @@ http://:8080 {
 }
 
 https://8.134.239.34 {
-	tls /etc/caddy/ip-cert/ip.crt /etc/caddy/ip-cert/ip.key
+	tls /etc/caddy/ip-cert/current/fullchain.pem /etc/caddy/ip-cert/current/privkey.pem
 	header {
 		-Server
 		Content-Security-Policy "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' ws: wss:; media-src 'self' blob:; worker-src 'self'"
@@ -41,11 +52,6 @@ https://8.134.239.34 {
 		respond @media_bad_method 405
 		respond @multiple_ranges 416
 
-		handle /api/v1/internal/tus/hooks {
-			reverse_proxy app:3000 {
-				header_up X-Internal-Token {$INTERNAL_HOOK_TOKEN}
-			}
-		}
 		handle /files/* {
 			forward_auth app:3000 {
 				uri /api/v1/internal/tus/authorize
@@ -60,9 +66,6 @@ https://8.134.239.34 {
 			reverse_proxy mediamtx:8889
 		}
 		handle /rtc* {
-			reverse_proxy livekit:7880
-		}
-		handle /twirp/* {
 			reverse_proxy livekit:7880
 		}
 		handle @media {

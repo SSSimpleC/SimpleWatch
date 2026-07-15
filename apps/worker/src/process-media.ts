@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   copyFileSync,
@@ -10,8 +11,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, join, resolve, sep } from "node:path";
+import { promisify } from "node:util";
 
 import { probeFile } from "@simplewatch/media";
+
+const execFileAsync = promisify(execFile);
 
 export interface ProbeJobPayload {
   readonly uploadId?: string | undefined;
@@ -31,6 +35,7 @@ export async function processProbeJob(
   payload: ProbeJobPayload,
   roots: MediaWorkerRoots,
   ffprobePath = "ffprobe",
+  ffmpegPath = "ffmpeg",
 ) {
   const sourceRoot =
     payload.source === "sftp" ? roots.inboxRoot : roots.uploadRoot;
@@ -38,10 +43,7 @@ export async function processProbeJob(
   const before = statSync(source);
   if (!before.isFile()) throw new Error("上传结果不是普通文件");
 
-  const [{ probe, compatibility }, sha256] = await Promise.all([
-    probeFile(source, ffprobePath),
-    hashFile(source),
-  ]);
+  let { probe, compatibility } = await probeFile(source, ffprobePath);
   const destinationRoot = compatibility.compatible
     ? roots.mediaRoot
     : roots.inboxRoot;
@@ -51,17 +53,68 @@ export async function processProbeJob(
     destinationDirectory,
     compatibility.compatible ? "content.mp4" : basename(source),
   );
-  moveFile(source, finalPath);
+  const needsRemux =
+    compatibility.compatible &&
+    (!compatibility.fastStart ||
+      (compatibility.video.codec === "hevc" &&
+        compatibility.video.codecTag?.toLowerCase() !== "hvc1"));
+  if (needsRemux) {
+    const temporary = `${finalPath}.${randomUUID()}.remux.mp4`;
+    try {
+      await remuxForBrowser(
+        source,
+        temporary,
+        compatibility.video.codec,
+        ffmpegPath,
+      );
+      const verified = await probeFile(temporary, ffprobePath);
+      if (
+        !verified.compatibility.compatible ||
+        !verified.compatibility.fastStart ||
+        (verified.compatibility.video.codec === "hevc" &&
+          verified.compatibility.video.codecTag?.toLowerCase() !== "hvc1")
+      ) {
+        throw new Error("重封装后的影片仍不满足浏览器直放要求");
+      }
+      probe = verified.probe;
+      compatibility = verified.compatibility;
+      renameSync(temporary, finalPath);
+      unlinkSync(source);
+    } catch (error) {
+      rmSync(temporary, { force: true });
+      throw error;
+    }
+  } else {
+    moveFile(source, finalPath);
+  }
+  const finalStat = statSync(finalPath);
+  const sha256 = await hashFile(finalPath);
 
   return {
     compatible: compatibility.compatible,
     probe,
     reasons: compatibility.reasons,
     sha256,
-    bytes: before.size,
+    bytes: finalStat.size,
     durationMs: compatibility.durationMs,
     finalPath: resolve(finalPath),
   };
+}
+
+export async function remuxForBrowser(
+  source: string,
+  destination: string,
+  codec: string | null,
+  ffmpegPath = "ffmpeg",
+): Promise<void> {
+  const args = ["-v", "error", "-y", "-i", source, "-map", "0", "-c", "copy"];
+  if (codec === "hevc") args.push("-tag:v", "hvc1");
+  args.push("-movflags", "+faststart", destination);
+  await execFileAsync(ffmpegPath, args, {
+    encoding: "utf8",
+    maxBuffer: 4 * 1024 * 1024,
+    windowsHide: true,
+  });
 }
 
 interface MoveOperations {

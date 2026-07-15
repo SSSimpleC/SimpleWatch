@@ -162,6 +162,30 @@ a {
 .join-strip button {
   border-width: 0 0 0 1px;
 }
+.invite-note {
+  margin-top: 3.2rem;
+  display: grid;
+  gap: 0.45rem;
+  max-width: 620px;
+  padding: 1.2rem 1.4rem;
+  border: 1px solid #6c6358;
+  border-left: 4px solid var(--amber);
+  background: #11100ecc;
+}
+.invite-note span {
+  color: var(--amber);
+  font-size: 0.62rem;
+  letter-spacing: 0.16em;
+}
+.invite-note strong {
+  font-family: "Iowan Old Style", "Baskerville", serif;
+  font-size: 1.35rem;
+  font-weight: 400;
+}
+.invite-note small {
+  color: var(--muted);
+  line-height: 1.6;
+}
 .landing-footer {
   position: absolute;
   z-index: 1;
@@ -269,6 +293,73 @@ a {
 .stack-form {
   padding-top: 1.2rem;
 }
+.room-monitor {
+  display: grid;
+  gap: 1rem;
+  padding-top: 1.2rem;
+}
+.monitor-primary {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: baseline;
+}
+.monitor-primary strong {
+  font-family: "Iowan Old Style", "Baskerville", serif;
+  font-size: 1.45rem;
+  font-weight: 400;
+}
+.monitor-primary span {
+  color: var(--amber);
+  font-size: 0.65rem;
+}
+.room-monitor dl {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.5rem;
+  margin: 0;
+}
+.room-monitor dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.7rem;
+  border: 1px solid #2d2924;
+}
+.room-monitor dt {
+  color: var(--muted);
+  font-size: 0.65rem;
+}
+.room-monitor dd {
+  margin: 0;
+  font-size: 0.7rem;
+}
+.invite-copy {
+  display: grid;
+  gap: 0.55rem;
+}
+.invite-copy code {
+  padding: 0.7rem;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--line);
+  color: #b7aea0;
+  background: #0b0a09;
+}
+.room-actions {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+.danger-button {
+  color: #ffd8d1;
+  border-color: #8f4438;
+  background: #5d241c;
+}
+.danger-button:hover:not(:disabled) {
+  color: white;
+  border-color: #c45644;
+  background: #9a3526;
+}
 .stack-form label,
 .login-card label,
 .admission-card label {
@@ -298,6 +389,10 @@ input {
   border-color: var(--amber);
   background: #e8a93f0a;
 }
+.drop-zone.disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
 .drop-zone input {
   position: absolute;
   width: 1px;
@@ -313,6 +408,37 @@ input {
 .upload-status {
   color: var(--muted);
   margin-top: 0.5rem;
+}
+.upload-progress {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  background: #0d0c0a;
+}
+.upload-progress-head,
+.upload-metrics {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+.upload-progress-head strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.upload-progress progress {
+  width: 100%;
+  height: 12px;
+  accent-color: var(--amber);
+}
+.upload-metrics,
+.upload-progress p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.65rem;
 }
 .media-list {
   display: grid;
@@ -450,6 +576,15 @@ input {
   display: block;
   object-fit: contain;
 }
+.program-warning {
+  margin-bottom: 0.75rem;
+  padding: 0.8rem 1rem;
+  border-left: 3px solid var(--amber);
+  color: #d6c5a9;
+  background: #2b2115;
+  font-size: 0.7rem;
+  line-height: 1.6;
+}
 .blank-screen {
   display: grid;
   place-content: center;
@@ -489,6 +624,16 @@ input {
   align-items: center;
   gap: 0.6rem;
 }
+.secondary-button {
+  color: var(--paper);
+  border-color: var(--line);
+  background: #1c1915;
+}
+.secondary-button.active {
+  color: #98d7a4;
+  border-color: #396c43;
+  background: #132418;
+}
 .host-controls {
   margin-top: 0.8rem;
   border-top: 1px solid var(--line);
@@ -507,6 +652,19 @@ input {
 .publish-config code {
   overflow-wrap: anywhere;
   color: var(--paper);
+}
+.obs-preset {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.8rem;
+  border: 1px solid #4b4136;
+  background: #201a13;
+}
+.obs-preset strong {
+  color: var(--amber);
+}
+.obs-preset span {
+  line-height: 1.5;
 }
 .transport-bar select {
   margin-left: auto;
@@ -657,6 +815,13 @@ input {
   }
   .join-strip {
     grid-template-columns: 1fr;
+  }
+  .room-monitor dl {
+    grid-template-columns: 1fr;
+  }
+  .upload-metrics {
+    display: grid;
+    gap: 0.3rem;
   }
   .join-strip label {
     padding: 1rem 1rem 0;

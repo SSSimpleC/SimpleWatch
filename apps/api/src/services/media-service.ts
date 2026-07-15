@@ -1,11 +1,21 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { mkdirSync, readFileSync, realpathSync, statfsSync } from "node:fs";
+import {
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statfsSync,
+} from "node:fs";
 import { join, sep } from "node:path";
 
 import { v7 as uuidv7 } from "uuid";
 
 import type { UploadAuthorizeRequest } from "@simplewatch/contracts";
-import { sanitizeDisplayName, validateWebVtt } from "@simplewatch/media";
+import {
+  evaluateCompatibility,
+  sanitizeDisplayName,
+  validateWebVtt,
+} from "@simplewatch/media";
 
 import type { AppDatabase } from "../database.js";
 import { AppError, conflict, notFound, unauthorized } from "../errors.js";
@@ -24,6 +34,12 @@ interface MediaRow {
   readonly bytes: number;
   readonly mime: string | null;
   readonly duration_ms: number | null;
+  readonly video_codec: "h264" | "hevc" | null;
+  readonly playback_support: "broad" | "device-dependent" | "unsupported";
+  readonly video_width: number | null;
+  readonly video_height: number | null;
+  readonly video_fps: number | null;
+  readonly video_pixel_format: string | null;
   readonly created_at: number;
 }
 
@@ -89,7 +105,9 @@ export class MediaService {
   public listMedia() {
     const rows = this.database
       .prepare(
-        `SELECT id, storage_key, display_name, state, bytes, mime, duration_ms, created_at
+        `SELECT id, storage_key, display_name, state, bytes, mime, duration_ms, created_at,
+                video_codec, playback_support, video_width, video_height,
+                video_fps, video_pixel_format
          FROM media WHERE trashed_at IS NULL ORDER BY created_at DESC`,
       )
       .all() as MediaRow[];
@@ -329,20 +347,31 @@ export class MediaService {
   }
 
   public cancelUpload(adminId: string, uploadId: string): void {
-    const result = this.database
-      .prepare(
-        `UPDATE uploads SET state = 'cancelled', reserved_bytes = 0, finished_at = ?
-         WHERE id = ? AND owner_admin_id = ?
-           AND state IN ('authorized', 'uploading', 'received')`,
-      )
-      .run(this.now(), uploadId, adminId);
-    if (result.changes !== 1)
-      throw conflict("UPLOAD_NOT_CANCELLABLE", "上传无法取消");
-    this.database
-      .prepare(
-        "UPDATE token_jti SET revoked_at = ? WHERE kind = 'upload' AND subject_id = ?",
-      )
-      .run(this.now(), uploadId);
+    const row = this.database
+      .prepare("SELECT state FROM uploads WHERE id = ? AND owner_admin_id = ?")
+      .get(uploadId, adminId) as { readonly state: string } | undefined;
+    if (!row) throw notFound("上传不存在");
+    if (row.state !== "cancelled") {
+      const result = this.database
+        .prepare(
+          `UPDATE uploads SET state = 'cancelled', reserved_bytes = 0, finished_at = ?
+           WHERE id = ? AND owner_admin_id = ?
+             AND state IN ('authorized', 'uploading', 'received')`,
+        )
+        .run(this.now(), uploadId, adminId);
+      if (result.changes !== 1)
+        throw conflict(
+          "UPLOAD_NOT_CANCELLABLE",
+          "上传已进入检片阶段，无法取消",
+        );
+      this.database
+        .prepare(
+          "UPDATE token_jti SET revoked_at = ? WHERE kind = 'upload' AND subject_id = ?",
+        )
+        .run(this.now(), uploadId);
+    }
+    rmSync(join(this.options.uploadRoot, uploadId), { force: true });
+    rmSync(join(this.options.uploadRoot, `${uploadId}.info`), { force: true });
   }
 
   public validateUploadToken(uploadId: string, token: string): UploadRow {
@@ -595,15 +624,19 @@ export class MediaService {
         | { readonly id: string; readonly media_id: string }
         | undefined;
       if (!job) throw conflict("JOB_LEASE_EXPIRED", "任务租约已失效");
+      const compatibility = evaluateCompatibility(result.probe);
+      const compatible = result.compatible && compatibility.compatible;
       requirePathWithin(
         result.finalPath,
-        result.compatible ? this.options.mediaRoot : this.options.inboxRoot,
+        compatible ? this.options.mediaRoot : this.options.inboxRoot,
       );
-      const state = result.compatible ? "published" : "incompatible";
+      const state = compatible ? "published" : "incompatible";
       this.database
         .prepare(
           `UPDATE media
-           SET state = ?, bytes = ?, sha256 = ?, probe_json = ?, duration_ms = ?
+           SET state = ?, bytes = ?, sha256 = ?, probe_json = ?, duration_ms = ?,
+               video_codec = ?, playback_support = ?, video_width = ?,
+               video_height = ?, video_fps = ?, video_pixel_format = ?
            WHERE id = ?`,
         )
         .run(
@@ -616,6 +649,12 @@ export class MediaService {
             finalPath: result.finalPath,
           }),
           result.durationMs,
+          compatibility.video.codec,
+          compatibility.playbackSupport,
+          compatibility.video.width,
+          compatibility.video.height,
+          compatibility.video.fps,
+          compatibility.video.pixelFormat,
           job.media_id,
         );
       this.database
@@ -697,7 +736,9 @@ export class MediaService {
   private getMediaRow(mediaId: string): MediaRow {
     const row = this.database
       .prepare(
-        `SELECT id, storage_key, display_name, state, bytes, mime, duration_ms, created_at
+        `SELECT id, storage_key, display_name, state, bytes, mime, duration_ms, created_at,
+                video_codec, playback_support, video_width, video_height,
+                video_fps, video_pixel_format
          FROM media WHERE id = ? AND trashed_at IS NULL`,
       )
       .get(mediaId) as MediaRow | undefined;
@@ -765,6 +806,14 @@ function serializeMedia(row: MediaRow) {
     bytes: row.bytes,
     mime: row.mime,
     durationMs: row.duration_ms,
+    video: {
+      codec: row.video_codec,
+      playbackSupport: row.playback_support,
+      width: row.video_width,
+      height: row.video_height,
+      fps: row.video_fps,
+      pixelFormat: row.video_pixel_format,
+    },
     createdAt: new Date(row.created_at).toISOString(),
   };
 }

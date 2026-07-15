@@ -44,13 +44,13 @@ export class AuthService {
 
   public async bootstrapAdmin(
     usernameInput: string,
-    password: string,
+    code: string,
   ): Promise<AdminIdentity> {
     const username = usernameInput.trim();
     if (username.length === 0 || username.length > 64) {
       throw new Error("管理员用户名长度必须为 1–64 个字符");
     }
-    if (password.length < 12) throw new Error("管理员密码至少需要 12 个字符");
+    requireAccessCode(code);
 
     const existing = this.database
       .prepare("SELECT COUNT(*) AS count FROM admin_users")
@@ -61,7 +61,7 @@ export class AuthService {
       throw conflict("ADMIN_ALREADY_EXISTS", "管理员账户已经初始化");
     }
 
-    const passwordHash = await hashPassword(password);
+    const passwordHash = await hashPassword(code);
     const admin = { id: uuidv7(), username };
     const timestamp = this.now();
 
@@ -76,17 +76,15 @@ export class AuthService {
     return admin;
   }
 
-  public async login(
-    username: string,
-    password: string,
-  ): Promise<AdminLoginResult> {
+  public async login(code: string): Promise<AdminLoginResult> {
+    requireAccessCode(code);
     const row = this.database
       .prepare(
-        "SELECT id, username, password_hash FROM admin_users WHERE username = ? COLLATE NOCASE",
+        "SELECT id, username, password_hash FROM admin_users ORDER BY created_at ASC LIMIT 1",
       )
-      .get(username.trim()) as AdminRow | undefined;
-    if (!row || !(await verifyPassword(row.password_hash, password))) {
-      throw unauthorized("用户名或密码错误");
+      .get() as AdminRow | undefined;
+    if (!row || !(await verifyPassword(row.password_hash, code))) {
+      throw unauthorized("放映口令错误");
     }
 
     const credential = createSessionCredential();
@@ -112,6 +110,35 @@ export class AuthService {
       csrfToken: credential.csrfToken,
       expiresAt,
     };
+  }
+
+  public async configureAccessCode(code: string): Promise<AdminIdentity> {
+    requireAccessCode(code);
+    const rows = this.database
+      .prepare(
+        "SELECT id, username, password_hash FROM admin_users ORDER BY created_at ASC",
+      )
+      .all() as AdminRow[];
+    if (rows.length === 0) return this.bootstrapAdmin("projectionist", code);
+    if (rows.length > 1) {
+      throw conflict("MULTIPLE_ADMINS", "检测到多个管理员，拒绝修改放映口令");
+    }
+    const admin = rows[0]!;
+    const passwordHash = await hashPassword(code);
+    const timestamp = this.now();
+    this.database.transaction(() => {
+      this.database
+        .prepare(
+          "UPDATE admin_users SET password_hash = ?, password_changed_at = ? WHERE id = ?",
+        )
+        .run(passwordHash, timestamp, admin.id);
+      this.database
+        .prepare(
+          "UPDATE admin_sessions SET revoked_at = ? WHERE admin_id = ? AND revoked_at IS NULL",
+        )
+        .run(timestamp, admin.id);
+    })();
+    return { id: admin.id, username: admin.username };
   }
 
   public authenticate(sessionToken: string | undefined): AdminSessionRow {
@@ -144,4 +171,8 @@ export class AuthService {
       )
       .run(this.now(), hashToken(sessionToken));
   }
+}
+
+function requireAccessCode(code: string): void {
+  if (!/^\d{6}$/.test(code)) throw new Error("放映口令必须为 6 位数字");
 }

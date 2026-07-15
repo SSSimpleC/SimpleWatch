@@ -16,7 +16,7 @@ test("a kicked member is removed from real LiveKit and cannot reuse the token", 
   try {
     const login = await hostApi.post("/api/v1/admin/login", {
       headers: { origin: browserOrigin },
-      data: { username: "rtc-admin", password: "rtc-password-strong" },
+      data: { code: "260713" },
     });
     expect(login.status()).toBe(200);
     const adminCsrf = (await login.json()) as { csrfToken: string };
@@ -29,9 +29,7 @@ test("a kicked member is removed from real LiveKit and cannot reuse the token", 
         cookie: adminCookie ?? "",
       },
       data: {
-        password: "rtc-shared-password",
         hostNickname: "RTC Host",
-        maxMembers: 5,
       },
     });
     expect(created.status()).toBe(201);
@@ -41,9 +39,12 @@ test("a kicked member is removed from real LiveKit and cannot reuse the token", 
     };
     const hostRoomCookie = created.headers()["set-cookie"]?.split(";", 1)[0];
     expect(hostRoomCookie).toBeTruthy();
-    const joined = await memberApi.post(`/api/v1/rooms/${room.room.id}/join`, {
+    const joined = await memberApi.post("/api/v1/rooms/active/join", {
       headers: { origin: browserOrigin },
-      data: { nickname: "Kicked Member", password: "rtc-shared-password" },
+      data: {
+        nickname: "Kicked Member",
+        inviteToken: "rtc-friend-invite-token-at-least-32-characters",
+      },
     });
     expect(joined.status()).toBe(200);
     const member = (await joined.json()) as {

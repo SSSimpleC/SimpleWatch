@@ -1,8 +1,10 @@
+import { timingSafeEqual } from "node:crypto";
+
 import { v7 as uuidv7 } from "uuid";
 
 import type {
   CreateRoomRequest,
-  JoinRoomRequest,
+  JoinActiveRoomRequest,
   RoomCommandRequest,
   RoomSnapshot,
   TransportAnchor,
@@ -22,7 +24,6 @@ import {
   createSessionCredential,
   hashPassword,
   hashToken,
-  verifyPassword,
   verifyTokenHash,
 } from "../security.js";
 
@@ -97,6 +98,7 @@ export class RoomService {
   public constructor(
     private readonly database: AppDatabase,
     private readonly publicOrigin: string,
+    private readonly friendInviteToken: string,
     private readonly now: () => number = Date.now,
   ) {}
 
@@ -105,7 +107,7 @@ export class RoomService {
     input: CreateRoomRequest,
   ): Promise<CreateRoomResult> {
     const nickname = normalizeNickname(input.hostNickname);
-    const passwordHash = await hashPassword(input.password);
+    const passwordHash = await hashPassword(createOpaqueToken(32));
     const credential = createSessionCredential();
     const roomId = uuidv7();
     const memberId = uuidv7();
@@ -163,7 +165,7 @@ export class RoomService {
 
     return {
       roomId,
-      joinUrl: `${this.publicOrigin}/join/${roomId}`,
+      joinUrl: `${this.publicOrigin}/join/${this.friendInviteToken}`,
       member: { id: memberId, nickname, role: "host" },
       sessionToken: credential.token,
       csrfToken: credential.csrfToken,
@@ -171,21 +173,17 @@ export class RoomService {
     };
   }
 
-  public async joinRoom(
-    roomId: string,
-    input: JoinRoomRequest,
-  ): Promise<RoomSessionResult> {
+  public joinActiveRoom(input: JoinActiveRoomRequest): RoomSessionResult {
+    if (!safeEqual(input.inviteToken, this.friendInviteToken)) {
+      throw notFound("好友链接无效");
+    }
     const room = this.database
       .prepare(
-        "SELECT id, password_hash, status, max_members, created_at FROM rooms WHERE id = ?",
+        "SELECT id, password_hash, status, max_members, created_at FROM rooms WHERE status = 'active' LIMIT 1",
       )
-      .get(roomId) as RoomRow | undefined;
-    if (!room) throw notFound("房间不存在");
-    if (room.status !== "active")
-      throw new AppError(410, "ROOM_CLOSED", "房间已经关闭");
-    if (!(await verifyPassword(room.password_hash, input.password))) {
-      throw unauthorized("房间密码错误");
-    }
+      .get() as RoomRow | undefined;
+    if (!room) throw new AppError(410, "ROOM_CLOSED", "放映室尚未开放");
+    const roomId = room.id;
 
     const nickname = normalizeNickname(input.nickname);
     const memberId = uuidv7();
@@ -243,6 +241,94 @@ export class RoomService {
       sessionToken: credential.token,
       csrfToken: credential.csrfToken,
       expiresAt,
+    };
+  }
+
+  public createActiveHostSession(adminId: string): CreateRoomResult {
+    const row = this.database
+      .prepare(
+        `SELECT r.id AS room_id, s.host_member_id, m.nickname
+         FROM rooms r
+         JOIN room_state s ON s.room_id = r.id
+         JOIN room_members m ON m.member_id = s.host_member_id
+         WHERE r.status = 'active' AND r.created_by = ?
+           AND m.left_at IS NULL AND m.kicked_at IS NULL
+         LIMIT 1`,
+      )
+      .get(adminId) as
+      | {
+          readonly room_id: string;
+          readonly host_member_id: string;
+          readonly nickname: string;
+        }
+      | undefined;
+    if (!row) throw notFound("当前没有可接管的活动房间");
+    const credential = createSessionCredential();
+    const timestamp = this.now();
+    const expiresAt = timestamp + 12 * 60 * 60 * 1000;
+    this.database.transaction(() => {
+      this.database
+        .prepare(
+          "UPDATE room_sessions SET revoked_at = ? WHERE member_id = ? AND revoked_at IS NULL",
+        )
+        .run(timestamp, row.host_member_id);
+      this.insertRoomSession(
+        credential.tokenHash,
+        row.room_id,
+        row.host_member_id,
+        row.nickname,
+        credential.csrfHash,
+        expiresAt,
+        timestamp,
+      );
+      this.database
+        .prepare("UPDATE room_members SET last_seen_at = ? WHERE member_id = ?")
+        .run(timestamp, row.host_member_id);
+    })();
+    return {
+      roomId: row.room_id,
+      joinUrl: `${this.publicOrigin}/join/${this.friendInviteToken}`,
+      member: { id: row.host_member_id, nickname: row.nickname, role: "host" },
+      sessionToken: credential.token,
+      csrfToken: credential.csrfToken,
+      expiresAt,
+    };
+  }
+
+  public getActiveRoomSummary(adminId: string) {
+    const room = this.database
+      .prepare(
+        `SELECT id, created_at FROM rooms
+         WHERE status = 'active' AND created_by = ? LIMIT 1`,
+      )
+      .get(adminId) as
+      | { readonly id: string; readonly created_at: number }
+      | undefined;
+    if (!room) return null;
+    const snapshot = this.getSnapshot(room.id);
+    const host = snapshot.members.find(
+      (member) => member.id === snapshot.hostMemberId,
+    );
+    return {
+      id: room.id,
+      createdAt: new Date(room.created_at).toISOString(),
+      inviteUrl: `${this.publicOrigin}/join/${this.friendInviteToken}`,
+      memberCount: snapshot.members.length,
+      onlineCount: snapshot.members.filter((member) => member.online).length,
+      maxMembers: 5 as const,
+      host: host
+        ? { id: host.id, nickname: host.nickname, online: host.online }
+        : null,
+      mode: snapshot.mode,
+      content: snapshot.media
+        ? {
+            kind: "vod" as const,
+            id: snapshot.media.id,
+            title: snapshot.media.title,
+          }
+        : snapshot.mode === "live"
+          ? { kind: "live" as const, title: "OBS 直播" }
+          : null,
     };
   }
 
@@ -565,14 +651,37 @@ export class RoomService {
     })();
   }
 
-  public async updateRoom(
+  public updateRoom(
     adminId: string,
     roomId: string,
     input: UpdateRoomRequest,
-  ): Promise<{ readonly id: string; readonly status: "active" | "closed" }> {
-    const passwordHash = input.rotatePassword
-      ? await hashPassword(input.rotatePassword)
-      : undefined;
+  ): { readonly id: string; readonly status: "active" | "closed" } {
+    if (!input.close) {
+      throw new AppError(400, "CLOSE_REQUIRED", "此接口仅用于关闭房间");
+    }
+    return this.closeRoom(adminId, roomId);
+  }
+
+  public closeActiveRoom(adminId: string): {
+    readonly id: string;
+    readonly status: "closed";
+  } {
+    const room = this.database
+      .prepare(
+        "SELECT id FROM rooms WHERE status = 'active' AND created_by = ? LIMIT 1",
+      )
+      .get(adminId) as { readonly id: string } | undefined;
+    if (!room) throw notFound("当前没有活动房间");
+    return this.closeRoom(adminId, room.id) as {
+      readonly id: string;
+      readonly status: "closed";
+    };
+  }
+
+  private closeRoom(
+    adminId: string,
+    roomId: string,
+  ): { readonly id: string; readonly status: "active" | "closed" } {
     const now = this.now();
 
     this.database.transaction(() => {
@@ -582,16 +691,25 @@ export class RoomService {
         | { readonly id: string; readonly status: "active" | "closed" }
         | undefined;
       if (!room) throw notFound("房间不存在");
-
-      if (passwordHash) {
-        this.database
-          .prepare("UPDATE rooms SET password_hash = ? WHERE id = ?")
-          .run(passwordHash, roomId);
-        if (input.revokeMembers) {
-          this.revokeNonHostMembers(roomId, now, "password-rotated");
-        }
-      }
-      if (input.close === true && room.status === "active") {
+      if (room.status === "active") {
+        const members = this.database
+          .prepare(
+            `SELECT member_id FROM room_members
+             WHERE room_id = ? AND left_at IS NULL AND kicked_at IS NULL`,
+          )
+          .all(roomId) as Array<{ readonly member_id: string }>;
+        const mediaSessionIds = this.database
+          .prepare(
+            `SELECT mediamtx_session_id FROM media_transport_sessions
+             WHERE room_id = ? AND closed_at IS NULL
+               AND mediamtx_session_id IS NOT NULL`,
+          )
+          .all(roomId)
+          .map(
+            (row) =>
+              (row as { readonly mediamtx_session_id: string })
+                .mediamtx_session_id,
+          );
         this.database
           .prepare(
             "UPDATE rooms SET status = 'closed', closed_at = ? WHERE id = ?",
@@ -599,9 +717,25 @@ export class RoomService {
           .run(now, roomId);
         this.database
           .prepare(
+            `UPDATE room_members SET kicked_at = COALESCE(kicked_at, ?), last_seen_at = ?
+             WHERE room_id = ? AND left_at IS NULL`,
+          )
+          .run(now, now, roomId);
+        this.database
+          .prepare(
             "UPDATE room_sessions SET revoked_at = ? WHERE room_id = ? AND revoked_at IS NULL",
           )
           .run(now, roomId);
+        this.database
+          .prepare(
+            `UPDATE token_jti SET revoked_at = ?
+             WHERE revoked_at IS NULL AND (
+               room_id = ? OR subject_id IN (
+                 SELECT member_id FROM room_members WHERE room_id = ?
+               )
+             )`,
+          )
+          .run(now, roomId, roomId);
         this.database
           .prepare(
             `UPDATE room_state
@@ -610,6 +744,51 @@ export class RoomService {
              WHERE room_id = ?`,
           )
           .run(now, roomId);
+        if (mediaSessionIds.length > 0) {
+          const eventId = uuidv7();
+          this.database
+            .prepare(
+              `INSERT INTO service_outbox(
+                id, kind, dedupe_key, payload_json, state, attempts,
+                not_before, lease_until, last_error, created_at, completed_at
+              ) VALUES (?, 'mediamtx.kick-sessions', ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL)`,
+            )
+            .run(
+              uuidv7(),
+              `mediamtx-force-close:${eventId}`,
+              JSON.stringify({
+                roomId,
+                memberId: "all",
+                sessionIds: mediaSessionIds,
+              }),
+              now,
+              now,
+            );
+        }
+        for (const member of members) {
+          const eventId = uuidv7();
+          this.database
+            .prepare(
+              `INSERT INTO rtc_revocations(
+                id, room_id, member_id, identity, reason, revoked_at, cleared_at
+              ) VALUES (?, ?, ?, ?, 'room-force-closed', ?, NULL)`,
+            )
+            .run(eventId, roomId, member.member_id, member.member_id, now);
+          this.database
+            .prepare(
+              `INSERT INTO service_outbox(
+                id, kind, dedupe_key, payload_json, state, attempts,
+                not_before, lease_until, last_error, created_at, completed_at
+              ) VALUES (?, 'rtc.remove-participant', ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL)`,
+            )
+            .run(
+              uuidv7(),
+              `rtc-force-close:${eventId}`,
+              JSON.stringify({ roomId, memberId: member.member_id }),
+              now,
+              now,
+            );
+        }
       }
     })();
 
@@ -724,43 +903,6 @@ export class RoomService {
       .run(next.member_id, timestamp, roomId);
     return true;
   }
-
-  private revokeNonHostMembers(
-    roomId: string,
-    timestamp: number,
-    reason: string,
-  ): void {
-    const members = this.database
-      .prepare(
-        `SELECT member_id FROM room_members
-         WHERE room_id = ? AND role = 'member' AND left_at IS NULL AND kicked_at IS NULL`,
-      )
-      .all(roomId) as Array<{ readonly member_id: string }>;
-    for (const member of members) {
-      this.database
-        .prepare("UPDATE room_members SET kicked_at = ? WHERE member_id = ?")
-        .run(timestamp, member.member_id);
-      this.database
-        .prepare(
-          "UPDATE room_sessions SET revoked_at = ? WHERE member_id = ? AND revoked_at IS NULL",
-        )
-        .run(timestamp, member.member_id);
-      this.database
-        .prepare(
-          `INSERT INTO rtc_revocations(
-            id, room_id, member_id, identity, reason, revoked_at, cleared_at
-          ) VALUES (?, ?, ?, ?, ?, ?, NULL)`,
-        )
-        .run(
-          uuidv7(),
-          roomId,
-          member.member_id,
-          member.member_id,
-          reason,
-          timestamp,
-        );
-    }
-  }
 }
 
 function normalizeNickname(value: string): string {
@@ -778,6 +920,15 @@ function normalizeNickname(value: string): string {
 
 function foldNickname(value: string): string {
   return value.normalize("NFC").toLocaleLowerCase();
+}
+
+function safeEqual(left: string, right: string): boolean {
+  const leftBytes = Buffer.from(left);
+  const rightBytes = Buffer.from(right);
+  return (
+    leftBytes.length === rightBytes.length &&
+    timingSafeEqual(leftBytes, rightBytes)
+  );
 }
 
 function isSqliteConstraint(error: unknown): boolean {

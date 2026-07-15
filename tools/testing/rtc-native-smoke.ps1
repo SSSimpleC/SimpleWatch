@@ -28,6 +28,7 @@ $env:HOST = "127.0.0.1"
 $env:PORT = "13900"
 $env:DATABASE_PATH = Join-Path $stateRoot "simplewatch.sqlite3"
 $env:PUBLIC_ORIGIN = "http://127.0.0.1:18080"
+$env:FRIEND_INVITE_TOKEN = "rtc-friend-invite-token-at-least-32-characters"
 $env:SESSION_SECRET = "rtc-predeploy-session-secret-at-least-32-bytes"
 $env:CONTENT_SIGNING_SECRET = "rtc-predeploy-content-secret-at-least-32-bytes"
 $env:INTERNAL_HOOK_TOKEN = "rtc-predeploy-internal-token-at-least-32-bytes"
@@ -42,8 +43,7 @@ $env:INBOX_ROOT = $roots[2]
 $env:SUBTITLE_ROOT = $roots[3]
 $env:TUS_ENDPOINT = "http://127.0.0.1:18080/files/"
 $env:ALLOW_NONINTERACTIVE_BOOTSTRAP = "true"
-$env:BOOTSTRAP_ADMIN_USERNAME = "rtc-admin"
-$env:BOOTSTRAP_ADMIN_PASSWORD = "rtc-password-strong"
+$env:BOOTSTRAP_ADMIN_CODE = "260713"
 $env:WORKER_ID = "rtc-native-worker"
 $env:API_ORIGIN = "http://127.0.0.1:13900"
 $env:FFPROBE_PATH = "ffprobe"
@@ -77,10 +77,10 @@ try {
   $worker = Start-Process -FilePath $node -ArgumentList @($workerTsx, "apps/worker/src/main.ts") -WorkingDirectory $repoRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $logRoot "worker.out.log") -RedirectStandardError (Join-Path $logRoot "worker.err.log")
 
   $origin = $env:PUBLIC_ORIGIN
-  $login = Invoke-WebRequest -Method Post -Uri "http://127.0.0.1:13900/api/v1/admin/login" -Headers @{ Origin = $origin } -ContentType "application/json" -Body '{"username":"rtc-admin","password":"rtc-password-strong"}'
+  $login = Invoke-WebRequest -Method Post -Uri "http://127.0.0.1:13900/api/v1/admin/login" -Headers @{ Origin = $origin } -ContentType "application/json" -Body '{"code":"260713"}'
   $adminCookie = ($login.Headers["Set-Cookie"] -split ";")[0]
   $adminCsrf = ($login.Content | ConvertFrom-Json).csrfToken
-  $room = Invoke-WebRequest -Method Post -Uri "http://127.0.0.1:13900/api/v1/rooms" -Headers @{ Origin = $origin; Cookie = $adminCookie; "X-CSRF-Token" = $adminCsrf } -ContentType "application/json" -Body '{"password":"rtc-shared-password","hostNickname":"RTC Host","maxMembers":5}'
+  $room = Invoke-WebRequest -Method Post -Uri "http://127.0.0.1:13900/api/v1/rooms" -Headers @{ Origin = $origin; Cookie = $adminCookie; "X-CSRF-Token" = $adminCsrf } -ContentType "application/json" -Body '{"hostNickname":"RTC Host"}'
   $roomBody = $room.Content | ConvertFrom-Json
   $roomCookie = ($room.Headers["Set-Cookie"] -split ";")[0]
   $roomId = $roomBody.room.id

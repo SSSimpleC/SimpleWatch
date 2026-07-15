@@ -32,31 +32,26 @@ export const errorResponseSchema = z.object({
 export type ErrorResponse = z.infer<typeof errorResponseSchema>;
 
 export const adminLoginRequestSchema = z.object({
-  username: z.string().trim().min(1).max(64),
-  password: z.string().min(1).max(1024),
+  code: z.string().regex(/^\d{6}$/, "放映口令必须为 6 位数字"),
 });
 
 export const createRoomRequestSchema = z.object({
-  password: z.string().min(8).max(1024),
   hostNickname: z.string().trim().min(1).max(24),
-  maxMembers: z.literal(5).default(5),
 });
 export type CreateRoomRequest = z.infer<typeof createRoomRequestSchema>;
 
-export const joinRoomRequestSchema = z.object({
+export const joinActiveRoomRequestSchema = z.object({
   nickname: z.string().trim().min(1).max(24),
-  password: z.string().min(1).max(1024),
+  inviteToken: z.string().regex(/^[A-Za-z0-9_-]{32,128}$/),
 });
-export type JoinRoomRequest = z.infer<typeof joinRoomRequestSchema>;
+export type JoinActiveRoomRequest = z.infer<typeof joinActiveRoomRequestSchema>;
 
 export const updateRoomRequestSchema = z
   .object({
-    rotatePassword: z.string().min(8).max(1024).optional(),
-    revokeMembers: z.boolean().default(false),
     close: z.boolean().optional(),
   })
-  .refine((value) => Boolean(value.rotatePassword) || value.close === true, {
-    message: "必须指定 rotatePassword 或 close",
+  .refine((value) => value.close === true, {
+    message: "必须指定 close",
   });
 export type UpdateRoomRequest = z.infer<typeof updateRoomRequestSchema>;
 
@@ -96,6 +91,14 @@ export const mediaSchema = z.object({
   bytes: z.number().int().nonnegative(),
   mime: z.string().nullable(),
   durationMs: z.number().int().nonnegative().nullable(),
+  video: z.object({
+    codec: z.enum(["h264", "hevc"]).nullable(),
+    playbackSupport: z.enum(["broad", "device-dependent", "unsupported"]),
+    width: z.number().int().positive().nullable(),
+    height: z.number().int().positive().nullable(),
+    fps: z.number().nonnegative().nullable(),
+    pixelFormat: z.string().nullable(),
+  }),
   createdAt: z.iso.datetime(),
   subtitles: z.array(
     z.object({
@@ -152,6 +155,40 @@ export const roomMemberSchema = z.object({
   role: z.enum(["host", "member"]),
   online: z.boolean(),
 });
+
+export const liveStatusSchema = z.object({
+  state: z.enum(["offline", "online", "unknown"]),
+  hasVideo: z.boolean(),
+  hasAudio: z.boolean(),
+  checkedAt: z.iso.datetime(),
+});
+
+export const activeRoomSummarySchema = z
+  .object({
+    id: roomIdSchema,
+    createdAt: z.iso.datetime(),
+    inviteUrl: z.url(),
+    memberCount: z.number().int().min(1).max(5),
+    onlineCount: z.number().int().min(0).max(5),
+    maxMembers: z.literal(5),
+    host: z
+      .object({
+        id: participantIdSchema,
+        nickname: z.string().min(1).max(24),
+        online: z.boolean(),
+      })
+      .nullable(),
+    mode: roomModeSchema,
+    content: z
+      .object({
+        kind: z.enum(["vod", "live"]),
+        id: z.string().uuid().optional(),
+        title: z.string(),
+      })
+      .nullable(),
+    live: liveStatusSchema,
+  })
+  .nullable();
 
 export const roomSnapshotSchema = z.object({
   roomId: roomIdSchema,

@@ -1,10 +1,15 @@
 import { useQuery } from "@tanstack/react-query";
 import type { Room as LiveKitRoom } from "livekit-client";
 import { v7 as uuidv7 } from "uuid";
-import { type FormEvent, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
-import { api, ApiError, type MediaItem, type RoomSnapshot } from "../api.js";
+import {
+  api,
+  type LiveStatus,
+  type MediaItem,
+  type RoomSnapshot,
+} from "../api.js";
 import { loadPreferences, savePreferences } from "../preferences.js";
 import { useSession } from "../store.js";
 
@@ -21,6 +26,12 @@ export function RoomPage() {
   const voiceRoomRef = useRef<LiveKitRoom | null>(null);
   const voiceTracksRef = useRef<HTMLDivElement | null>(null);
   const liveReaderRef = useRef<{ close(): void } | null>(null);
+  const liveStreamRef = useRef<MediaStream | null>(null);
+  const [programEnabled, setProgramEnabled] = useState(false);
+  const [liveProgramState, setLiveProgramState] = useState<
+    "idle" | "connecting" | "playing" | "error"
+  >("idle");
+  const [liveRetry, setLiveRetry] = useState(0);
   const [voiceState, setVoiceState] = useState<
     "idle" | "connecting" | "connected" | "error"
   >("idle");
@@ -41,6 +52,12 @@ export function RoomPage() {
     queryFn: () => api<MediaItem[]>("/api/v1/media"),
     enabled: isHost && Boolean(adminCsrf),
   });
+  const liveStatus = useQuery({
+    queryKey: ["live-status", roomId],
+    queryFn: () => api<LiveStatus>(`/api/v1/rooms/${roomId}/live/status`),
+    enabled: joined && snapshot?.mode === "live",
+    refetchInterval: 2000,
+  });
 
   useEffect(() => {
     let active = true;
@@ -54,7 +71,7 @@ export function RoomPage() {
         setSnapshot(bootstrap.snapshot);
         setJoined(true);
       })
-      .catch(() => undefined);
+      .catch(() => setError("房间会话已失效，请重新打开好友链接"));
     return () => {
       active = false;
     };
@@ -122,34 +139,58 @@ export function RoomPage() {
   useEffect(() => {
     if (!joined) return;
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(
-      `${protocol}//${location.host}/api/v1/rooms/${roomId}/ws`,
-      "simplewatch.v1",
-    );
-    socketRef.current = socket;
-    socket.addEventListener("open", () => {
-      setConnected(true);
-      socket.send(JSON.stringify(envelope(roomId, "room.hello", {})));
-    });
-    socket.addEventListener("close", () => setConnected(false));
-    socket.addEventListener("message", (event) => {
-      const message = JSON.parse(String(event.data)) as {
-        type: string;
-        payload: unknown;
-      };
-      if (message.type === "room.snapshot" || message.type === "host.changed") {
-        setSnapshot(message.payload as RoomSnapshot);
-      }
-      if (message.type === "room.command.rejected")
-        setError("操作未生效，状态已刷新");
-    });
-    return () => socket.close(1000, "page leave");
+    let disposed = false;
+    let retryTimer = 0;
+    let retryAttempt = 0;
+
+    const connect = () => {
+      if (disposed) return;
+      const socket = new WebSocket(
+        `${protocol}//${location.host}/api/v1/rooms/${roomId}/ws`,
+        "simplewatch.v1",
+      );
+      socketRef.current = socket;
+      socket.addEventListener("open", () => {
+        retryAttempt = 0;
+        setConnected(true);
+        socket.send(JSON.stringify(envelope(roomId, "room.hello", {})));
+      });
+      socket.addEventListener("close", () => {
+        setConnected(false);
+        if (disposed) return;
+        const delay = Math.min(15_000, 1000 * 2 ** retryAttempt);
+        retryAttempt += 1;
+        retryTimer = window.setTimeout(connect, delay);
+      });
+      socket.addEventListener("message", (event) => {
+        const message = JSON.parse(String(event.data)) as {
+          type: string;
+          payload: unknown;
+        };
+        if (
+          message.type === "room.snapshot" ||
+          message.type === "host.changed"
+        ) {
+          setSnapshot(message.payload as RoomSnapshot);
+        }
+        if (message.type === "room.command.rejected")
+          setError("操作未生效，状态已刷新");
+      });
+    };
+
+    connect();
+    return () => {
+      disposed = true;
+      window.clearTimeout(retryTimer);
+      socketRef.current?.close(1000, "page leave");
+      socketRef.current = null;
+    };
   }, [joined, roomId]);
 
   useEffect(() => {
     const video = videoRef.current;
     const transport = snapshot?.transport;
-    if (!video || !transport) return;
+    if (!video || !transport || snapshot?.mode !== "vod") return;
     const desired =
       transport.positionSec +
       (transport.state === "playing"
@@ -158,9 +199,22 @@ export function RoomPage() {
     if (Math.abs(video.currentTime - desired) > 0.8)
       video.currentTime = Math.max(0, desired);
     video.playbackRate = transport.rate;
-    if (transport.state === "playing") void video.play().catch(() => undefined);
+    if (transport.state === "playing" && programEnabled)
+      void video.play().catch(() => undefined);
     else video.pause();
-  }, [snapshot?.revision, snapshot?.transport]);
+  }, [programEnabled, snapshot?.mode, snapshot?.revision, snapshot?.transport]);
+
+  useEffect(() => {
+    if (snapshot?.mode !== "live") {
+      closeLiveProgram();
+      return;
+    }
+    if (!programEnabled || liveStatus.data?.state !== "online") {
+      if (liveStatus.data?.state === "offline") closeLiveProgram();
+      return;
+    }
+    if (!liveReaderRef.current) void enableLiveProgram();
+  }, [liveRetry, liveStatus.data?.state, programEnabled, snapshot?.mode]);
 
   useEffect(
     () => () => {
@@ -168,41 +222,10 @@ export function RoomPage() {
       voiceRoomRef.current = null;
       liveReaderRef.current?.close();
       liveReaderRef.current = null;
+      liveStreamRef.current = null;
     },
     [],
   );
-
-  async function join(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const data = new FormData(event.currentTarget);
-    try {
-      const result = await api<{ member: { id: string }; csrfToken: string }>(
-        `/api/v1/rooms/${roomId}/join`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            nickname: data.get("nickname"),
-            password: data.get("password"),
-          }),
-        },
-      );
-      setRoomCsrf(result.csrfToken);
-      setMemberId(result.member.id);
-      const bootstrap = await api<{
-        snapshot: RoomSnapshot;
-        memberId: string;
-        csrfToken: string;
-      }>(`/api/v1/rooms/${roomId}/bootstrap`);
-      setRoomCsrf(bootstrap.csrfToken);
-      setMemberId(bootstrap.memberId);
-      setSnapshot(bootstrap.snapshot);
-      setJoined(true);
-    } catch (joinError) {
-      setError(
-        joinError instanceof ApiError ? joinError.message : "无法加入房间",
-      );
-    }
-  }
 
   function command(commandPayload: Record<string, unknown>) {
     if (!snapshot || socketRef.current?.readyState !== WebSocket.OPEN) return;
@@ -261,15 +284,19 @@ export function RoomPage() {
         autoSubscribe: true,
       });
       await voiceRoom.startAudio();
-      await voiceRoom.localParticipant.setMicrophoneEnabled(
-        true,
-        preferences.inputDeviceId
-          ? { deviceId: preferences.inputDeviceId }
-          : undefined,
-      );
       voiceRoomRef.current = voiceRoom;
-      if (snapshot?.mode === "live") await enableLiveProgram();
-      setMicrophoneEnabled(true);
+      try {
+        await voiceRoom.localParticipant.setMicrophoneEnabled(
+          true,
+          preferences.inputDeviceId
+            ? { deviceId: preferences.inputDeviceId }
+            : undefined,
+        );
+        setMicrophoneEnabled(true);
+      } catch {
+        setMicrophoneEnabled(false);
+        setError("麦克风未授权，已使用只听模式；节目播放不受影响");
+      }
       setVoiceState("connected");
     } catch (voiceError) {
       voiceRoomRef.current?.disconnect();
@@ -283,30 +310,90 @@ export function RoomPage() {
 
   async function enableLiveProgram() {
     if (!roomCsrf || liveReaderRef.current) return;
-    const credential = await api<{ url: string; token: string }>(
-      `/api/v1/rooms/${roomId}/credentials`,
-      {
-        method: "POST",
-        headers: { "x-csrf-token": roomCsrf },
-        body: JSON.stringify({ purpose: "whep" }),
-      },
-    );
-    await import("../vendor/mediamtx-reader.js");
-    liveReaderRef.current = new window.MediaMTXWebRTCReader({
-      url: credential.url,
-      user: "",
-      pass: "",
-      token: credential.token,
-      onTrack: (event) => {
-        const video = videoRef.current;
-        if (!video) return;
-        const stream =
-          event.streams[0] ?? new MediaStream(event.track ? [event.track] : []);
-        video.srcObject = stream;
-        void video.play().catch(() => undefined);
-      },
-      onError: (readerError) => setError(`直播信号中断：${readerError}`),
-    });
+    setLiveProgramState("connecting");
+    try {
+      const credential = await api<{ url: string; token: string }>(
+        `/api/v1/rooms/${roomId}/credentials`,
+        {
+          method: "POST",
+          headers: { "x-csrf-token": roomCsrf },
+          body: JSON.stringify({ purpose: "whep" }),
+        },
+      );
+      await import("../vendor/mediamtx-reader.js");
+      liveReaderRef.current = new window.MediaMTXWebRTCReader({
+        url: credential.url,
+        user: "",
+        pass: "",
+        token: credential.token,
+        onTrack: (event) => {
+          const video = videoRef.current;
+          if (!video) return;
+          const stream = liveStreamRef.current ?? new MediaStream();
+          liveStreamRef.current = stream;
+          const incoming =
+            event.streams[0]?.getTracks() ?? (event.track ? [event.track] : []);
+          for (const track of incoming) {
+            if (
+              !stream.getTracks().some((candidate) => candidate.id === track.id)
+            )
+              stream.addTrack(track);
+          }
+          video.srcObject = stream;
+          video.volume = preferences.programVolume / 100;
+          void video
+            .play()
+            .then(() => setLiveProgramState("playing"))
+            .catch(() => {
+              setLiveProgramState("error");
+              setError("浏览器阻止了节目声音，请再次点击“启用节目声音”");
+            });
+        },
+        onError: (readerError) => {
+          scheduleLiveRetry(`直播信号中断，正在重连：${readerError}`);
+        },
+      });
+    } catch (readerError) {
+      scheduleLiveRetry(
+        readerError instanceof Error
+          ? `直播连接失败，正在重试：${readerError.message}`
+          : "直播连接失败，正在重试",
+      );
+    }
+  }
+
+  function scheduleLiveRetry(message: string) {
+    closeLiveProgram();
+    setLiveProgramState("error");
+    setError(message);
+    window.setTimeout(() => setLiveRetry((value) => value + 1), 2000);
+  }
+
+  function closeLiveProgram() {
+    liveReaderRef.current?.close();
+    liveReaderRef.current = null;
+    liveStreamRef.current?.getTracks().forEach((track) => track.stop());
+    liveStreamRef.current = null;
+    if (videoRef.current?.srcObject) videoRef.current.srcObject = null;
+    setLiveProgramState("idle");
+  }
+
+  async function enableProgramSound() {
+    setProgramEnabled(true);
+    setError("");
+    const video = videoRef.current;
+    if (video) {
+      video.muted = false;
+      video.volume = preferences.programVolume / 100;
+      if (snapshot?.mode === "vod" && snapshot.transport?.state === "playing") {
+        await video
+          .play()
+          .catch(() => setError("无法启用节目声音，请检查浏览器媒体权限"));
+      }
+    }
+    if (snapshot?.mode === "live" && liveStatus.data?.state === "online") {
+      await enableLiveProgram();
+    }
   }
 
   async function toggleMicrophone() {
@@ -371,20 +458,14 @@ export function RoomPage() {
         <Link to="/" className="brand-mark">
           SW / 门厅
         </Link>
-        <form className="admission-card" onSubmit={join}>
-          <p className="eyebrow">ADMISSION / {roomId.slice(0, 8)}</p>
-          <h1>报上名字，领取座位。</h1>
-          <label>
-            昵称
-            <input name="nickname" required maxLength={24} autoFocus />
-          </label>
-          <label>
-            房间口令
-            <input name="password" required type="password" />
-          </label>
-          <button type="submit">进入放映室</button>
+        <section className="admission-card">
+          <p className="eyebrow">SESSION REQUIRED</p>
+          <h1>这张入场券已经失效。</h1>
+          <p className="muted-copy">
+            请重新打开好友发送的固定入场链接，只需输入昵称即可回来。
+          </p>
           <output>{error}</output>
-        </form>
+        </section>
       </main>
     );
 
@@ -409,10 +490,21 @@ export function RoomPage() {
         <section className="screen-frame">
           <div className="screen-meta">
             <span>
-              {snapshot?.mode === "vod" ? "VOD PROGRAM" : "WAITING FOR REEL"}
+              {snapshot?.mode === "vod"
+                ? "VOD PROGRAM"
+                : snapshot?.mode === "live"
+                  ? `LIVE / ${liveLabel(liveStatus.data?.state)}`
+                  : "WAITING FOR REEL"}
             </span>
             <span>REV {snapshot?.revision ?? 0}</span>
           </div>
+          {media.data?.video.codec === "hevc" && !supportsHevcPlayback() && (
+            <div className="program-warning" role="status">
+              这条影片使用
+              H.265。当前浏览器未声明支持，仍可尝试播放；若出现黑屏或解码错误，请换用支持
+              H.265 的 Safari、Edge 或设备。
+            </div>
+          )}
           {snapshot?.mode === "live" ? (
             <video ref={videoRef} controls={false} playsInline />
           ) : snapshot?.media ? (
@@ -421,6 +513,13 @@ export function RoomPage() {
               src={`/api/v1/media/${snapshot.media.id}/content`}
               controls={false}
               playsInline
+              onError={() =>
+                setError(
+                  media.data?.video.codec === "hevc"
+                    ? "当前终端无法解码这条 H.265 影片，服务器不会转码"
+                    : "影片加载失败，请检查网络或文件状态",
+                )
+              }
             >
               {media.data?.subtitles.map((subtitle) => (
                 <track
@@ -491,6 +590,19 @@ export function RoomPage() {
             </select>
           </div>
           <div className="local-mix">
+            <button
+              type="button"
+              className={
+                programEnabled ? "secondary-button active" : "secondary-button"
+              }
+              onClick={() => void enableProgramSound()}
+            >
+              {programEnabled
+                ? snapshot?.mode === "live" && liveProgramState === "connecting"
+                  ? "节目连接中…"
+                  : "节目声音已启用"
+                : "启用节目声音"}
+            </button>
             <label>
               节目音量{" "}
               <input
@@ -552,6 +664,12 @@ export function RoomPage() {
               </button>
               {publishConfig && (
                 <div className="publish-config">
+                  <div className="obs-preset">
+                    <strong>OBS 推荐参数</strong>
+                    <span>1920×1080 · 30 fps · H.264 硬件编码</span>
+                    <span>CBR 6000 Kbps（链路稳定后可升至 8000）</span>
+                    <span>关键帧间隔 2 秒 · B 帧 0 · Opus 48 kHz 立体声</span>
+                  </div>
                   <code>{publishConfig.url}</code>
                   <code>{publishConfig.token}</code>
                   <button
@@ -632,7 +750,7 @@ export function RoomPage() {
                 disabled={voiceState === "connecting"}
                 onClick={() => void enableVoice()}
               >
-                进入并启用声音
+                加入语音通话
               </button>
             )}
             <div ref={voiceTracksRef} hidden aria-hidden="true" />
@@ -660,4 +778,23 @@ function remoteVolume(
 
 function envelope(roomId: string, type: string, payload: unknown) {
   return { v: 1, type, id: uuidv7(), roomId, sentAtMs: Date.now(), payload };
+}
+
+function supportsHevcPlayback(): boolean {
+  if (typeof document === "undefined") return false;
+  const video = document.createElement("video");
+  return Boolean(
+    video.canPlayType('video/mp4; codecs="hvc1"') ||
+    video.canPlayType('video/mp4; codecs="hev1"'),
+  );
+}
+
+function liveLabel(state: LiveStatus["state"] | undefined): string {
+  return state === "online"
+    ? "信号在线"
+    : state === "offline"
+      ? "等待 OBS"
+      : state === "unknown"
+        ? "状态未知"
+        : "正在检查";
 }

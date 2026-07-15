@@ -111,6 +111,30 @@ describe("media compatibility", () => {
     });
   });
 
+  it("accepts H.265 MP4 for device-dependent direct playback", () => {
+    const result = evaluateCompatibility({
+      ...compatibleProbe,
+      streams: [
+        {
+          codec_type: "video",
+          codec_name: "hevc",
+          codec_tag_string: "hvc1",
+          pix_fmt: "yuv420p10le",
+          width: 1920,
+          height: 1080,
+          avg_frame_rate: "24/1",
+        },
+        compatibleProbe.streams[1],
+      ],
+    });
+    expect(result).toMatchObject({
+      compatible: true,
+      playbackSupport: "device-dependent",
+      reasons: [],
+      video: { codec: "hevc", codecTag: "hvc1", fps: 24 },
+    });
+  });
+
   it("reports every incompatible codec constraint", () => {
     const result = evaluateCompatibility({
       ...compatibleProbe,
@@ -132,7 +156,13 @@ describe("media compatibility", () => {
       ],
     });
     expect(result.compatible).toBe(false);
-    expect(result.reasons).toHaveLength(7);
+    expect(result.reasons).toEqual([
+      "视频分辨率必须不高于 1920×1080",
+      "视频帧率必须不高于 30 fps",
+      "音频编码必须为 AAC-LC",
+      "节目音频必须为双声道",
+      "节目音频采样率必须为 48 kHz",
+    ]);
   });
 
   it("reports missing tracks, malformed rates, unknown sizes and non-MP4", () => {

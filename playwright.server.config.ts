@@ -8,8 +8,8 @@ export default defineConfig({
   use: {
     baseURL: "https://8.134.239.34",
     browserName: "chromium",
-    channel: "chrome",
-    ignoreHTTPSErrors: true,
+    channel: process.env.PLAYWRIGHT_CHANNEL ?? "msedge",
+    ignoreHTTPSErrors: false,
     launchOptions: {
       args: [
         "--use-fake-device-for-media-stream",

@@ -1,0 +1,15 @@
+[Unit]
+Description=Renew the SimpleWatch trusted IP certificate
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/simplewatch/current/tools/server/ip-cert.sh renew 8.134.239.34
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

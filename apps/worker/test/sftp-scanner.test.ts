@@ -6,6 +6,7 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,6 +14,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SftpScanner } from "../src/sftp-scanner.js";
 
 const roots: string[] = [];
+const testTempRoot = fileURLToPath(new URL("../../../tmp/", import.meta.url));
 
 afterEach(() => {
   for (const root of roots.splice(0))
@@ -21,7 +23,8 @@ afterEach(() => {
 
 describe("SftpScanner", () => {
   it("requires two stable observations and ignores .part files", () => {
-    const root = mkdtempSync(resolve("../../tmp/sftp-scanner-test-"));
+    mkdirSync(testTempRoot, { recursive: true });
+    const root = mkdtempSync(resolve(testTempRoot, "sftp-scanner-test-"));
     roots.push(root);
     const incoming = join(root, "incoming");
     const inbox = join(root, "inbox");

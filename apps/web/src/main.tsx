@@ -5,6 +5,7 @@ import { BrowserRouter, Route, Routes } from "react-router-dom";
 
 import { AdminPage } from "./pages/AdminPage.js";
 import { HomePage } from "./pages/HomePage.js";
+import { JoinPage } from "./pages/JoinPage.js";
 import { DiagnosticsPage } from "./pages/DiagnosticsPage.js";
 import { RoomPage } from "./pages/RoomPage.js";
 import { SettingsPage } from "./pages/SettingsPage.js";
@@ -20,6 +21,7 @@ createRoot(document.querySelector("#root")!).render(
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<HomePage />} />
+          <Route path="/join/:inviteToken" element={<JoinPage />} />
           <Route path="/admin" element={<AdminPage />} />
           <Route path="/room/:roomId" element={<RoomPage />} />
           <Route path="/settings" element={<SettingsPage />} />

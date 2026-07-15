@@ -1,14 +1,6 @@
-import { type FormEvent, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link } from "react-router-dom";
 
 export function HomePage() {
-  const [roomId, setRoomId] = useState("");
-  const navigate = useNavigate();
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
-    const normalized = roomId.trim();
-    if (normalized) void navigate(`/room/${encodeURIComponent(normalized)}`);
-  };
   return (
     <main className="landing">
       <div className="grain" aria-hidden="true" />
@@ -28,20 +20,14 @@ export function HomePage() {
         <p className="lede">
           一间只属于五个人的同步放映室。影片、直播、声音与字幕，在同一时刻抵达。
         </p>
-        <form className="join-strip" onSubmit={submit}>
-          <label htmlFor="room-id">房间编号</label>
-          <input
-            id="room-id"
-            value={roomId}
-            onChange={(event) => setRoomId(event.target.value)}
-            placeholder="粘贴 UUID"
-            autoComplete="off"
-          />
-          <button type="submit">推门入场</button>
-        </form>
+        <div className="invite-note">
+          <span>INVITATION ONLY</span>
+          <strong>请从好友发送的专属链接入场</strong>
+          <small>链接打开后只需输入昵称，不需要房间编号或口令。</small>
+        </div>
       </section>
       <footer className="landing-footer">
-        <span>H.264 / AAC / WEBVTT</span>
+        <span>H.264 / H.265 MP4</span>
         <span>最多 5 席</span>
         <span>端到端会话鉴权</span>
       </footer>

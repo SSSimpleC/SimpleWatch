@@ -9,6 +9,7 @@ const execFileAsync = promisify(execFile);
 const streamSchema = z.object({
   codec_type: z.enum(["video", "audio", "subtitle"]).or(z.string()),
   codec_name: z.string().optional(),
+  codec_tag_string: z.string().optional(),
   pix_fmt: z.string().optional(),
   width: z.number().int().optional(),
   height: z.number().int().optional(),
@@ -31,6 +32,8 @@ export type ProbeDocument = z.infer<typeof probeSchema>;
 
 export interface MediaCompatibility {
   readonly compatible: boolean;
+  readonly playbackSupport: "broad" | "device-dependent" | "unsupported";
+  readonly fastStart: boolean;
   readonly reasons: readonly string[];
   readonly durationMs: number | null;
   readonly bytes: number | null;
@@ -40,6 +43,7 @@ export interface MediaCompatibility {
     readonly height: number | null;
     readonly fps: number | null;
     readonly pixelFormat: string | null;
+    readonly codecTag: string | null;
   };
   readonly audio: {
     readonly codec: string | null;
@@ -63,12 +67,9 @@ export async function probeFile(
   const probe = probeSchema.parse(JSON.parse(stdout) as unknown);
   const base = evaluateCompatibility(probe);
   const fastStart = hasFastStart(filePath);
-  const reasons = fastStart
-    ? base.reasons
-    : [...base.reasons, "MP4 moov atom 必须位于 mdat 之前"];
   return {
     probe,
-    compatibility: { ...base, reasons, compatible: reasons.length === 0 },
+    compatibility: { ...base, fastStart },
   };
 }
 
@@ -116,7 +117,8 @@ export function evaluateCompatibility(probeInput: unknown): MediaCompatibility {
 
   if (!video) reasons.push("缺少视频轨");
   else {
-    if (video.codec_name !== "h264") reasons.push("视频编码必须为 H.264");
+    if (!new Set(["h264", "hevc"]).has(video.codec_name ?? ""))
+      reasons.push("视频编码必须为 H.264 或 H.265/HEVC");
     if (
       !video.width ||
       !video.height ||
@@ -126,8 +128,15 @@ export function evaluateCompatibility(probeInput: unknown): MediaCompatibility {
       reasons.push("视频分辨率必须不高于 1920×1080");
     }
     if (fps === null || fps > 30.5) reasons.push("视频帧率必须不高于 30 fps");
-    if (video.pix_fmt !== "yuv420p")
-      reasons.push("视频像素格式必须为 yuv420p 8-bit SDR");
+    if (video.codec_name === "h264" && video.pix_fmt !== "yuv420p") {
+      reasons.push("H.264 视频像素格式必须为 yuv420p 8-bit SDR");
+    }
+    if (
+      video.codec_name === "hevc" &&
+      !new Set(["yuv420p", "yuv420p10le"]).has(video.pix_fmt ?? "")
+    ) {
+      reasons.push("H.265 视频像素格式必须为 yuv420p 或 yuv420p10le");
+    }
   }
 
   if (!audio) reasons.push("缺少音频轨");
@@ -143,6 +152,13 @@ export function evaluateCompatibility(probeInput: unknown): MediaCompatibility {
 
   return {
     compatible: reasons.length === 0,
+    playbackSupport:
+      reasons.length > 0
+        ? "unsupported"
+        : video?.codec_name === "hevc"
+          ? "device-dependent"
+          : "broad",
+    fastStart: true,
     reasons,
     durationMs:
       durationSeconds === null ? null : Math.round(durationSeconds * 1000),
@@ -153,6 +169,7 @@ export function evaluateCompatibility(probeInput: unknown): MediaCompatibility {
       height: video?.height ?? null,
       fps,
       pixelFormat: video?.pix_fmt ?? null,
+      codecTag: video?.codec_tag_string ?? null,
     },
     audio: {
       codec: audio?.codec_name ?? null,

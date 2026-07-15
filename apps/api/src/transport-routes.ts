@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { ZodTypeProvider } from "fastify-type-provider-zod";
+import { liveStatusSchema } from "@simplewatch/contracts";
 
 import type { RoomService } from "./services/room-service.js";
 import type { OutboxService } from "./services/outbox-service.js";
@@ -40,6 +41,22 @@ export function registerTransportRoutes(
       );
       roomService.requireCsrf(identity, header(request, "x-csrf-token"));
       return transportService.issueCredential(identity, request.body.purpose);
+    },
+  );
+
+  app.get(
+    "/api/v1/rooms/:roomId/live/status",
+    {
+      schema: {
+        params: roomParamsSchema,
+        response: {
+          200: liveStatusSchema,
+        },
+      },
+    },
+    async (request) => {
+      roomService.authenticate(request.cookies.sw_room, request.params.roomId);
+      return transportService.getLiveStatus(request.params.roomId);
     },
   );
 

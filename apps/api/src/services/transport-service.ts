@@ -21,6 +21,7 @@ interface TransportOptions {
   readonly livekitApiKey: string;
   readonly livekitApiSecret: string;
   readonly livekitUrl: string;
+  readonly mediamtxControlUrl: string;
   readonly now?: () => number;
 }
 
@@ -72,7 +73,7 @@ export class TransportService {
         {
           identity: identity.memberId,
           name: identity.nickname,
-          ttl: "5m",
+          ttl: "2m",
           metadata: JSON.stringify({ roomId: identity.roomId }),
         },
       );
@@ -88,7 +89,7 @@ export class TransportService {
         purpose,
         url: this.options.livekitUrl,
         token: await token.toJwt(),
-        expiresAt: new Date(this.now() + 5 * 60_000).toISOString(),
+        expiresAt: new Date(this.now() + 2 * 60_000).toISOString(),
       };
     }
 
@@ -100,6 +101,7 @@ export class TransportService {
     if (identity.role !== "host") throw forbidden("只有主持人可以推流");
     this.requireActiveMember(identity.roomId, identity.memberId);
     const path = this.getLivePath(identity.roomId);
+    this.revokePreviousPublishCredentials(identity.roomId);
     return this.issueMediaToken(
       identity,
       "publish",
@@ -107,6 +109,58 @@ export class TransportService {
       6 * 60 * 60_000,
       "whip",
     );
+  }
+
+  public async getLiveStatus(roomId: string): Promise<{
+    readonly state: "offline" | "online" | "unknown";
+    readonly hasVideo: boolean;
+    readonly hasAudio: boolean;
+    readonly checkedAt: string;
+  }> {
+    const checkedAt = new Date(this.now()).toISOString();
+    const path = this.getLivePath(roomId);
+    try {
+      const response = await fetch(
+        new URL("/v3/paths/list", this.options.mediamtxControlUrl),
+        { signal: AbortSignal.timeout(1500) },
+      );
+      if (!response.ok) throw new Error(`MediaMTX HTTP ${response.status}`);
+      const payload = (await response.json()) as { items?: unknown[] };
+      const item = (payload.items ?? []).find((candidate) => {
+        if (!candidate || typeof candidate !== "object") return false;
+        return (candidate as { name?: unknown }).name === path;
+      }) as
+        | {
+            readonly ready?: boolean;
+            readonly tracks?: unknown[];
+            readonly source?: unknown;
+          }
+        | undefined;
+      if (!item?.ready || !item.source) {
+        return {
+          state: "offline",
+          hasVideo: false,
+          hasAudio: false,
+          checkedAt,
+        };
+      }
+      const tracks = (item.tracks ?? []).map((track) =>
+        (typeof track === "string"
+          ? track
+          : JSON.stringify(track)
+        ).toLowerCase(),
+      );
+      const hasVideo = tracks.some((track) => track.includes("h264"));
+      const hasAudio = tracks.some((track) => track.includes("opus"));
+      return {
+        state: hasVideo && hasAudio ? "online" : "offline",
+        hasVideo,
+        hasAudio,
+        checkedAt,
+      };
+    } catch {
+      return { state: "unknown", hasVideo: false, hasAudio: false, checkedAt };
+    }
   }
 
   public async authorizeMedia(input: {
@@ -134,9 +188,11 @@ export class TransportService {
     this.requireActiveMember(roomId, memberId);
     const tokenRow = this.database
       .prepare(
-        "SELECT revoked_at FROM token_jti WHERE jti_hash = ? AND kind = 'media' AND expires_at > ?",
+        `SELECT revoked_at FROM token_jti
+         WHERE jti_hash = ? AND kind = 'media' AND expires_at > ?
+           AND room_id = ? AND scope = ?`,
       )
-      .get(hashToken(jti), this.now()) as
+      .get(hashToken(jti), this.now(), roomId, action) as
       | { readonly revoked_at: number | null }
       | undefined;
     if (!tokenRow || tokenRow.revoked_at !== null)
@@ -194,10 +250,17 @@ export class TransportService {
       .sign(this.mediaKey);
     this.database
       .prepare(
-        `INSERT INTO token_jti(jti_hash, kind, subject_id, expires_at, revoked_at)
-         VALUES (?, 'media', ?, ?, NULL)`,
+        `INSERT INTO token_jti(
+          jti_hash, kind, subject_id, expires_at, revoked_at, room_id, scope
+        ) VALUES (?, 'media', ?, ?, NULL, ?, ?)`,
       )
-      .run(hashToken(jti), identity.memberId, expiresAt);
+      .run(
+        hashToken(jti),
+        identity.memberId,
+        expiresAt,
+        identity.roomId,
+        action,
+      );
     return {
       purpose,
       url: `${this.options.mediaOrigin}/program/${path}/${purpose}`,
@@ -224,5 +287,46 @@ export class TransportService {
       )
       .get(roomId, memberId);
     if (!row) throw forbidden("房间成员状态无效");
+  }
+
+  private revokePreviousPublishCredentials(roomId: string): void {
+    const now = this.now();
+    this.database.transaction(() => {
+      this.database
+        .prepare(
+          `UPDATE token_jti SET revoked_at = ?
+           WHERE kind = 'media' AND room_id = ? AND scope = 'publish'
+             AND revoked_at IS NULL`,
+        )
+        .run(now, roomId);
+      const sessionIds = this.database
+        .prepare(
+          `SELECT mediamtx_session_id FROM media_transport_sessions
+           WHERE room_id = ? AND action = 'publish' AND closed_at IS NULL
+             AND mediamtx_session_id IS NOT NULL`,
+        )
+        .all(roomId)
+        .map(
+          (row) =>
+            (row as { readonly mediamtx_session_id: string })
+              .mediamtx_session_id,
+        );
+      if (sessionIds.length === 0) return;
+      const eventId = uuidv7();
+      this.database
+        .prepare(
+          `INSERT INTO service_outbox(
+            id, kind, dedupe_key, payload_json, state, attempts,
+            not_before, lease_until, last_error, created_at, completed_at
+          ) VALUES (?, 'mediamtx.kick-sessions', ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL)`,
+        )
+        .run(
+          uuidv7(),
+          `mediamtx-republish:${eventId}`,
+          JSON.stringify({ roomId, memberId: "publisher", sessionIds }),
+          now,
+          now,
+        );
+    })();
   }
 }

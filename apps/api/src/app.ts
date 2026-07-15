@@ -14,8 +14,9 @@ import {
   createRoomRequestSchema,
   envelopeSchema,
   handoffHostRequestSchema,
-  joinRoomRequestSchema,
+  joinActiveRoomRequestSchema,
   kickMemberRequestSchema,
+  activeRoomSummarySchema,
   roomCommandRequestSchema,
   roomSnapshotSchema,
   updateRoomRequestSchema,
@@ -72,6 +73,7 @@ const commandEnvelopeSchema = envelopeSchema(roomCommandRequestSchema);
 export interface BuildAppOptions {
   readonly databasePath: string;
   readonly publicOrigin: string;
+  readonly friendInviteToken?: string;
   readonly mediaRoot?: string;
   readonly uploadRoot?: string;
   readonly inboxRoot?: string;
@@ -84,6 +86,7 @@ export interface BuildAppOptions {
   readonly livekitApiKey?: string;
   readonly livekitApiSecret?: string;
   readonly livekitUrl?: string;
+  readonly mediamtxControlUrl?: string;
   readonly webRoot?: string;
   readonly migrationsPath?: string;
   readonly now?: () => number;
@@ -110,7 +113,12 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
     now,
   });
   const authService = new AuthService(database, now);
-  const roomService = new RoomService(database, options.publicOrigin, now);
+  const roomService = new RoomService(
+    database,
+    options.publicOrigin,
+    options.friendInviteToken ?? "test-friend-invite-token-32-characters",
+    now,
+  );
   const mediaService = new MediaService(database, {
     mediaRoot: options.mediaRoot ?? "tmp/media",
     uploadRoot: options.uploadRoot ?? "tmp/uploads",
@@ -131,6 +139,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
     livekitApiSecret:
       options.livekitApiSecret ?? "test-livekit-secret-at-least-32-bytes",
     livekitUrl: options.livekitUrl ?? "ws://127.0.0.1:7880",
+    mediamtxControlUrl: options.mediamtxControlUrl ?? "http://127.0.0.1:9997",
     now,
   });
   const app = Fastify({
@@ -236,6 +245,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
     app,
     authService,
     roomService,
+    transportService,
     hub,
     options.publicOrigin,
     now,
@@ -318,6 +328,7 @@ function registerApiRoutes(
   baseApp: FastifyInstance,
   authService: AuthService,
   roomService: RoomService,
+  transportService: TransportService,
   hub: RoomHub,
   publicOrigin: string,
   now: () => number,
@@ -339,10 +350,7 @@ function registerApiRoutes(
       requireRateLimit(publicRateLimiter, minuteKey, 5, hourKey, 20);
       let result;
       try {
-        result = await authService.login(
-          request.body.username,
-          request.body.password,
-        );
+        result = await authService.login(request.body.code);
       } catch (error) {
         publicRateLimiter.record(minuteKey, 60_000);
         publicRateLimiter.record(hourKey, 60 * 60_000);
@@ -377,16 +385,73 @@ function registerApiRoutes(
         },
       },
     },
-    async (request) => {
+    (request) => {
       const admin = authService.authenticate(request.cookies.sw_admin);
       authService.requireCsrf(admin, getHeader(request, "x-csrf-token"));
-      const result = await roomService.updateRoom(
+      const result = roomService.updateRoom(
         admin.admin_id,
         request.params.roomId,
         request.body,
       );
       if (result.status === "closed")
         hub.closeRoom(result.id, 4010, "room closed");
+      return result;
+    },
+  );
+
+  app.get(
+    "/api/v1/admin/active-room",
+    { schema: { response: { 200: activeRoomSummarySchema } } },
+    async (request, reply) => {
+      const admin = authService.authenticate(request.cookies.sw_admin);
+      const room = roomService.getActiveRoomSummary(admin.admin_id);
+      reply.header("Cache-Control", "no-store");
+      if (!room) return null;
+      const live =
+        room.mode === "live"
+          ? await transportService.getLiveStatus(room.id)
+          : {
+              state: "offline" as const,
+              hasVideo: false,
+              hasAudio: false,
+              checkedAt: new Date(now()).toISOString(),
+            };
+      return { ...room, live };
+    },
+  );
+
+  app.post(
+    "/api/v1/admin/active-room/host-session",
+    { schema: { response: { 200: roomSessionResponseSchema } } },
+    async (request, reply) => {
+      const admin = authService.authenticate(request.cookies.sw_admin);
+      authService.requireCsrf(admin, getHeader(request, "x-csrf-token"));
+      const result = roomService.createActiveHostSession(admin.admin_id);
+      setSessionCookie(reply, "sw_room", result.sessionToken, result.expiresAt);
+      reply.header("Cache-Control", "no-store");
+      return {
+        room: { id: result.roomId, joinUrl: result.joinUrl },
+        member: result.member,
+        csrfToken: result.csrfToken,
+        expiresAt: new Date(result.expiresAt).toISOString(),
+      };
+    },
+  );
+
+  app.delete(
+    "/api/v1/admin/active-room",
+    {
+      schema: {
+        response: {
+          200: z.object({ id: z.string().uuid(), status: z.literal("closed") }),
+        },
+      },
+    },
+    (request) => {
+      const admin = authService.authenticate(request.cookies.sw_admin);
+      authService.requireCsrf(admin, getHeader(request, "x-csrf-token"));
+      const result = roomService.closeActiveRoom(admin.admin_id);
+      hub.closeRoom(result.id, 4010, "room force closed");
       return result;
     },
   );
@@ -490,25 +555,21 @@ function registerApiRoutes(
   );
 
   app.post(
-    "/api/v1/rooms/:roomId/join",
+    "/api/v1/rooms/active/join",
     {
       schema: {
-        params: roomParamsSchema,
-        body: joinRoomRequestSchema,
+        body: joinActiveRoomRequestSchema,
         response: { 200: roomSessionResponseSchema },
       },
     },
     async (request, reply) => {
-      const prefix = `join:${request.ip}:${request.params.roomId}`;
+      const prefix = `join:${request.ip}`;
       const minuteKey = `${prefix}:minute`;
       const hourKey = `${prefix}:hour`;
       requireRateLimit(publicRateLimiter, minuteKey, 5, hourKey, 20);
       let result;
       try {
-        result = await roomService.joinRoom(
-          request.params.roomId,
-          request.body,
-        );
+        result = roomService.joinActiveRoom(request.body);
       } catch (error) {
         if (error instanceof AppError && error.statusCode === 401) {
           publicRateLimiter.record(minuteKey, 60_000);

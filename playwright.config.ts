@@ -10,7 +10,7 @@ export default defineConfig({
   use: {
     baseURL: "http://127.0.0.1:15173",
     browserName: "chromium",
-    channel: "chrome",
+    channel: process.env.PLAYWRIGHT_CHANNEL ?? "msedge",
     launchOptions: {
       args: [
         "--use-fake-device-for-media-stream",
@@ -21,8 +21,7 @@ export default defineConfig({
     trace: "retain-on-failure",
   },
   webServer: {
-    command:
-      "pwsh -NoProfile -File tools/environment/run-dev.ps1 pnpm --filter @simplewatch/web dev --host 127.0.0.1 --port 15173",
+    command: "pnpm --filter @simplewatch/web dev --host 127.0.0.1 --port 15173",
     port: 15173,
     reuseExistingServer: false,
     timeout: 60_000,

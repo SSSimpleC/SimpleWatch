@@ -4,6 +4,7 @@ set -euo pipefail
 release_dir=${1:?release directory required}
 public_ip=${2:?public IP required}
 public_port=${3:-443}
+clear_existing_data=${4:-false}
 if [[ "$public_port" == "443" ]]; then
   public_origin="https://${public_ip}"
 else
@@ -13,54 +14,82 @@ cd "$release_dir"
 umask 077
 
 secret() { openssl rand -hex 32; }
+set_env() {
+  local key=$1 value=$2 temporary
+  temporary=$(mktemp .env.server.XXXXXX)
+  if [[ -f .env.server ]]; then
+    grep -v "^${key}=" .env.server >"$temporary" || true
+  fi
+  printf '%s=%s\n' "$key" "$value" >>"$temporary"
+  mv "$temporary" .env.server
+}
+remove_env() {
+  local key=$1 temporary
+  temporary=$(mktemp .env.server.XXXXXX)
+  grep -v "^${key}=" .env.server >"$temporary" || true
+  mv "$temporary" .env.server
+}
+
+if [[ ! -f .env.server && -f /opt/simplewatch/current/.env.server ]]; then
+  cp /opt/simplewatch/current/.env.server .env.server
+fi
 if [[ ! -f .env.server ]]; then
-  admin_password=$(openssl rand -base64 24 | tr -d '\n/=+' | head -c 24)
   livekit_key="sw_$(openssl rand -hex 8)"
-  livekit_secret=$(secret)
-  cat > .env.server <<EOF
-RELEASE_TAG=$(basename "$release_dir")
-PUBLIC_ORIGIN=${public_origin}
+  cat >.env.server <<EOF
 SESSION_SECRET=$(secret)
 CONTENT_SIGNING_SECRET=$(secret)
 INTERNAL_HOOK_TOKEN=$(secret)
 MEDIA_JWT_SECRET=$(secret)
-MEDIA_ORIGIN=${public_origin}
 LIVEKIT_API_KEY=${livekit_key}
-LIVEKIT_API_SECRET=${livekit_secret}
-LIVEKIT_URL=${public_origin/https:/wss:}
-TUS_ENDPOINT=${public_origin}/files/
-ALLOW_NONINTERACTIVE_BOOTSTRAP=true
-BOOTSTRAP_ADMIN_USERNAME=simplewatch-admin
-BOOTSTRAP_ADMIN_PASSWORD=${admin_password}
+LIVEKIT_API_SECRET=$(secret)
 EOF
-  cat > /root/simplewatch-initial-credentials <<EOF
-URL=${public_origin}/admin
-USERNAME=simplewatch-admin
-PASSWORD=${admin_password}
-EOF
-  chmod 600 /root/simplewatch-initial-credentials
 fi
 
+friend_invite_token=$(grep '^FRIEND_INVITE_TOKEN=' .env.server | cut -d= -f2- || true)
+if [[ ${#friend_invite_token} -lt 32 ]]; then
+  friend_invite_token=$(openssl rand -base64 48 | tr '+/' '-_' | tr -d '=\n')
+fi
+set_env RELEASE_TAG "$(basename "$release_dir")"
+set_env PUBLIC_ORIGIN "$public_origin"
+set_env FRIEND_INVITE_TOKEN "$friend_invite_token"
+set_env MEDIA_ORIGIN "$public_origin"
+set_env LIVEKIT_URL "${public_origin/https:/wss:}"
+set_env TUS_ENDPOINT "${public_origin}/files/"
+set_env MEDIAMTX_CONTROL_URL "http://mediamtx:9997"
+set_env ALLOW_NONINTERACTIVE_BOOTSTRAP "true"
+set_env BOOTSTRAP_ADMIN_CODE "260713"
+remove_env BOOTSTRAP_ADMIN_USERNAME
+remove_env BOOTSTRAP_ADMIN_PASSWORD
+chmod 600 .env.server
+
+cat >/root/simplewatch-initial-credentials <<EOF
+URL=${public_origin}/admin
+CODE=260713
+EOF
+chmod 600 /root/simplewatch-initial-credentials
+
 set -a
+# `.env.server` 由本脚本在当前发布目录中生成或继承。
+# shellcheck disable=SC1091
 source .env.server
 set +a
 
-cert_dir=/srv/simplewatch/ip-cert
-mkdir -p "$cert_dir"
-if [[ ! -s "$cert_dir/ip.crt" || ! -s "$cert_dir/ip.key" ]]; then
-  openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 30 \
-    -keyout "$cert_dir/ip.key" \
-    -out "$cert_dir/ip.crt" \
-    -subj "/CN=${public_ip}" \
-    -addext "subjectAltName=IP:${public_ip}" \
-    -addext "keyUsage=digitalSignature,keyEncipherment" \
-    -addext "extendedKeyUsage=serverAuth"
-fi
-chmod 600 "$cert_dir/ip.key"
-chmod 644 "$cert_dir/ip.crt"
+mkdir -p \
+  /srv/simplewatch/{state,media,uploads,inbox,subtitles,trash,quarantine,acme-webroot} \
+  /srv/simplewatch/sftp/incoming
+chown 1000:1000 /srv/simplewatch/{state,media,uploads,inbox,subtitles,trash,quarantine}
+chmod 0750 /srv/simplewatch/{state,media,uploads,inbox,subtitles,trash,quarantine}
+chown root:root /srv/simplewatch/acme-webroot
+chmod 0755 /srv/simplewatch/acme-webroot
+SIMPLEWATCH_RELEASE_DIR="$release_dir" \
+  tools/server/ip-cert.sh bootstrap "$public_ip"
 
 vendor_dir="$release_dir/.server/vendor"
 mkdir -p "$vendor_dir"
+if [[ -d /opt/simplewatch/current/.server/vendor ]] &&
+  [[ "$(readlink -f /opt/simplewatch/current)" != "$(readlink -f "$release_dir")" ]]; then
+  cp -a /opt/simplewatch/current/.server/vendor/. "$vendor_dir/"
+fi
 livekit_archive="livekit_1.13.1_linux_amd64.tar.gz"
 mediamtx_archive="mediamtx_v1.18.2_linux_amd64.tar.gz"
 if [[ ! -x "$vendor_dir/livekit-server" ]]; then
@@ -82,10 +111,10 @@ MEDIAMTX_ARCHIVE_SHA256=$(sha256sum "$vendor_dir/$mediamtx_archive" | cut -d' ' 
 sed \
   -e "s/__LIVEKIT_API_KEY__/${LIVEKIT_API_KEY}/g" \
   -e "s/__LIVEKIT_API_SECRET__/${LIVEKIT_API_SECRET}/g" \
-  infra/livekit/livekit.server-ip.template.yaml > infra/livekit/livekit.server-ip.yaml
-chmod 600 .env.server infra/livekit/livekit.server-ip.yaml
+  infra/livekit/livekit.server-ip.template.yaml >infra/livekit/livekit.server-ip.yaml
+chmod 600 infra/livekit/livekit.server-ip.yaml
 
-compose=(docker compose -f infra/compose/compose.server-ip.yaml)
+compose=(docker compose --env-file .env.server -f infra/compose/compose.server-ip.yaml)
 "${compose[@]}" config --quiet
 "${compose[@]}" pull caddy
 docker tag ghcr.io/tus/tusd:v2.9.2 docker.m.daocloud.io/tusproject/tusd:v2.9.2 2>/dev/null || true
@@ -93,13 +122,49 @@ docker tag ghcr.io/tus/tusd:v2.9.2 docker.m.daocloud.io/tusproject/tusd:v2.9.2 2
 docker image inspect "simplewatch-app:${RELEASE_TAG}" >/dev/null 2>&1 || "${compose[@]}" build app
 docker image inspect "simplewatch-mediamtx:${RELEASE_TAG}" >/dev/null 2>&1 || "${compose[@]}" build mediamtx
 docker image inspect "simplewatch-livekit:${RELEASE_TAG}" >/dev/null 2>&1 || "${compose[@]}" build livekit
-if [[ ! -s /srv/simplewatch/state/simplewatch.sqlite3 ]]; then
+
+# The project name is fixed in Compose, so this stops only SimpleWatch and leaves
+# FRP, DERP and the unrelated MES stack untouched.
+"${compose[@]}" down --remove-orphans
+
+"${compose[@]}" run --rm \
+  -e ALLOW_PRODUCTION_CODE_UPDATE=locked-single-room-code-update \
+  -e BOOTSTRAP_ADMIN_CODE=260713 \
+  app node apps/api/node_modules/tsx/dist/cli.mjs \
+  apps/api/src/cli/admin-bootstrap-noninteractive.ts
+
+if [[ "$clear_existing_data" == "true" ]]; then
+  quarantine_id="pre-${RELEASE_TAG}-$(date -u +%Y%m%dT%H%M%SZ)"
   "${compose[@]}" run --rm \
-    -e NODE_ENV=test \
-    -e DATABASE_PATH=/opt/simplewatch/.local/server/simplewatch.sqlite3 \
-    -v /srv/simplewatch/state:/opt/simplewatch/.local/server \
-    app node apps/api/node_modules/tsx/dist/cli.mjs apps/api/src/cli/admin-bootstrap-noninteractive.ts
+    -e CLEAR_LIBRARY_CONFIRM=clear-all-media-uploads-and-rooms \
+    -e CLEAR_LIBRARY_QUARANTINE="/quarantine/${quarantine_id}" \
+    -e TRASH_ROOT=/trash \
+    -v /srv/simplewatch/quarantine:/quarantine \
+    -v /srv/simplewatch/trash:/trash \
+    app node apps/api/node_modules/tsx/dist/cli.mjs \
+    apps/api/src/cli/clear-library.ts
+  printf '%s\n' "$quarantine_id" >/srv/simplewatch/last-library-quarantine
 fi
+
 "${compose[@]}" up -d --wait --wait-timeout 180
 ln -sfn "$release_dir" /opt/simplewatch/current
+
+if ! openssl x509 -in /srv/simplewatch/ip-cert/current/fullchain.pem \
+  -noout -issuer | grep -qi "Let's Encrypt"; then
+  SIMPLEWATCH_RELEASE_DIR="$release_dir" \
+    tools/server/ip-cert.sh staging "$public_ip"
+  SIMPLEWATCH_RELEASE_DIR="$release_dir" \
+    tools/server/ip-cert.sh issue "$public_ip"
+fi
+
+install -m 0644 infra/systemd/simplewatch-ip-cert.service \
+  /etc/systemd/system/simplewatch-ip-cert.service
+install -m 0644 infra/systemd/simplewatch-ip-cert.timer \
+  /etc/systemd/system/simplewatch-ip-cert.timer
+systemctl daemon-reload
+systemctl enable --now simplewatch-ip-cert.timer
+
+curl --fail --silent --show-error --max-time 10 \
+  "${public_origin}/health/ready" >/dev/null
+tools/server/ip-cert.sh status "$public_ip"
 "${compose[@]}" ps

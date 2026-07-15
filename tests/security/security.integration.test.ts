@@ -7,6 +7,7 @@ import { buildApp, type BuiltApp } from "../../apps/api/src/app.js";
 
 const origin = "https://watch.example.test";
 const internalToken = "security-internal-token-at-least-32-bytes";
+const friendInviteToken = "security-friend-invite-token-at-least-32-bytes";
 let built: BuiltApp;
 let root: string;
 
@@ -17,6 +18,7 @@ beforeEach(async () => {
     databasePath: join(root, "security.sqlite3"),
     migrationsPath: resolve("migrations"),
     publicOrigin: origin,
+    friendInviteToken,
     mediaRoot: join(root, "media"),
     uploadRoot: join(root, "uploads"),
     inboxRoot: join(root, "inbox"),
@@ -24,10 +26,7 @@ beforeEach(async () => {
     internalHookToken: internalToken,
     now: () => 1_750_000_000_000,
   });
-  await built.authService.bootstrapAdmin(
-    "admin",
-    "correct-horse-battery-staple",
-  );
+  await built.authService.bootstrapAdmin("admin", "260713");
 });
 
 afterEach(async () => {
@@ -38,24 +37,21 @@ afterEach(async () => {
 describe("OWASP security regression", () => {
   it("A07 validates credentials, sessions and CSRF fail-closed", async () => {
     await expect(
-      built.authService.bootstrapAdmin("", "another-valid-password"),
+      built.authService.bootstrapAdmin("", "123456"),
     ).rejects.toThrow("用户名长度");
     await expect(
       built.authService.bootstrapAdmin("other", "short"),
-    ).rejects.toThrow("至少需要 12");
+    ).rejects.toThrow("6 位数字");
     await expect(
-      built.authService.bootstrapAdmin("other", "another-valid-password"),
+      built.authService.bootstrapAdmin("other", "123456"),
     ).rejects.toThrow("已经初始化");
-    await expect(
-      built.authService.login("admin' OR '1'='1", "irrelevant"),
-    ).rejects.toThrow("用户名或密码错误");
+    await expect(built.authService.login("000000")).rejects.toThrow(
+      "放映口令错误",
+    );
     expect(() => built.authService.authenticate(undefined)).toThrow();
     expect(() => built.authService.authenticate("forged-session")).toThrow();
 
-    const login = await built.authService.login(
-      "admin",
-      "correct-horse-battery-staple",
-    );
+    const login = await built.authService.login("260713");
     const session = built.authService.authenticate(login.sessionToken);
     expect(() => built.authService.requireCsrf(session, undefined)).toThrow(
       "CSRF Token 无效",
@@ -75,7 +71,7 @@ describe("OWASP security regression", () => {
         method: "POST",
         url: "/api/v1/admin/login",
         headers: { origin, "x-forwarded-for": `203.0.113.${attempt}` },
-        payload: { username: "missing", password: "invalid" },
+        payload: { code: "000000" },
       });
       statuses.push(response.statusCode);
     }
@@ -122,9 +118,9 @@ describe("OWASP security regression", () => {
     const hostCookie = readCookie(created, "sw_room");
     const joined = await built.app.inject({
       method: "POST",
-      url: `/api/v1/rooms/${room.room.id}/join`,
+      url: "/api/v1/rooms/active/join",
       headers: { origin },
-      payload: { nickname: "Member", password: roomPayload.password },
+      payload: { nickname: "Member", inviteToken: friendInviteToken },
     });
     const member = joined.json<{ member: { id: string }; csrfToken: string }>();
     const memberCookie = readCookie(joined, "sw_room");
@@ -208,9 +204,7 @@ describe("OWASP security regression", () => {
 });
 
 const roomPayload = {
-  password: "shared-room-password",
   hostNickname: "Host",
-  maxMembers: 5,
 };
 
 async function loginAdmin(): Promise<{ cookie: string; csrfToken: string }> {
@@ -218,7 +212,7 @@ async function loginAdmin(): Promise<{ cookie: string; csrfToken: string }> {
     method: "POST",
     url: "/api/v1/admin/login",
     headers: { origin },
-    payload: { username: "admin", password: "correct-horse-battery-staple" },
+    payload: { code: "260713" },
   });
   expect(response.statusCode).toBe(200);
   return {

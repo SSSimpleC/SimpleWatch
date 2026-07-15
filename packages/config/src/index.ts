@@ -6,6 +6,7 @@ export const appConfigSchema = z.object({
   port: z.coerce.number().int().min(1).max(65_535).default(3000),
   databasePath: z.string().min(1),
   publicOrigin: z.url(),
+  friendInviteToken: z.string().regex(/^[A-Za-z0-9_-]{32,128}$/),
   sessionSecret: z.string().min(32),
   mediaRoot: z.string().min(1),
   uploadRoot: z.string().min(1),
@@ -19,6 +20,7 @@ export const appConfigSchema = z.object({
   livekitApiKey: z.string().min(1),
   livekitApiSecret: z.string().min(32),
   livekitUrl: z.url(),
+  mediamtxControlUrl: z.url(),
 });
 export type AppConfig = z.infer<typeof appConfigSchema>;
 
@@ -29,6 +31,7 @@ export function parseAppConfig(environment: NodeJS.ProcessEnv): AppConfig {
     port: environment.PORT,
     databasePath: environment.DATABASE_PATH,
     publicOrigin: environment.PUBLIC_ORIGIN,
+    friendInviteToken: environment.FRIEND_INVITE_TOKEN,
     sessionSecret: environment.SESSION_SECRET,
     mediaRoot: environment.MEDIA_ROOT,
     uploadRoot: environment.UPLOAD_ROOT,
@@ -42,5 +45,6 @@ export function parseAppConfig(environment: NodeJS.ProcessEnv): AppConfig {
     livekitApiKey: environment.LIVEKIT_API_KEY,
     livekitApiSecret: environment.LIVEKIT_API_SECRET,
     livekitUrl: environment.LIVEKIT_URL,
+    mediamtxControlUrl: environment.MEDIAMTX_CONTROL_URL,
   });
 }

@@ -41,7 +41,12 @@ for (const viewport of [
     await expect(
       page.getByRole("heading", { name: "放映员控制台" }),
     ).toBeVisible();
-    await expect(page.getByLabel("账号")).toHaveValue("admin");
+    const codeInput = page.getByLabel("6 位放映口令");
+    await expect(codeInput).toHaveValue("");
+    await expect(codeInput).toHaveAttribute("inputmode", "numeric");
+    await expect(
+      page.getByRole("button", { name: "解锁控制台" }),
+    ).toBeDisabled();
     await page.screenshot({
       path: resolve(artifacts, `admin-login-${viewport.name}.png`),
       fullPage: true,

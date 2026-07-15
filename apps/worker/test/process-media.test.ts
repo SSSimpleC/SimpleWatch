@@ -14,6 +14,7 @@ import {
   processProbeJob,
   processSubtitleJob,
 } from "../src/process-media.js";
+import { probeFile } from "@simplewatch/media";
 
 const roots: string[] = [];
 
@@ -114,6 +115,40 @@ describe("processProbeJob", () => {
       resolve(mediaRoot, "sftp-storage-key/content.mp4"),
     );
     expect(existsSync(source)).toBe(false);
+  });
+
+  it("copy-remuxes H.265 to hvc1 without transcoding", async () => {
+    const repositoryRoot = resolve(import.meta.dirname, "../../..");
+    const root = mkdtempSync(resolve(repositoryRoot, "tmp/hevc-worker-test-"));
+    roots.push(root);
+    const uploadRoot = join(root, "uploads");
+    const mediaRoot = join(root, "media");
+    const inboxRoot = join(root, "inbox");
+    const subtitleRoot = join(root, "subtitles");
+    mkdirSync(uploadRoot, { recursive: true });
+    const source = join(uploadRoot, "hevc.mp4");
+    copyFileSync(
+      join(repositoryRoot, "test-data/generated/media-smoke-hevc-hev1.mp4"),
+      source,
+    );
+
+    const result = await processProbeJob(
+      {
+        uploadId: "upload-hevc",
+        filePath: source,
+        storageKey: "hevc-storage-key",
+      },
+      { uploadRoot, mediaRoot, inboxRoot, subtitleRoot },
+    );
+    const verified = await probeFile(result.finalPath);
+
+    expect(result.compatible).toBe(true);
+    expect(verified.compatibility).toMatchObject({
+      compatible: true,
+      playbackSupport: "device-dependent",
+      fastStart: true,
+      video: { codec: "hevc", codecTag: "hvc1" },
+    });
   });
 });
 

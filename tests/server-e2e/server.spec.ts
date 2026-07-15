@@ -6,14 +6,11 @@ test("public server supports upload, room admission and two-party voice", async 
   browser,
   page,
 }) => {
-  const username = process.env.SIMPLEWATCH_ADMIN_USERNAME;
-  const password = process.env.SIMPLEWATCH_ADMIN_PASSWORD;
-  expect(username).toBeTruthy();
-  expect(password).toBeTruthy();
+  const code = process.env.SIMPLEWATCH_ADMIN_CODE;
+  expect(code).toMatch(/^\d{6}$/);
 
   await page.goto("/admin");
-  await page.getByLabel("账号").fill(username!);
-  await page.getByLabel("口令").fill(password!);
+  await page.getByLabel("6 位放映口令").fill(code!);
   const loginResponsePromise = page.waitForResponse(
     (response) =>
       response.url().endsWith("/api/v1/admin/login") &&
@@ -38,20 +35,22 @@ test("public server supports upload, room admission and two-party voice", async 
   await expect(subtitleInput).toBeVisible({ timeout: 30_000 });
   await subtitleInput.setInputFiles("test-data/subtitles/predeploy.vtt");
 
-  await page.getByLabel("主持昵称").fill("Server Host");
-  await page.getByLabel("房间口令").fill("server-browser-password");
+  await page.getByLabel("主持人昵称").fill("Server Host");
   const roomResponsePromise = page.waitForResponse(
     (response) =>
       response.url().endsWith("/api/v1/rooms") &&
       response.request().method() === "POST",
   );
-  await page.getByRole("button", { name: /建立五席放映室/ }).click();
+  await page.getByRole("button", { name: /开启放映室/ }).click();
   const roomResponse = await roomResponsePromise;
   expect(roomResponse.status()).toBe(201);
   const roomId = ((await roomResponse.json()) as { room: { id: string } }).room
     .id;
   let memberContext: BrowserContext | undefined;
   try {
+    const inviteUrl = await page.locator(".invite-copy code").textContent();
+    expect(inviteUrl).toBeTruthy();
+    await page.getByRole("button", { name: "进入主持房间" }).click();
     await expect(page.getByText("主持控制")).toBeVisible();
     await expect(page.getByText("同步在线")).toBeVisible({ timeout: 15_000 });
     await page.getByLabel("选择点播影片").selectOption({ label: mediaName });
@@ -76,13 +75,10 @@ test("public server supports upload, room admission and two-party voice", async 
     expect(whipResult.codecs, JSON.stringify(whipResult.diagnostics)).toContain(
       "video/H264",
     );
-    const roomUrl = page.url();
-
     memberContext = await browser.newContext({ ignoreHTTPSErrors: true });
     const member = await memberContext.newPage();
-    await member.goto(roomUrl);
+    await member.goto(inviteUrl!);
     await member.getByLabel("昵称").fill("Server Member");
-    await member.getByLabel("房间口令").fill("server-browser-password");
     await member.getByRole("button", { name: "进入放映室" }).click();
     await expect(member.getByText("同场观众")).toBeVisible();
     await expect(
@@ -90,8 +86,8 @@ test("public server supports upload, room admission and two-party voice", async 
     ).toBeDisabled();
 
     if (process.env.SIMPLEWATCH_SKIP_RTC !== "true") {
-      await page.getByRole("button", { name: "进入并启用声音" }).click();
-      await member.getByRole("button", { name: "进入并启用声音" }).click();
+      await page.getByRole("button", { name: "加入语音通话" }).click();
+      await member.getByRole("button", { name: "加入语音通话" }).click();
       await expect(page.getByText("麦克风已接通")).toBeVisible({
         timeout: 30_000,
       });

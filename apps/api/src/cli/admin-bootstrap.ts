@@ -17,18 +17,14 @@ const database = openDatabase({ databasePath: config.databasePath });
 const readline = createInterface({ input: stdin, output: stdout });
 
 try {
-  const username = await readline.question("管理员用户名：");
-  const password = await readHidden("管理员密码：");
-  const confirmation = await readHidden("再次输入密码：");
-  if (password !== confirmation) throw new Error("两次输入的密码不一致");
+  const code = await readHidden("输入 6 位放映口令：");
+  const confirmation = await readHidden("再次输入放映口令：");
+  if (code !== confirmation) throw new Error("两次输入的口令不一致");
 
-  const admin = await new AuthService(database).bootstrapAdmin(
-    username,
-    password,
-  );
-  stdout.write(`管理员 ${admin.username} 已创建。\n`);
+  const admin = await new AuthService(database).configureAccessCode(code);
+  stdout.write(`放映员 ${admin.username} 的口令已更新，旧控制台会话已撤销。\n`);
 } catch (error) {
-  if (error instanceof AppError && error.code === "ADMIN_ALREADY_EXISTS") {
+  if (error instanceof AppError) {
     console.error(error.message);
     process.exitCode = 2;
   } else {

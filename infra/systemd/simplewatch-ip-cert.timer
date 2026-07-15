@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the SimpleWatch IP certificate every 12 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=12h
+RandomizedDelaySec=10min
+Persistent=true
+Unit=simplewatch-ip-cert.service
+
+[Install]
+WantedBy=timers.target

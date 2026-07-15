@@ -137,10 +137,16 @@ if [[ "$clear_existing_data" == "true" ]]; then
   quarantine_id="pre-${RELEASE_TAG}-$(date -u +%Y%m%dT%H%M%SZ)"
   "${compose[@]}" run --rm \
     -e CLEAR_LIBRARY_CONFIRM=clear-all-media-uploads-and-rooms \
-    -e CLEAR_LIBRARY_QUARANTINE="/quarantine/${quarantine_id}" \
-    -e TRASH_ROOT=/trash \
-    -v /srv/simplewatch/quarantine:/quarantine \
-    -v /srv/simplewatch/trash:/trash \
+    -e CLEAR_LIBRARY_ALLOWED_ROOT=/srv-data/quarantine \
+    -e CLEAR_LIBRARY_QUARANTINE="/srv-data/quarantine/${quarantine_id}" \
+    -e DATABASE_PATH=/srv-data/state/simplewatch.sqlite3 \
+    -e MEDIA_ROOT=/srv-data/media \
+    -e UPLOAD_ROOT=/srv-data/uploads \
+    -e INBOX_ROOT=/srv-data/inbox \
+    -e SUBTITLE_ROOT=/srv-data/subtitles \
+    -e SFTP_INCOMING_ROOT=/srv-data/sftp/incoming \
+    -e TRASH_ROOT=/srv-data/trash \
+    -v /srv/simplewatch:/srv-data \
     app node apps/api/node_modules/tsx/dist/cli.mjs \
     apps/api/src/cli/clear-library.ts
   printf '%s\n' "$quarantine_id" >/srv/simplewatch/last-library-quarantine

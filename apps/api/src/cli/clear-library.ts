@@ -13,7 +13,9 @@ const quarantineInput = process.env.CLEAR_LIBRARY_QUARANTINE;
 if (!quarantineInput) throw new Error("缺少隔离备份目录");
 const quarantine = resolve(quarantineInput);
 const config = parseAppConfig(process.env);
-const productionRoot = resolve("/quarantine");
+const productionRoot = resolve(
+  process.env.CLEAR_LIBRARY_ALLOWED_ROOT ?? "/quarantine",
+);
 const developmentRoot = resolve(".local");
 const allowedRoot =
   config.nodeEnv === "production" ? productionRoot : developmentRoot;

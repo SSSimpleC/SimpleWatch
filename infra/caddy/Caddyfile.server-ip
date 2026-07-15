@@ -63,7 +63,9 @@ https://8.134.239.34 {
 		}
 		handle /program/* {
 			uri strip_prefix /program
-			reverse_proxy mediamtx:8889
+			reverse_proxy mediamtx:8889 {
+				header_down Location ^/ /program/
+			}
 		}
 		handle /rtc* {
 			reverse_proxy livekit:7880

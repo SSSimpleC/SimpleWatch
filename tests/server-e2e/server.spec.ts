@@ -17,28 +17,27 @@ test("public server supports upload, room admission and two-party voice", async 
       response.request().method() === "POST",
   );
   await page.getByRole("button", { name: "解锁控制台" }).click();
-  const { csrfToken: adminCsrfToken } = (await (
+  let { csrfToken: adminCsrfToken } = (await (
     await loginResponsePromise
   ).json()) as { csrfToken: string };
   await expect(
     page.getByRole("heading", { name: "放映控制", exact: true }),
   ).toBeVisible();
 
-  const mediaName = `server-media-${Date.now()}.mp4`;
-  await page
-    .locator('input[type="file"][accept*="video/mp4"]')
-    .first()
-    .setInputFiles({
-      name: mediaName,
-      mimeType: "video/mp4",
-      buffer: readFileSync("test-data/generated/media-smoke.mp4"),
-    });
-  await expect(page.getByText(/上传完成|正在检查兼容性/)).toBeVisible({
-    timeout: 30_000,
-  });
+  const mediaName = `server-h264-${Date.now()}.mp4`;
+  const hevcName = `server-h265-${Date.now()}.mp4`;
+  await uploadMp4(page, mediaName, "test-data/generated/media-smoke.mp4");
   const subtitleInput = page.getByLabel(`为 ${mediaName} 添加字幕`);
   await expect(subtitleInput).toBeVisible({ timeout: 30_000 });
   await subtitleInput.setInputFiles("test-data/subtitles/predeploy.vtt");
+  await uploadMp4(
+    page,
+    hevcName,
+    "test-data/generated/media-smoke-hevc-hev1.mp4",
+  );
+  await expect(
+    page.locator(".media-row").filter({ hasText: hevcName }),
+  ).toContainText("H.265 · 终端相关");
 
   await page.getByLabel("主持人昵称").fill("Server Host");
   const roomResponsePromise = page.waitForResponse(
@@ -55,11 +54,34 @@ test("public server supports upload, room admission and two-party voice", async 
   try {
     const inviteUrl = await page.locator(".invite-copy code").textContent();
     expect(inviteUrl).toBeTruthy();
+    expect(new URL(inviteUrl!).pathname).toMatch(
+      /^\/join\/[A-Za-z0-9_-]{32,}$/,
+    );
     await page.getByRole("button", { name: "进入主持房间" }).click();
     await expect(page.getByText("主持控制")).toBeVisible();
     await expect(page.getByText("同步在线")).toBeVisible({ timeout: 15_000 });
-    await page.getByLabel("选择点播影片").selectOption({ label: mediaName });
+    await selectVodAndWait(page, mediaName);
     await expect(page.locator("video")).toBeVisible({ timeout: 15_000 });
+    await selectVodAndWait(page, hevcName);
+    const declaresHevc = await page.evaluate(() => {
+      const video = document.createElement("video");
+      return Boolean(
+        video.canPlayType('video/mp4; codecs="hvc1"') ||
+        video.canPlayType('video/mp4; codecs="hev1"'),
+      );
+    });
+    if (!declaresHevc) {
+      await expect(page.getByText(/当前浏览器未声明支持/)).toBeVisible();
+    } else {
+      await expect(page.locator("video")).toBeVisible();
+    }
+    await selectVodAndWait(page, mediaName);
+    const revisionBeforeLive = await roomRevision(page);
+    await page.getByRole("button", { name: "切换直播" }).click();
+    await expect
+      .poll(() => roomRevision(page), { timeout: 15_000 })
+      .toBeGreaterThan(revisionBeforeLive);
+    await expect(page.getByText("LIVE / 等待 OBS")).toBeVisible();
     await page.getByRole("button", { name: "生成 OBS 配置" }).click();
     const publishConfig = page.locator(".publish-config code");
     await expect(publishConfig).toHaveCount(2);
@@ -80,6 +102,9 @@ test("public server supports upload, room admission and two-party voice", async 
     expect(whipResult.codecs, JSON.stringify(whipResult.diagnostics)).toContain(
       "video/H264",
     );
+    await expect(page.getByText("LIVE / 信号在线")).toBeVisible({
+      timeout: 15_000,
+    });
     memberContext = await browser.newContext({ ignoreHTTPSErrors: false });
     const member = await memberContext.newPage();
     await member.goto(inviteUrl!);
@@ -89,6 +114,22 @@ test("public server supports upload, room admission and two-party voice", async 
     await expect(
       member.getByRole("button", { name: /播放|暂停/ }),
     ).toBeDisabled();
+    await member.getByRole("button", { name: "启用节目声音" }).click();
+    await expect
+      .poll(
+        () =>
+          member.locator("video").evaluate((element) => {
+            const stream = (element as HTMLVideoElement).srcObject;
+            return stream instanceof MediaStream
+              ? stream
+                  .getTracks()
+                  .map((track) => track.kind)
+                  .sort()
+              : [];
+          }),
+        { timeout: 20_000 },
+      )
+      .toEqual(["audio", "video"]);
 
     if (process.env.SIMPLEWATCH_SKIP_RTC !== "true") {
       await page.getByRole("button", { name: "加入语音通话" }).click();
@@ -100,7 +141,41 @@ test("public server supports upload, room admission and two-party voice", async 
         timeout: 30_000,
       });
     }
+    const monitor = await page.context().newPage();
+    await monitor.goto("/admin");
+    await monitor.getByLabel("6 位放映口令").fill(code!);
+    const monitorLoginPromise = monitor.waitForResponse(
+      (response) =>
+        response.url().endsWith("/api/v1/admin/login") &&
+        response.request().method() === "POST",
+    );
+    await monitor.getByRole("button", { name: "解锁控制台" }).click();
+    adminCsrfToken = (
+      (await (await monitorLoginPromise).json()) as {
+        csrfToken: string;
+      }
+    ).csrfToken;
+    await expect(monitor.getByText("OBS 直播")).toBeVisible();
+    await expect(monitor.getByText("2 / 5")).toBeVisible();
+    await expect(monitor.getByText("推流在线")).toBeVisible({
+      timeout: 15_000,
+    });
+    await stopWhipFromBrowser(page);
+    monitor.once("dialog", (dialog) => dialog.accept());
+    await monitor.getByRole("button", { name: "强制关闭房间" }).click();
+    await expect(
+      monitor.getByText("房间已强制关闭，所有成员凭据均已撤销"),
+    ).toBeVisible();
+    const revokedStatus = await member.evaluate(async (activeRoomId) => {
+      const response = await fetch(`/api/v1/rooms/${activeRoomId}/bootstrap`, {
+        credentials: "same-origin",
+      });
+      return response.status;
+    }, roomId);
+    expect(revokedStatus).toBe(401);
+    await monitor.close();
   } finally {
+    await stopWhipFromBrowser(page);
     await memberContext?.close();
     await page.evaluate(
       async ({ roomId, csrfToken }) => {
@@ -113,13 +188,68 @@ test("public server supports upload, room admission and two-party voice", async 
           },
           body: JSON.stringify({ close: true }),
         });
-        if (!response.ok)
+        if (!response.ok && response.status !== 404)
           throw new Error(`关闭测试房间失败：${response.status}`);
       },
       { roomId, csrfToken: adminCsrfToken },
     );
   }
 });
+
+test("public upload reports speed and can be cancelled", async ({ page }) => {
+  const code = process.env.SIMPLEWATCH_ADMIN_CODE;
+  expect(code).toMatch(/^\d{6}$/);
+  await page.goto("/admin");
+  await page.getByLabel("6 位放映口令").fill(code!);
+  await page.getByRole("button", { name: "解锁控制台" }).click();
+  await expect(
+    page.getByRole("heading", { name: "放映控制", exact: true }),
+  ).toBeVisible();
+
+  await page
+    .locator('input[type="file"][accept*="video/mp4"]')
+    .first()
+    .setInputFiles({
+      name: `cancel-${Date.now()}.mp4`,
+      mimeType: "video/mp4",
+      buffer: Buffer.alloc(48 * 1024 * 1024, 0x41),
+    });
+  await expect(page.locator("progress")).toBeVisible();
+  await expect(page.getByText(/(?:KB|MB)\/s/)).toBeVisible({
+    timeout: 15_000,
+  });
+  await page.getByRole("button", { name: "终止本条上传" }).click();
+  await expect(page.getByText("本条上传已终止，临时数据已清理")).toBeVisible({
+    timeout: 15_000,
+  });
+});
+
+async function uploadMp4(page: Page, name: string, path: string) {
+  await page
+    .locator('input[type="file"][accept*="video/mp4"]')
+    .first()
+    .setInputFiles({
+      name,
+      mimeType: "video/mp4",
+      buffer: readFileSync(path),
+    });
+  const row = page.locator(".media-row").filter({ hasText: name });
+  await expect(row).toBeVisible({ timeout: 30_000 });
+  await expect(row).toContainText("可放映", { timeout: 30_000 });
+}
+
+async function roomRevision(page: Page): Promise<number> {
+  const label = await page.locator(".screen-meta span").nth(1).textContent();
+  return Number(label?.replace(/\D/g, "") ?? 0);
+}
+
+async function selectVodAndWait(page: Page, label: string) {
+  const previousRevision = await roomRevision(page);
+  await page.getByLabel("选择点播影片").selectOption({ label });
+  await expect
+    .poll(() => roomRevision(page), { timeout: 15_000 })
+    .toBeGreaterThan(previousRevision);
+}
 
 async function publishWhipFromBrowser(page: Page, url: string, token: string) {
   return page.evaluate(
@@ -264,14 +394,25 @@ async function publishWhipFromBrowser(page: Page, url: string, token: string) {
         })),
         videoTrack: stream.getVideoTracks()[0]?.getSettings(),
       };
-      peer.close();
-      window.clearInterval(frameTimer);
-      for (const track of stream.getTracks()) track.stop();
-      if (location)
-        await fetch(new URL(location, url), {
-          method: "DELETE",
-          headers: { authorization: `Bearer ${token}` },
-        });
+      (
+        window as typeof window & {
+          __simpleWatchWhipTest?: {
+            peer: RTCPeerConnection;
+            stream: MediaStream;
+            frameTimer: number;
+            location: string | null;
+            url: string;
+            token: string;
+          };
+        }
+      ).__simpleWatchWhipTest = {
+        peer,
+        stream,
+        frameTimer,
+        location,
+        url,
+        token,
+      };
       return {
         status: response.status,
         connected,
@@ -281,4 +422,31 @@ async function publishWhipFromBrowser(page: Page, url: string, token: string) {
     },
     { url, token },
   );
+}
+
+async function stopWhipFromBrowser(page: Page) {
+  await page.evaluate(async () => {
+    const testWindow = window as typeof window & {
+      __simpleWatchWhipTest?: {
+        peer: RTCPeerConnection;
+        stream: MediaStream;
+        frameTimer: number;
+        location: string | null;
+        url: string;
+        token: string;
+      };
+    };
+    const active = testWindow.__simpleWatchWhipTest;
+    if (!active) return;
+    active.peer.close();
+    window.clearInterval(active.frameTimer);
+    for (const track of active.stream.getTracks()) track.stop();
+    if (active.location) {
+      await fetch(new URL(active.location, active.url), {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${active.token}` },
+      }).catch(() => undefined);
+    }
+    delete testWindow.__simpleWatchWhipTest;
+  });
 }

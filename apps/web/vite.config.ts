@@ -4,5 +4,10 @@ import { defineConfig } from "vite";
 export default defineConfig({
   plugins: [react()],
   build: { outDir: "../../dist/web", emptyOutDir: true, sourcemap: true },
-  server: { port: 5173, proxy: { "/api": "http://127.0.0.1:13900" } },
+  server: {
+    port: 5173,
+    proxy: {
+      "/api": { target: "http://127.0.0.1:13900", ws: true },
+    },
+  },
 });

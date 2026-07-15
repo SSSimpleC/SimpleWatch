@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import type { Room as LiveKitRoom } from "livekit-client";
 import { v7 as uuidv7 } from "uuid";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import {
@@ -10,6 +10,8 @@ import {
   type MediaItem,
   type RoomSnapshot,
 } from "../api.js";
+import { decideProgramTrack, replaceRetryTimer } from "../live-program.js";
+import { averageBitrateMbps, isHighLoadVod } from "../media-performance.js";
 import { loadPreferences, savePreferences } from "../preferences.js";
 import { useSession } from "../store.js";
 
@@ -30,7 +32,16 @@ export function RoomPage() {
   const voiceTracksRef = useRef<HTMLDivElement | null>(null);
   const liveReaderRef = useRef<{ close(): void } | null>(null);
   const liveStreamRef = useRef<MediaStream | null>(null);
+  const liveTracksRef = useRef(new Map<"audio" | "video", MediaStreamTrack>());
+  const liveReaderGenerationRef = useRef(0);
+  const liveRetryTimerRef = useRef(0);
+  const rejectedLiveTracksRef = useRef(0);
+  const stallCountRef = useRef(0);
+  const seekingRef = useRef(false);
   const [programEnabled, setProgramEnabled] = useState(false);
+  const [playheadSec, setPlayheadSec] = useState(0);
+  const [bufferedAheadSec, setBufferedAheadSec] = useState(0);
+  const [seekDraftSec, setSeekDraftSec] = useState<number | null>(null);
   const [liveProgramState, setLiveProgramState] = useState<
     "idle" | "connecting" | "playing" | "error"
   >("idle");
@@ -61,6 +72,18 @@ export function RoomPage() {
     enabled: joined && snapshot?.mode === "live",
     refetchInterval: 2000,
   });
+  const durationSec =
+    snapshot?.media?.durationSec ?? (media.data?.durationMs ?? 0) / 1000;
+  const displayedPositionSec = clamp(
+    seekDraftSec ?? playheadSec,
+    0,
+    durationSec,
+  );
+  const bitrateMbps = averageBitrateMbps(media.data);
+  const onlinePlaybackEndpoints =
+    snapshot?.members.filter((member) => member.online).length ?? 0;
+  const aggregateBitrateMbps = bitrateMbps * onlinePlaybackEndpoints;
+  const highLoadVod = isHighLoadVod(media.data);
 
   useEffect(() => {
     let active = true;
@@ -140,6 +163,13 @@ export function RoomPage() {
   }, [connected, roomId, snapshot?.revision, voiceState]);
 
   useEffect(() => {
+    setSeekDraftSec(null);
+    setPlayheadSec(0);
+    setBufferedAheadSec(0);
+    stallCountRef.current = 0;
+  }, [snapshot?.media?.id]);
+
+  useEffect(() => {
     if (!joined) return;
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     let disposed = false;
@@ -209,18 +239,25 @@ export function RoomPage() {
     const video = videoRef.current;
     const transport = snapshot?.transport;
     if (!video || !transport || snapshot?.mode !== "vod") return;
+    const elapsed = Math.max(0, Date.now() - transport.anchoredAtServerMs);
     const desired =
       transport.positionSec +
-      (transport.state === "playing"
-        ? ((Date.now() - transport.anchoredAtServerMs) / 1000) * transport.rate
-        : 0);
-    if (Math.abs(video.currentTime - desired) > 0.8)
-      video.currentTime = Math.max(0, desired);
+      (transport.state === "playing" ? (elapsed / 1000) * transport.rate : 0);
+    const boundedDesired = clamp(desired, 0, durationSec || desired);
+    if (Math.abs(video.currentTime - boundedDesired) > 0.8)
+      video.currentTime = boundedDesired;
+    setPlayheadSec(video.currentTime);
     video.playbackRate = transport.rate;
     if (transport.state === "playing" && programEnabled)
       void video.play().catch(() => undefined);
     else video.pause();
-  }, [programEnabled, snapshot?.mode, snapshot?.revision, snapshot?.transport]);
+  }, [
+    durationSec,
+    programEnabled,
+    snapshot?.mode,
+    snapshot?.revision,
+    snapshot?.transport,
+  ]);
 
   useEffect(() => {
     if (snapshot?.mode !== "live" || isHost) {
@@ -244,9 +281,7 @@ export function RoomPage() {
     () => () => {
       voiceRoomRef.current?.disconnect();
       voiceRoomRef.current = null;
-      liveReaderRef.current?.close();
-      liveReaderRef.current = null;
-      liveStreamRef.current = null;
+      closeLiveProgram();
     },
     [],
   );
@@ -334,6 +369,7 @@ export function RoomPage() {
 
   async function enableLiveProgram() {
     if (!roomCsrf || liveReaderRef.current || isHost) return;
+    const generation = ++liveReaderGenerationRef.current;
     setLiveProgramState("connecting");
     try {
       const credential = await api<{ url: string; token: string }>(
@@ -345,26 +381,55 @@ export function RoomPage() {
         },
       );
       await import("../vendor/mediamtx-reader.js");
-      liveReaderRef.current = new window.MediaMTXWebRTCReader({
+      if (generation !== liveReaderGenerationRef.current) return;
+      const reader = new window.MediaMTXWebRTCReader({
         url: credential.url,
         user: "",
         pass: "",
         token: credential.token,
         onTrack: (event) => {
+          if (generation !== liveReaderGenerationRef.current) {
+            event.track.stop();
+            return;
+          }
           const video = videoRef.current;
           if (!video) return;
           const stream = liveStreamRef.current ?? new MediaStream();
           liveStreamRef.current = stream;
-          const incoming =
-            event.streams[0]?.getTracks() ?? (event.track ? [event.track] : []);
-          for (const track of incoming) {
-            if (
-              !stream.getTracks().some((candidate) => candidate.id === track.id)
-            )
-              stream.addTrack(track);
+          const track = event.track;
+          const kind = track.kind;
+          if (kind !== "audio" && kind !== "video") {
+            track.stop();
+            return;
           }
+          const existing = liveTracksRef.current.get(kind);
+          const decision = decideProgramTrack(existing, track);
+          if (decision === "same") return;
+          if (decision === "reject-duplicate") {
+            rejectedLiveTracksRef.current += 1;
+            track.stop();
+            writeProgramDiagnostics(video, "duplicate-live-track-rejected");
+            return;
+          }
+          if (existing) stream.removeTrack(existing);
+          liveTracksRef.current.set(kind, track);
+          stream.addTrack(track);
+          track.addEventListener(
+            "ended",
+            () => {
+              if (liveTracksRef.current.get(kind)?.id === track.id)
+                liveTracksRef.current.delete(kind);
+            },
+            { once: true },
+          );
           video.srcObject = stream;
           video.volume = preferences.programVolume / 100;
+          writeProgramDiagnostics(video, "live-track-added");
+          if (
+            stream.getAudioTracks().length !== 1 ||
+            stream.getVideoTracks().length !== 1
+          )
+            return;
           void video
             .play()
             .then(() => setLiveProgramState("playing"))
@@ -374,15 +439,20 @@ export function RoomPage() {
             });
         },
         onError: (readerError) => {
-          scheduleLiveRetry(`直播信号中断，正在重连：${readerError}`);
+          if (generation === liveReaderGenerationRef.current)
+            scheduleLiveRetry(`直播信号中断，正在重连：${readerError}`);
         },
       });
+      if (generation === liveReaderGenerationRef.current)
+        liveReaderRef.current = reader;
+      else reader.close();
     } catch (readerError) {
-      scheduleLiveRetry(
-        readerError instanceof Error
-          ? `直播连接失败，正在重试：${readerError.message}`
-          : "直播连接失败，正在重试",
-      );
+      if (generation === liveReaderGenerationRef.current)
+        scheduleLiveRetry(
+          readerError instanceof Error
+            ? `直播连接失败，正在重试：${readerError.message}`
+            : "直播连接失败，正在重试",
+        );
     }
   }
 
@@ -390,14 +460,24 @@ export function RoomPage() {
     closeLiveProgram();
     setLiveProgramState("error");
     setError(message);
-    window.setTimeout(() => setLiveRetry((value) => value + 1), 2000);
+    liveRetryTimerRef.current = replaceRetryTimer(
+      liveRetryTimerRef.current,
+      window.clearTimeout,
+      window.setTimeout,
+      () => setLiveRetry((value) => value + 1),
+      2000,
+    );
   }
 
   function closeLiveProgram() {
+    liveReaderGenerationRef.current += 1;
+    window.clearTimeout(liveRetryTimerRef.current);
+    liveRetryTimerRef.current = 0;
     liveReaderRef.current?.close();
     liveReaderRef.current = null;
     liveStreamRef.current?.getTracks().forEach((track) => track.stop());
     liveStreamRef.current = null;
+    liveTracksRef.current.clear();
     if (videoRef.current?.srcObject) videoRef.current.srcObject = null;
     setLiveProgramState("idle");
   }
@@ -413,6 +493,13 @@ export function RoomPage() {
         await video
           .play()
           .catch(() => setError("无法启用节目声音，请检查浏览器媒体权限"));
+      } else if (snapshot?.mode === "vod") {
+        // A short play/pause in the direct click gesture unlocks later
+        // synchronized playback without starting the room early.
+        await video
+          .play()
+          .then(() => video.pause())
+          .catch(() => setError("无法启用节目声音，请检查浏览器媒体权限"));
       }
     }
     if (
@@ -422,6 +509,64 @@ export function RoomPage() {
     ) {
       await enableLiveProgram();
     }
+  }
+
+  async function toggleVodPlayback() {
+    if (!isHost || !snapshot?.transport) return;
+    if (!programEnabled) await enableProgramSound();
+    command({
+      kind: snapshot.transport.state === "playing" ? "pause" : "play",
+    });
+  }
+
+  function commitSeek(positionSec: number) {
+    if (!isHost || !durationSec) return;
+    const next = clamp(positionSec, 0, durationSec);
+    setSeekDraftSec(null);
+    command({ kind: "seek", positionSec: next });
+  }
+
+  function updateProgramMetrics(video: HTMLVideoElement, event: string) {
+    setPlayheadSec(video.currentTime);
+    const buffered = bufferedAhead(video);
+    setBufferedAheadSec(buffered);
+    writeProgramDiagnostics(video, event, buffered);
+  }
+
+  function writeProgramDiagnostics(
+    video: HTMLVideoElement,
+    event: string,
+    buffered = bufferedAhead(video),
+  ) {
+    const quality = video.getVideoPlaybackQuality?.();
+    sessionStorage.setItem(
+      "simplewatch.program-diagnostics",
+      JSON.stringify({
+        updatedAt: new Date().toISOString(),
+        event,
+        mode: snapshot?.mode ?? "idle",
+        codec: media.data?.video.codec ?? null,
+        resolution:
+          media.data?.video.width && media.data.video.height
+            ? `${media.data.video.width}x${media.data.video.height}`
+            : null,
+        averageBitrateMbps: round(bitrateMbps, 1),
+        currentTimeSec: round(video.currentTime, 2),
+        durationSec: round(video.duration || durationSec, 2),
+        bufferedAheadSec: round(buffered, 2),
+        readyState: video.readyState,
+        networkState: video.networkState,
+        stalls: stallCountRef.current,
+        droppedFrames: quality?.droppedVideoFrames ?? null,
+        totalFrames: quality?.totalVideoFrames ?? null,
+        liveAudioTracks: liveStreamRef.current?.getAudioTracks().length ?? 0,
+        liveVideoTracks: liveStreamRef.current?.getVideoTracks().length ?? 0,
+        rejectedLiveTracks: rejectedLiveTracksRef.current,
+        serverAudioTracks: liveStatus.data?.audioTrackCount ?? null,
+        serverVideoTracks: liveStatus.data?.videoTrackCount ?? null,
+        readerGeneration: liveReaderGenerationRef.current,
+      }),
+    );
   }
 
   async function toggleMicrophone() {
@@ -585,6 +730,23 @@ export function RoomPage() {
               H.265 的 Safari、Edge 或设备。
             </div>
           )}
+          {snapshot?.mode === "vod" && highLoadVod && media.data && (
+            <div className="program-warning high-load-warning" role="status">
+              <strong>高负载原片</strong>
+              <span>
+                {media.data.video.width ?? "?"}×{media.data.video.height ?? "?"}{" "}
+                · {bitrateMbps.toFixed(1)}
+                Mbps / 播放端
+              </span>
+              <span>
+                当前 {onlinePlaybackEndpoints} 个在线端理论聚合约{" "}
+                {aggregateBitrateMbps.toFixed(1)}{" "}
+                Mbps。服务器不会转码；若主持端卡顿而其他端流畅，通常是该终端的网络或
+                {media.data.video.codec === "hevc" ? " H.265 硬件解码" : "解码"}
+                能力不足。
+              </span>
+            </div>
+          )}
           {snapshot?.mode === "live" && !isHost ? (
             <video ref={videoRef} controls={false} playsInline />
           ) : snapshot?.mode === "live" && isHost ? (
@@ -594,6 +756,17 @@ export function RoomPage() {
               <p>
                 直播节目只发送给观看者。放映者在此只保留播控与语音，避免回传节目音频造成重复。
               </p>
+              <p className="live-track-status">
+                节目轨道：视频 {liveStatus.data?.videoTrackCount ?? 0} / 音频{" "}
+                {liveStatus.data?.audioTrackCount ?? 0}
+              </p>
+              {liveStatus.data?.state === "online" &&
+                liveStatus.data.audioTrackCount !== 1 && (
+                  <p className="program-warning">
+                    直播应当只有 1 条 Opus 音轨。请先停止推流并检查 OBS
+                    音频来源。
+                  </p>
+                )}
               <button onClick={() => command({ kind: "restore-vod" })}>
                 返回服务器影片
               </button>
@@ -604,13 +777,31 @@ export function RoomPage() {
               src={`/api/v1/media/${snapshot.media.id}/content`}
               controls={false}
               playsInline
-              onError={() =>
+              preload="auto"
+              onLoadedMetadata={(event) =>
+                updateProgramMetrics(event.currentTarget, "loaded-metadata")
+              }
+              onTimeUpdate={(event) =>
+                updateProgramMetrics(event.currentTarget, "time-update")
+              }
+              onProgress={(event) =>
+                updateProgramMetrics(event.currentTarget, "progress")
+              }
+              onPlaying={(event) =>
+                updateProgramMetrics(event.currentTarget, "playing")
+              }
+              onWaiting={(event) => {
+                stallCountRef.current += 1;
+                updateProgramMetrics(event.currentTarget, "waiting");
+              }}
+              onError={(event) => {
+                updateProgramMetrics(event.currentTarget, "error");
                 setError(
                   media.data?.video.codec === "hevc"
                     ? "当前终端无法解码这条 H.265 影片，服务器不会转码"
                     : "影片加载失败，请检查网络或文件状态",
-                )
-              }
+                );
+              }}
             >
               {media.data?.subtitles.map((subtitle) => (
                 <track
@@ -632,42 +823,71 @@ export function RoomPage() {
             <div className="transport-bar">
               <button
                 disabled={!isHost}
-                onClick={() =>
-                  command({
-                    kind:
-                      snapshot?.transport?.state === "playing"
-                        ? "pause"
-                        : "play",
-                  })
-                }
+                onClick={() => void toggleVodPlayback()}
               >
                 {snapshot?.transport?.state === "playing" ? "Ⅱ 暂停" : "▶ 播放"}
               </button>
               <button
                 disabled={!isHost}
-                onClick={() =>
-                  command({
-                    kind: "seek",
-                    positionSec: Math.max(
-                      0,
-                      (videoRef.current?.currentTime ?? 0) - 10,
-                    ),
-                  })
-                }
+                onClick={() => commitSeek(displayedPositionSec - 10)}
               >
                 −10s
               </button>
               <button
                 disabled={!isHost}
-                onClick={() =>
-                  command({
-                    kind: "seek",
-                    positionSec: (videoRef.current?.currentTime ?? 0) + 10,
-                  })
-                }
+                onClick={() => commitSeek(displayedPositionSec + 10)}
               >
                 +10s
               </button>
+              <div className="playback-scrubber">
+                <input
+                  aria-label="播放进度"
+                  type="range"
+                  min="0"
+                  max={Math.max(durationSec, 0.1)}
+                  step="0.1"
+                  disabled={!isHost || durationSec <= 0}
+                  value={displayedPositionSec}
+                  style={
+                    {
+                      "--playhead-percent": `${durationSec ? (displayedPositionSec / durationSec) * 100 : 0}%`,
+                      "--buffered-percent": `${durationSec ? (Math.min(durationSec, playheadSec + bufferedAheadSec) / durationSec) * 100 : 0}%`,
+                    } as CSSProperties
+                  }
+                  onPointerDown={() => {
+                    seekingRef.current = true;
+                  }}
+                  onChange={(event) =>
+                    setSeekDraftSec(Number(event.currentTarget.value))
+                  }
+                  onPointerUp={(event) => {
+                    seekingRef.current = false;
+                    commitSeek(Number(event.currentTarget.value));
+                  }}
+                  onKeyUp={(event) => {
+                    if (
+                      [
+                        "ArrowLeft",
+                        "ArrowRight",
+                        "Home",
+                        "End",
+                        "PageUp",
+                        "PageDown",
+                      ].includes(event.key)
+                    )
+                      commitSeek(Number(event.currentTarget.value));
+                  }}
+                  onBlur={(event) => {
+                    if (!seekingRef.current) return;
+                    seekingRef.current = false;
+                    commitSeek(Number(event.currentTarget.value));
+                  }}
+                />
+                <output aria-live="off">
+                  {formatMediaTime(displayedPositionSec)} /{" "}
+                  {formatMediaTime(durationSec)}
+                </output>
+              </div>
               <select
                 disabled={!isHost}
                 aria-label="播放速度"
@@ -697,7 +917,7 @@ export function RoomPage() {
             </div>
           )}
           <div className="local-mix">
-            {!isHost && (
+            {(!isHost || snapshot?.mode === "vod") && (
               <button
                 type="button"
                 className={
@@ -787,6 +1007,23 @@ export function RoomPage() {
                     <span>1920×1080 · 30 fps · H.264 硬件编码</span>
                     <span>CBR 6000 Kbps（链路稳定后可升至 8000）</span>
                     <span>关键帧间隔 2 秒 · B 帧 0 · Opus 48 kHz 立体声</span>
+                  </div>
+                  <div className="obs-audio-checklist" role="note">
+                    <strong>推流前音频自检（避免重声）</strong>
+                    <span>
+                      同一系统声音只能保留一个来源：屏幕采集音频或桌面音频，二选一。
+                    </span>
+                    <span>
+                      macOS 屏幕采集若已带声音，请禁用全局“桌面音频”。
+                    </span>
+                    <span>
+                      高级音频属性中的“音频监听”设为“仅输出/监听关闭”，不要“监听并输出”。
+                    </span>
+                    <span>
+                      先在 OBS 本地录制 10
+                      秒试听；本地已重声时，服务器无法从单条 Opus
+                      音轨中分离修复。
+                    </span>
                   </div>
                   <code>{publishConfig.url}</code>
                   <code>{publishConfig.token}</code>
@@ -909,6 +1146,38 @@ function supportsHevcPlayback(): boolean {
     video.canPlayType('video/mp4; codecs="hvc1"') ||
     video.canPlayType('video/mp4; codecs="hev1"'),
   );
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  if (!Number.isFinite(value)) return minimum;
+  return Math.min(Math.max(value, minimum), maximum);
+}
+
+function bufferedAhead(video: HTMLVideoElement): number {
+  for (let index = 0; index < video.buffered.length; index += 1) {
+    if (
+      video.buffered.start(index) <= video.currentTime &&
+      video.buffered.end(index) >= video.currentTime
+    )
+      return Math.max(0, video.buffered.end(index) - video.currentTime);
+  }
+  return 0;
+}
+
+function round(value: number, digits: number): number {
+  if (!Number.isFinite(value)) return 0;
+  const scale = 10 ** digits;
+  return Math.round(value * scale) / scale;
+}
+
+function formatMediaTime(value: number): string {
+  const seconds = Math.max(0, Math.floor(Number.isFinite(value) ? value : 0));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = seconds % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
+    : `${minutes}:${String(remainder).padStart(2, "0")}`;
 }
 
 function liveLabel(state: LiveStatus["state"] | undefined): string {

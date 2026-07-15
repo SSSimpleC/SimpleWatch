@@ -29,11 +29,15 @@ test("real admin creates a room and a second browser joins read-only", async ({
   expect(inviteUrl).toBeTruthy();
   await page.getByRole("button", { name: "进入主持房间" }).click();
   await expect(page.getByText("主持控制")).toBeVisible();
+  await expect(page.getByText("同步在线")).toBeVisible();
   await expect(page.getByLabel("选择点播影片")).toBeVisible();
   await page
     .getByLabel("选择点播影片")
     .selectOption({ label: "media-smoke.mp4" });
   await expect(page.locator("video")).toBeVisible();
+  const hostProgress = page.getByRole("slider", { name: "播放进度" });
+  await expect(hostProgress).toBeEnabled();
+  await expect(page.getByRole("button", { name: /播放|暂停/ })).toBeEnabled();
   const memberContext = await browser.newContext();
   const member = await memberContext.newPage();
   await member.goto(inviteUrl!);
@@ -44,8 +48,21 @@ test("real admin creates a room and a second browser joins read-only", async ({
     member.getByRole("button", { name: /播放|暂停/ }),
   ).toBeDisabled();
   await expect(member.getByRole("button", { name: "−10s" })).toBeDisabled();
+  await expect(member.getByRole("slider", { name: "播放进度" })).toBeDisabled();
   await expect(member.getByText("主持控制")).toHaveCount(0);
   await member.getByRole("link", { name: "诊断" }).click();
   await expect(member.getByRole("heading", { name: "连接诊断" })).toBeVisible();
+  await member.goBack();
+  await expect(member.getByText("同场观众")).toBeVisible();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page
+    .locator(".seat-list li")
+    .filter({ hasText: "Second Browser" })
+    .getByRole("button", { name: "移出" })
+    .click();
+  await expect(member).toHaveURL("/");
+  await expect(
+    member.getByRole("heading", { name: /让远方的人/ }),
+  ).toBeVisible();
   await memberContext.close();
 });

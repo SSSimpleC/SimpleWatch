@@ -89,6 +89,8 @@ export interface LiveStatus {
   state: "offline" | "online" | "unknown";
   hasVideo: boolean;
   hasAudio: boolean;
+  videoTrackCount: number;
+  audioTrackCount: number;
   checkedAt: string;
 }
 

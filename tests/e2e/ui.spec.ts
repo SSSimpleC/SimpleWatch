@@ -22,6 +22,13 @@ for (const viewport of [
       width: viewport.width,
       height: viewport.height,
     });
+    await page.route("**/api/v1/admin/session", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({}),
+      }),
+    );
     await page.goto("/", { waitUntil: "networkidle" });
     await expect(
       page.getByRole("heading", { name: /让远方的人/ }),

@@ -274,19 +274,31 @@ export function AdminPage() {
   async function deleteMedia(ids: string[]) {
     if (!adminCsrf || ids.length === 0) return;
     if (!confirm(`确认将 ${ids.length} 条影片移入回收站？`)) return;
-    try {
-      for (const id of ids) {
+    const failed: Array<{ id: string; message: string }> = [];
+    let deleted = 0;
+    for (const id of ids) {
+      try {
         await api<void>(`/api/v1/admin/media/${id}`, {
           method: "DELETE",
           headers: { "x-csrf-token": adminCsrf },
         });
+        deleted += 1;
+      } catch (error) {
+        failed.push({
+          id,
+          message: error instanceof ApiError ? error.message : "删除影片失败",
+        });
       }
-      setSelectedMedia([]);
-      setMessage(`${ids.length} 条影片已移入回收站`);
-      await queryClient.invalidateQueries({ queryKey: ["media"] });
-    } catch (error) {
-      setMessage(error instanceof ApiError ? error.message : "删除影片失败");
     }
+    setSelectedMedia(failed.map((item) => item.id));
+    setMessage(
+      failed.length === 0
+        ? `${deleted} 条影片已移入回收站，将在 24 小时后彻底清理`
+        : `已删除 ${deleted} 条，${failed.length} 条未删除：${failed
+            .map((item) => item.message)
+            .join("；")}`,
+    );
+    await queryClient.invalidateQueries({ queryKey: ["media"] });
   }
 
   async function rescanMedia(mediaId: string) {

@@ -164,6 +164,8 @@ export const liveStatusSchema = z.object({
   state: z.enum(["offline", "online", "unknown"]),
   hasVideo: z.boolean(),
   hasAudio: z.boolean(),
+  videoTrackCount: z.number().int().nonnegative(),
+  audioTrackCount: z.number().int().nonnegative(),
   checkedAt: z.iso.datetime(),
 });
 

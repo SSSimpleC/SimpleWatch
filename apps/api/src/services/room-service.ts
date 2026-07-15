@@ -533,7 +533,7 @@ export class RoomService {
   ): void {
     if (identity.role !== "host") throw forbidden("只有主持人可以移出成员");
     if (identity.memberId === targetMemberId) {
-      throw conflict("CANNOT_KICK_SELF", "主持人不能移出自己，请先转交主持权");
+      throw conflict("CANNOT_KICK_SELF", "主持人不能移出自己");
     }
     const now = this.now();
     this.database.transaction(() => {
@@ -972,16 +972,30 @@ function applyRoomCommand(
           anchoredAtServerMs: effectiveAt,
         },
       };
-    case "seek":
+    case "seek": {
+      const mediaDuration = state.media_id
+        ? (
+            database
+              .prepare("SELECT duration_ms FROM media WHERE id = ?")
+              .get(state.media_id) as
+              | { readonly duration_ms: number | null }
+              | undefined
+          )?.duration_ms
+        : null;
+      const maximumPosition = Math.max(0, (mediaDuration ?? 0) / 1000);
       return {
         mode: "vod",
         mediaId: state.media_id,
         transport: {
           ...current,
-          positionSec: command.positionSec,
+          positionSec:
+            maximumPosition > 0
+              ? Math.min(command.positionSec, maximumPosition)
+              : command.positionSec,
           anchoredAtServerMs: effectiveAt,
         },
       };
+    }
     case "set-rate":
       return {
         mode: "vod",

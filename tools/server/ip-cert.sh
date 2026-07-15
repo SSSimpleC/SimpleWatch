@@ -23,17 +23,24 @@ resolve_image() {
     cat "$image_lock"
     return
   fi
-  local tagged=docker.io/certbot/certbot:v5.7.0
-  docker pull "$tagged" >/dev/null
-  local resolved
-  resolved=$(docker image inspect --format '{{index .RepoDigests 0}}' "$tagged")
-  if [[ "$resolved" != *@sha256:* ]]; then
-    echo "无法锁定 Certbot 镜像摘要" >&2
-    exit 1
-  fi
-  install -D -m 0644 /dev/null "$image_lock"
-  printf '%s\n' "$resolved" >"$image_lock"
-  printf '%s\n' "$resolved"
+  local tagged resolved
+  for tagged in \
+    docker.m.daocloud.io/certbot/certbot:v5.7.0 \
+    docker.io/certbot/certbot:v5.7.0; do
+    if ! docker image inspect "$tagged" >/dev/null 2>&1 &&
+      ! docker pull "$tagged" >/dev/null; then
+      continue
+    fi
+    resolved=$(docker image inspect --format '{{index .RepoDigests 0}}' "$tagged")
+    if [[ "$resolved" == *@sha256:* ]]; then
+      install -D -m 0644 /dev/null "$image_lock"
+      printf '%s\n' "$resolved" >"$image_lock"
+      printf '%s\n' "$resolved"
+      return
+    fi
+  done
+  echo "无法通过镜像加速或 Docker Hub 锁定 Certbot 镜像摘要" >&2
+  exit 1
 }
 
 run_certbot() {

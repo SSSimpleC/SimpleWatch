@@ -218,6 +218,34 @@ export class AuthService {
           "UPDATE room_sessions SET revoked_at = ? WHERE revoked_at IS NULL",
         )
         .run(timestamp);
+      this.database
+        .prepare(
+          `UPDATE token_jti SET revoked_at = ?
+           WHERE revoked_at IS NULL AND subject_id IN (
+             SELECT member_id FROM room_members
+             WHERE room_id IN (SELECT id FROM rooms WHERE status = 'active')
+           )`,
+        )
+        .run(timestamp);
+      this.database
+        .prepare(
+          `UPDATE media_transport_sessions SET closed_at = ?
+           WHERE closed_at IS NULL
+             AND room_id IN (SELECT id FROM rooms WHERE status = 'active')`,
+        )
+        .run(timestamp);
+      this.database
+        .prepare(
+          `UPDATE room_members SET left_at = COALESCE(left_at, ?), last_seen_at = ?
+           WHERE room_id IN (SELECT id FROM rooms WHERE status = 'active')
+             AND kicked_at IS NULL`,
+        )
+        .run(timestamp, timestamp);
+      this.database
+        .prepare(
+          "UPDATE rooms SET status = 'closed', closed_at = ? WHERE status = 'active'",
+        )
+        .run(timestamp);
       this.database.prepare("DELETE FROM room_wait_queue").run();
       this.database.prepare("DELETE FROM room_device_leases").run();
     })();

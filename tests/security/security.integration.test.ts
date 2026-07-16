@@ -69,6 +69,37 @@ describe("OWASP security regression", () => {
     expect(() => built.authService.authenticate(login.sessionToken)).toThrow();
   });
 
+  it("closes every legacy active room during fixed-account replacement", async () => {
+    const login = await built.authService.login(
+      "Host",
+      hostPassword,
+      "127.0.0.20",
+    );
+    const session = built.authService.authenticate(login.sessionToken);
+    const room = built.roomService.createAccountRoom(session);
+
+    await built.authService.provisionAccounts([
+      { username: "Host", role: "host", password: hostPassword },
+      { username: "Simple", role: "viewer", password: viewerPassword },
+    ]);
+
+    expect(
+      built.database
+        .prepare("SELECT status FROM rooms WHERE id = ?")
+        .get(room.roomId),
+    ).toEqual({ status: "closed" });
+    expect(
+      built.database
+        .prepare("SELECT left_at FROM room_members WHERE member_id = ?")
+        .get(room.memberId),
+    ).toEqual({ left_at: currentNow });
+    expect(
+      built.database
+        .prepare("SELECT COUNT(*) AS count FROM room_device_leases")
+        .get(),
+    ).toEqual({ count: 0 });
+  });
+
   it("expires after seven idle days and after thirty absolute days", async () => {
     const idle = await built.authService.login(
       "Simple",

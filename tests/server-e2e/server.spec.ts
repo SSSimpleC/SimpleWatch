@@ -133,9 +133,9 @@ test("public server supports upload, room admission and two-party voice", async 
     await member.getByLabel("昵称").fill("Server Member");
     await member.getByRole("button", { name: "进入放映室" }).click();
     await expect(member.getByText("同场观众")).toBeVisible();
-    await expect(
-      member.getByRole("button", { name: /播放|暂停/ }),
-    ).toHaveCount(0);
+    await expect(member.getByRole("button", { name: /播放|暂停/ })).toHaveCount(
+      0,
+    );
     await member.getByRole("button", { name: "启用节目声音" }).click();
     await expect
       .poll(
@@ -230,7 +230,7 @@ test("public server supports upload, room admission and two-party voice", async 
       },
       { roomId, csrfToken: adminCsrfToken },
     );
-    await cleanupMediaRows(page, code!, [mediaName, hevcName]);
+    await cleanupMediaRows(page, code!, adminCsrfToken, [mediaName, hevcName]);
   }
 });
 
@@ -276,23 +276,64 @@ async function uploadMp4(page: Page, name: string, path: string) {
   await expect(row).toContainText("可放映", { timeout: 30_000 });
 }
 
-async function cleanupMediaRows(page: Page, code: string, names: string[]) {
+async function cleanupMediaRows(
+  page: Page,
+  code: string,
+  initialCsrfToken: string,
+  names: string[],
+) {
   await page.goto("/admin");
   const login = page.getByLabel("6 位放映口令");
+  let csrfToken = initialCsrfToken;
   if (await login.isVisible()) {
     await login.fill(code);
+    const loginResponsePromise = page.waitForResponse(
+      (response) =>
+        response.url().endsWith("/api/v1/admin/login") &&
+        response.request().method() === "POST",
+    );
     await page.getByRole("button", { name: "解锁控制台" }).click();
+    csrfToken = (
+      (await (await loginResponsePromise).json()) as { csrfToken: string }
+    ).csrfToken;
   }
   await expect(
     page.getByRole("heading", { name: "放映控制", exact: true }),
   ).toBeVisible();
-  for (const name of names) {
-    const row = page.locator(".media-row").filter({ hasText: name });
-    if (!(await row.isVisible())) continue;
-    page.once("dialog", (dialog) => void dialog.accept());
-    await row.getByRole("button", { name: "删除" }).click();
-    await expect(row).toHaveCount(0);
-  }
+  await page.evaluate(
+    async ({ names, csrfToken }) => {
+      const list = async () => {
+        const response = await fetch("/api/v1/media", {
+          credentials: "same-origin",
+        });
+        if (!response.ok)
+          throw new Error(`读取测试媒体失败：${response.status}`);
+        return (await response.json()) as Array<{
+          id: string;
+          displayName: string;
+        }>;
+      };
+      for (const item of (await list()).filter((candidate) =>
+        names.includes(candidate.displayName),
+      )) {
+        const response = await fetch(`/api/v1/admin/media/${item.id}`, {
+          method: "DELETE",
+          credentials: "same-origin",
+          headers: { "x-csrf-token": csrfToken },
+        });
+        if (!response.ok && response.status !== 404)
+          throw new Error(`清理测试媒体失败：${response.status}`);
+      }
+      const remaining = (await list()).filter((candidate) =>
+        names.includes(candidate.displayName),
+      );
+      if (remaining.length > 0)
+        throw new Error(
+          `测试媒体未清理：${remaining.map((item) => item.displayName).join(", ")}`,
+        );
+    },
+    { names, csrfToken },
+  );
 }
 
 async function roomRevision(page: Page): Promise<number> {

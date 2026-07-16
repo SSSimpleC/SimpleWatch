@@ -21,6 +21,7 @@ srt: false
 
 webrtc: true
 webrtcAddress: :18889
+webrtcTrackGatherTimeout: 10s
 webrtcAllowOrigins: ["http://127.0.0.1:18080"]
 webrtcLocalUDPAddress: :18189
 webrtcLocalTCPAddress: :18189

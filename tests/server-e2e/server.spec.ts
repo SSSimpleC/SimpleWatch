@@ -11,7 +11,7 @@ test("public server supports upload, room admission and two-party voice", async 
   expect(hostPassword?.length).toBeGreaterThanOrEqual(20);
   expect(viewerPassword?.length).toBeGreaterThanOrEqual(20);
 
-  await page.route("**/admin", async (route) => {
+  await page.route(/https:\/\/8\.134\.239\.34\/(?:admin)?$/, async (route) => {
     const response = await route.fetch();
     const headers = response.headers();
     delete headers["permissions-policy"];
@@ -99,14 +99,41 @@ test("public server supports upload, room admission and two-party voice", async 
     );
     expect(whipResult.status).toBe(201);
     expect(whipResult.connected).toBe(true);
-    expect(whipResult.codecs, JSON.stringify(whipResult.diagnostics)).toContain(
-      "audio/opus",
-    );
-    expect(whipResult.codecs, JSON.stringify(whipResult.diagnostics)).toContain(
-      "video/H264",
-    );
+    expect(
+      whipResult.activeCodecs,
+      JSON.stringify(whipResult.diagnostics),
+    ).toContain("audio/opus");
+    expect(
+      whipResult.activeCodecs,
+      JSON.stringify(whipResult.diagnostics),
+    ).toContain("video/H264");
+    await expect
+      .poll(
+        () =>
+          page.evaluate(async (activeRoomId) => {
+            const response = await fetch(
+              `/api/v1/rooms/${activeRoomId}/live/status`,
+              { credentials: "same-origin" },
+            );
+            return (await response.json()) as {
+              state: string;
+              hasVideo: boolean;
+              hasAudio: boolean;
+              videoTrackCount: number;
+              audioTrackCount: number;
+            };
+          }, roomId),
+        { timeout: 20_000 },
+      )
+      .toMatchObject({
+        state: "online",
+        hasVideo: true,
+        hasAudio: true,
+        videoTrackCount: 1,
+        audioTrackCount: 1,
+      });
     await expect(page.getByText("LIVE / 信号在线")).toBeVisible({
-      timeout: 15_000,
+      timeout: 10_000,
     });
     await expect
       .poll(
@@ -462,6 +489,7 @@ async function publishWhipFromBrowser(page: Page, url: string, token: string) {
       };
       const stats = await waitForOutboundMedia(10_000);
       const codecs: string[] = [];
+      const codecsById = new Map<string, string>();
       const outbound: Array<{
         kind: string | undefined;
         packetsSent: number | undefined;
@@ -478,6 +506,8 @@ async function publishWhipFromBrowser(page: Page, url: string, token: string) {
           typeof report.mimeType === "string"
         ) {
           codecs.push(report.mimeType);
+          if ("id" in report && typeof report.id === "string")
+            codecsById.set(report.id, report.mimeType);
         }
         if (
           report &&
@@ -519,6 +549,12 @@ async function publishWhipFromBrowser(page: Page, url: string, token: string) {
         videoTrack: stream.getVideoTracks()[0]?.getSettings(),
         outbound,
       };
+      const activeCodecs = outbound.flatMap((report) => {
+        const codec = report.codecId
+          ? codecsById.get(report.codecId)
+          : undefined;
+        return codec ? [codec] : [];
+      });
       (
         window as typeof window & {
           __simpleWatchWhipTest?: {
@@ -540,6 +576,7 @@ async function publishWhipFromBrowser(page: Page, url: string, token: string) {
         status: response.status,
         connected,
         codecs,
+        activeCodecs,
         diagnostics,
       };
     },

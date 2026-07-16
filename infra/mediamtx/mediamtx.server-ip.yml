@@ -17,6 +17,7 @@ hls: false
 srt: false
 webrtc: true
 webrtcAddress: :8889
+webrtcTrackGatherTimeout: 10s
 webrtcAllowOrigins: ["https://8.134.239.34"]
 webrtcLocalUDPAddress: :8189
 webrtcLocalTCPAddress: :8189

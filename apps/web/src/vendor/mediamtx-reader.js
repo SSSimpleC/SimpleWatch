@@ -61,6 +61,11 @@ class MediaMTXWebRTCReader {
     }
   }
 
+  /** Return the active peer connection for read-only diagnostics. */
+  getPeerConnection() {
+    return this.pc;
+  }
+
   static #supportsNonAdvertisedCodec(codec, fmtp) {
     return new Promise((resolve) => {
       const pc = new RTCPeerConnection({ iceServers: [] });
@@ -448,6 +453,15 @@ class MediaMTXWebRTCReader {
     const direction = 'recvonly';
     this.pc.addTransceiver('video', { direction });
     this.pc.addTransceiver('audio', { direction });
+    for (const receiver of this.pc.getReceivers()) {
+      if ('jitterBufferTarget' in receiver) {
+        try {
+          receiver.jitterBufferTarget = 100;
+        } catch (_) {
+          // Browsers may expose the property before accepting assignments.
+        }
+      }
+    }
 
     // using data channels requires creating a data channel locally
     this.pc.createDataChannel('');
@@ -587,5 +601,4 @@ class MediaMTXWebRTCReader {
 }
 
 window.MediaMTXWebRTCReader = MediaMTXWebRTCReader;
-
 

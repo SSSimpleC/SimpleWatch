@@ -1,4 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
+import {
+  decideDriftCorrection,
+  estimateClock,
+  selectStableClockEstimate,
+  type ClockEstimate,
+} from "@simplewatch/sync";
 import type { Room as LiveKitRoom } from "livekit-client";
 import { v7 as uuidv7 } from "uuid";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
@@ -30,22 +36,37 @@ export function RoomPage() {
   const screenRef = useRef<HTMLElement | null>(null);
   const voiceRoomRef = useRef<LiveKitRoom | null>(null);
   const voiceTracksRef = useRef<HTMLDivElement | null>(null);
-  const liveReaderRef = useRef<{ close(): void } | null>(null);
+  const liveReaderRef = useRef<{
+    close(): void;
+    getPeerConnection(): RTCPeerConnection | null;
+  } | null>(null);
   const liveStreamRef = useRef<MediaStream | null>(null);
   const liveTracksRef = useRef(new Map<"audio" | "video", MediaStreamTrack>());
   const liveReaderGenerationRef = useRef(0);
   const liveRetryTimerRef = useRef(0);
   const rejectedLiveTracksRef = useRef(0);
+  const previousLiveStatsRef = useRef<LiveStatsSample | null>(null);
   const stallCountRef = useRef(0);
   const seekingRef = useRef(false);
+  const clockOffsetMsRef = useRef<number | null>(null);
+  const clockSamplesRef = useRef<ClockEstimate[]>([]);
+  const clockBurstTimersRef = useRef<number[]>([]);
+  const excessiveDriftSinceRef = useRef<number | null>(null);
+  const closingRoomRef = useRef(false);
+  const latestSnapshotRef = useRef<RoomSnapshot | null>(null);
+  const programEnabledRef = useRef(false);
   const [programEnabled, setProgramEnabled] = useState(false);
   const [playheadSec, setPlayheadSec] = useState(0);
   const [bufferedAheadSec, setBufferedAheadSec] = useState(0);
+  const [syncDeltaMs, setSyncDeltaMs] = useState<number | null>(null);
+  const [clockRttMs, setClockRttMs] = useState<number | null>(null);
+  const [syncFailed, setSyncFailed] = useState(false);
   const [seekDraftSec, setSeekDraftSec] = useState<number | null>(null);
   const [liveProgramState, setLiveProgramState] = useState<
     "idle" | "connecting" | "playing" | "error"
   >("idle");
   const [liveRetry, setLiveRetry] = useState(0);
+  const [liveStats, setLiveStats] = useState<LiveViewerStats | null>(null);
   const [voiceState, setVoiceState] = useState<
     "idle" | "connecting" | "connected" | "error"
   >("idle");
@@ -55,6 +76,7 @@ export function RoomPage() {
     url: string;
     token: string;
   } | null>(null);
+  const [publishConfigError, setPublishConfigError] = useState("");
   const isHost = Boolean(snapshot && memberId === snapshot.hostMemberId);
   const media = useQuery({
     queryKey: ["room-media", snapshot?.media?.id],
@@ -85,6 +107,9 @@ export function RoomPage() {
   const aggregateBitrateMbps = bitrateMbps * onlinePlaybackEndpoints;
   const highLoadVod = isHighLoadVod(media.data);
 
+  latestSnapshotRef.current = snapshot;
+  programEnabledRef.current = programEnabled;
+
   useEffect(() => {
     let active = true;
     void api<{ snapshot: RoomSnapshot; memberId: string; csrfToken: string }>(
@@ -95,6 +120,7 @@ export function RoomPage() {
         setRoomCsrf(bootstrap.csrfToken);
         setMemberId(bootstrap.memberId);
         setSnapshot(bootstrap.snapshot);
+        clockOffsetMsRef.current = bootstrap.snapshot.serverNowMs - Date.now();
         setJoined(true);
       })
       .catch(() => setError("房间会话已失效，请重新打开好友链接"));
@@ -170,6 +196,29 @@ export function RoomPage() {
   }, [snapshot?.media?.id]);
 
   useEffect(() => {
+    if (!joined || !isHost || snapshot?.mode !== "live" || publishConfig)
+      return;
+    let cancelled = false;
+    setPublishConfigError("");
+    void api<{ url: string; token: string }>(
+      `/api/v1/rooms/${roomId}/live/publish-config`,
+      { method: "GET" },
+    )
+      .then((result) => {
+        if (!cancelled) setPublishConfig(result);
+      })
+      .catch((reason: unknown) => {
+        if (!cancelled)
+          setPublishConfigError(
+            reason instanceof Error ? reason.message : "OBS 配置获取失败",
+          );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isHost, joined, publishConfig, roomId, snapshot?.mode]);
+
+  useEffect(() => {
     if (!joined) return;
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     let disposed = false;
@@ -187,6 +236,7 @@ export function RoomPage() {
         retryAttempt = 0;
         setConnected(true);
         socket.send(JSON.stringify(envelope(roomId, "room.hello", {})));
+        scheduleClockBurst(socket);
       });
       socket.addEventListener("close", (event) => {
         setConnected(false);
@@ -196,6 +246,7 @@ export function RoomPage() {
           voiceRoomRef.current?.disconnect();
           voiceRoomRef.current = null;
           setVoiceState("idle");
+          if (event.code === 4010 && closingRoomRef.current) return;
           setError(
             event.code === 4003
               ? "你已被主持人移出放映室"
@@ -219,7 +270,30 @@ export function RoomPage() {
           message.type === "room.snapshot" ||
           message.type === "host.changed"
         ) {
-          setSnapshot(message.payload as RoomSnapshot);
+          const next = message.payload as RoomSnapshot;
+          setSnapshot(next);
+          if (clockOffsetMsRef.current === null)
+            clockOffsetMsRef.current = next.serverNowMs - Date.now();
+        }
+        if (message.type === "clock.pong") {
+          const pong = message.payload as {
+            clientSentAtMs: number;
+            serverReceivedAtMs: number;
+            serverSentAtMs: number;
+          };
+          const estimate = estimateClock({
+            ...pong,
+            clientReceivedAtMs: Date.now(),
+          });
+          clockSamplesRef.current = [
+            ...clockSamplesRef.current.slice(-6),
+            estimate,
+          ];
+          const stable = selectStableClockEstimate(clockSamplesRef.current);
+          if (stable) {
+            clockOffsetMsRef.current = stable.offsetMs;
+            setClockRttMs(Math.round(stable.roundTripMs));
+          }
         }
         if (message.type === "room.command.rejected")
           setError("操作未生效，状态已刷新");
@@ -227,30 +301,32 @@ export function RoomPage() {
     };
 
     connect();
+    const calibrationTimer = window.setInterval(() => {
+      const socket = socketRef.current;
+      if (socket?.readyState === WebSocket.OPEN) scheduleClockBurst(socket, 3);
+    }, 30_000);
+    const recalibrate = () => {
+      if (document.visibilityState === "hidden") return;
+      const socket = socketRef.current;
+      if (socket?.readyState === WebSocket.OPEN) scheduleClockBurst(socket);
+    };
+    document.addEventListener("visibilitychange", recalibrate);
+    addEventListener("online", recalibrate);
     return () => {
       disposed = true;
       window.clearTimeout(retryTimer);
+      window.clearInterval(calibrationTimer);
+      clockBurstTimersRef.current.forEach(window.clearTimeout);
+      clockBurstTimersRef.current = [];
+      document.removeEventListener("visibilitychange", recalibrate);
+      removeEventListener("online", recalibrate);
       socketRef.current?.close(1000, "page leave");
       socketRef.current = null;
     };
   }, [joined, navigate, roomId]);
 
   useEffect(() => {
-    const video = videoRef.current;
-    const transport = snapshot?.transport;
-    if (!video || !transport || snapshot?.mode !== "vod") return;
-    const elapsed = Math.max(0, Date.now() - transport.anchoredAtServerMs);
-    const desired =
-      transport.positionSec +
-      (transport.state === "playing" ? (elapsed / 1000) * transport.rate : 0);
-    const boundedDesired = clamp(desired, 0, durationSec || desired);
-    if (Math.abs(video.currentTime - boundedDesired) > 0.8)
-      video.currentTime = boundedDesired;
-    setPlayheadSec(video.currentTime);
-    video.playbackRate = transport.rate;
-    if (transport.state === "playing" && programEnabled)
-      void video.play().catch(() => undefined);
-    else video.pause();
+    reconcileVod("snapshot");
   }, [
     durationSec,
     programEnabled,
@@ -258,6 +334,21 @@ export function RoomPage() {
     snapshot?.revision,
     snapshot?.transport,
   ]);
+
+  useEffect(() => {
+    if (snapshot?.mode !== "vod") return;
+    const timer = window.setInterval(() => reconcileVod("periodic"), 500);
+    return () => window.clearInterval(timer);
+  }, [durationSec, snapshot?.media?.id, snapshot?.mode]);
+
+  useEffect(() => {
+    if (snapshot?.mode !== "live" || isHost || liveProgramState !== "playing")
+      return;
+    const update = () => void collectLiveStats();
+    update();
+    const timer = window.setInterval(update, 1000);
+    return () => window.clearInterval(timer);
+  }, [isHost, liveProgramState, snapshot?.mode]);
 
   useEffect(() => {
     if (snapshot?.mode !== "live" || isHost) {
@@ -298,6 +389,75 @@ export function RoomPage() {
         }),
       ),
     );
+  }
+
+  function scheduleClockBurst(socket: WebSocket, sampleCount = 7) {
+    if (sampleCount >= 7) clockSamplesRef.current = [];
+    clockBurstTimersRef.current.forEach(window.clearTimeout);
+    clockBurstTimersRef.current = Array.from(
+      { length: sampleCount },
+      (_, index) =>
+        window.setTimeout(() => {
+          if (socket.readyState !== WebSocket.OPEN) return;
+          const clientSentAtMs = Date.now();
+          socket.send(
+            JSON.stringify(envelope(roomId, "clock.ping", { clientSentAtMs })),
+          );
+        }, index * 120),
+    );
+  }
+
+  function reconcileVod(event: string) {
+    const video = videoRef.current;
+    const currentSnapshot = latestSnapshotRef.current;
+    const transport = currentSnapshot?.transport;
+    if (
+      !video ||
+      !transport ||
+      currentSnapshot.mode !== "vod" ||
+      video.readyState === HTMLMediaElement.HAVE_NOTHING
+    )
+      return;
+
+    const serverNowMs = Date.now() + (clockOffsetMsRef.current ?? 0);
+    const elapsedMs = Math.max(0, serverNowMs - transport.anchoredAtServerMs);
+    const desired =
+      transport.positionSec +
+      (transport.state === "playing" ? (elapsedMs / 1000) * transport.rate : 0);
+    const maximum =
+      durationSec ||
+      (Number.isFinite(video.duration) ? video.duration : desired);
+    const boundedDesired = clamp(desired, 0, maximum || desired);
+    const driftSeconds = boundedDesired - video.currentTime;
+    setSyncDeltaMs(Math.round(driftSeconds * 1000));
+
+    if (transport.state === "paused") {
+      video.pause();
+      video.playbackRate = transport.rate;
+      if (Math.abs(driftSeconds) > 0.05) seekVideo(video, boundedDesired);
+      excessiveDriftSinceRef.current = null;
+      setSyncFailed(false);
+      setPlayheadSec(boundedDesired);
+      writeProgramDiagnostics(video, event);
+      return;
+    }
+
+    const correction = decideDriftCorrection(driftSeconds, transport.rate);
+    if (correction.kind === "seek") seekVideo(video, boundedDesired);
+    video.playbackRate = correction.playbackRate;
+    if (programEnabledRef.current) void video.play().catch(() => undefined);
+    else video.pause();
+
+    if (Math.abs(driftSeconds) > 1) {
+      excessiveDriftSinceRef.current ??= Date.now();
+      if (Date.now() - excessiveDriftSinceRef.current >= 5_000)
+        setSyncFailed(true);
+    } else {
+      excessiveDriftSinceRef.current = null;
+      setSyncFailed(false);
+    }
+    setPlayheadSec(video.currentTime);
+    writeProgramDiagnostics(video, event);
   }
 
   async function enableVoice() {
@@ -478,8 +638,95 @@ export function RoomPage() {
     liveStreamRef.current?.getTracks().forEach((track) => track.stop());
     liveStreamRef.current = null;
     liveTracksRef.current.clear();
+    previousLiveStatsRef.current = null;
+    setLiveStats(null);
     if (videoRef.current?.srcObject) videoRef.current.srcObject = null;
     setLiveProgramState("idle");
+  }
+
+  async function collectLiveStats() {
+    const peer = liveReaderRef.current?.getPeerConnection();
+    if (!peer) return;
+    const report = await peer.getStats();
+    let video: InboundVideoStats | null = null;
+    let candidatePair: CandidatePairStats | null = null;
+    let protocol = "unknown";
+    report.forEach((entry) => {
+      if (
+        entry.type === "inbound-rtp" &&
+        entry.kind === "video" &&
+        !entry.isRemote
+      )
+        video = entry as InboundVideoStats;
+      if (entry.type === "transport" && entry.selectedCandidatePairId) {
+        const selected = report.get(entry.selectedCandidatePairId);
+        if (selected?.type === "candidate-pair")
+          candidatePair = selected as CandidatePairStats;
+      }
+    });
+    const videoStats = video as InboundVideoStats | null;
+    const selectedPair = candidatePair as CandidatePairStats | null;
+    if (!videoStats) return;
+    if (selectedPair) {
+      const local = report.get(selectedPair.localCandidateId);
+      protocol =
+        local?.type === "local-candidate" && typeof local.protocol === "string"
+          ? local.protocol.toUpperCase()
+          : "unknown";
+    }
+    const now = performance.now();
+    const bytes = videoStats.bytesReceived ?? 0;
+    const packets = videoStats.packetsReceived ?? 0;
+    const lost = videoStats.packetsLost ?? 0;
+    const previous = previousLiveStatsRef.current;
+    const elapsedSeconds = previous ? (now - previous.atMs) / 1000 : 0;
+    const bitrateMbps =
+      previous && elapsedSeconds > 0
+        ? ((bytes - previous.bytes) * 8) / elapsedSeconds / 1_000_000
+        : 0;
+    const receivedDelta = previous
+      ? Math.max(0, packets - previous.packets)
+      : 0;
+    const lostDelta = previous ? Math.max(0, lost - previous.lost) : 0;
+    const packetLossPercent =
+      receivedDelta + lostDelta > 0
+        ? (lostDelta / (receivedDelta + lostDelta)) * 100
+        : 0;
+    previousLiveStatsRef.current = { atMs: now, bytes, packets, lost };
+    const rttMs = selectedPair?.currentRoundTripTime
+      ? selectedPair.currentRoundTripTime * 1000
+      : null;
+    const jitterMs = (videoStats.jitter ?? 0) * 1000;
+    const jitterBufferMs =
+      videoStats.jitterBufferEmittedCount && videoStats.jitterBufferDelay
+        ? (videoStats.jitterBufferDelay / videoStats.jitterBufferEmittedCount) *
+          1000
+        : null;
+    const framesPerSecond = videoStats.framesPerSecond ?? 0;
+    setLiveStats({
+      bitrateMbps,
+      packetLossPercent,
+      rttMs,
+      jitterMs,
+      jitterBufferMs,
+      framesPerSecond,
+      protocol,
+      health: classifyViewerHealth(packetLossPercent, rttMs, framesPerSecond),
+    });
+    sessionStorage.setItem(
+      "simplewatch.live-diagnostics",
+      JSON.stringify({
+        updatedAt: new Date().toISOString(),
+        bitrateMbps: round(bitrateMbps, 2),
+        packetLossPercent: round(packetLossPercent, 2),
+        rttMs: rttMs === null ? null : round(rttMs, 0),
+        jitterMs: round(jitterMs, 1),
+        jitterBufferMs:
+          jitterBufferMs === null ? null : round(jitterBufferMs, 1),
+        framesPerSecond: round(framesPerSecond, 1),
+        protocol,
+      }),
+    );
   }
 
   async function enableProgramSound() {
@@ -526,6 +773,14 @@ export function RoomPage() {
     command({ kind: "seek", positionSec: next });
   }
 
+  function reloadVodProgram() {
+    const video = videoRef.current;
+    if (!video) return;
+    setSyncFailed(false);
+    excessiveDriftSinceRef.current = null;
+    video.load();
+  }
+
   function updateProgramMetrics(video: HTMLVideoElement, event: string) {
     setPlayheadSec(video.currentTime);
     const buffered = bufferedAhead(video);
@@ -562,6 +817,8 @@ export function RoomPage() {
         liveAudioTracks: liveStreamRef.current?.getAudioTracks().length ?? 0,
         liveVideoTracks: liveStreamRef.current?.getVideoTracks().length ?? 0,
         rejectedLiveTracks: rejectedLiveTracksRef.current,
+        syncDeltaMs,
+        clockRttMs,
         serverAudioTracks: liveStatus.data?.audioTrackCount ?? null,
         serverVideoTracks: liveStatus.data?.videoTrackCount ?? null,
         readerGeneration: liveReaderGenerationRef.current,
@@ -591,11 +848,18 @@ export function RoomPage() {
   }
 
   async function requestPublishConfig() {
-    const result = await api<{ url: string; token: string }>(
-      `/api/v1/rooms/${roomId}/live/publish-config`,
-      { method: "GET" },
-    );
-    setPublishConfig(result);
+    setPublishConfigError("");
+    try {
+      const result = await api<{ url: string; token: string }>(
+        `/api/v1/rooms/${roomId}/live/publish-config`,
+        { method: "GET" },
+      );
+      setPublishConfig(result);
+    } catch (reason) {
+      setPublishConfigError(
+        reason instanceof Error ? reason.message : "OBS 配置获取失败",
+      );
+    }
   }
 
   async function rotatePublishConfig() {
@@ -628,13 +892,21 @@ export function RoomPage() {
 
   async function closeRoom() {
     if (!roomCsrf || !confirm("确认关闭放映室？所有成员会立即退出。")) return;
-    await api<void>(`/api/v1/rooms/${roomId}`, {
-      method: "DELETE",
-      headers: { "x-csrf-token": roomCsrf },
-    });
-    closeLiveProgram();
-    voiceRoomRef.current?.disconnect();
-    void navigate("/admin", { replace: true });
+    closingRoomRef.current = true;
+    try {
+      await api<void>(`/api/v1/rooms/${roomId}`, {
+        method: "DELETE",
+        headers: { "x-csrf-token": roomCsrf },
+      });
+      closeLiveProgram();
+      voiceRoomRef.current?.disconnect();
+      void navigate("/admin", { replace: true });
+    } catch (closeError) {
+      closingRoomRef.current = false;
+      setError(
+        closeError instanceof Error ? closeError.message : "关闭房间失败",
+      );
+    }
   }
 
   async function toggleFullscreen() {
@@ -642,6 +914,12 @@ export function RoomPage() {
     if (!screen) return;
     if (document.fullscreenElement) await document.exitFullscreen();
     else await screen.requestFullscreen();
+  }
+
+  function reconnectLiveProgram() {
+    closeLiveProgram();
+    setProgramEnabled(true);
+    setLiveRetry((value) => value + 1);
   }
 
   function setParticipantVolume(id: string, value: number) {
@@ -722,7 +1000,22 @@ export function RoomPage() {
                   : "WAITING FOR REEL"}
             </span>
             <span>REV {snapshot?.revision ?? 0}</span>
+            {snapshot?.mode === "vod" && (
+              <span>
+                SYNC {syncDeltaMs === null ? "—" : `${syncDeltaMs} ms`} · RTT{" "}
+                {clockRttMs === null ? "—" : `${clockRttMs} ms`}
+              </span>
+            )}
           </div>
+          {syncFailed && snapshot?.mode === "vod" && (
+            <div className="program-warning" role="alert">
+              <strong>本机同步暂未收敛</strong>
+              <span>播放器将继续自动纠偏；若仍从头播放，请重新加载节目。</span>
+              <button type="button" onClick={() => reloadVodProgram()}>
+                重新加载节目
+              </button>
+            </div>
+          )}
           {media.data?.video.codec === "hevc" && !supportsHevcPlayback() && (
             <div className="program-warning" role="status">
               这条影片使用
@@ -760,6 +1053,12 @@ export function RoomPage() {
                 节目轨道：视频 {liveStatus.data?.videoTrackCount ?? 0} / 音频{" "}
                 {liveStatus.data?.audioTrackCount ?? 0}
               </p>
+              <p className="live-track-status">
+                OBS 上行：
+                {liveStatus.data?.sourceBitrateMbps?.toFixed(2) ?? "—"} Mbps ·
+                丢包{" "}
+                {liveStatus.data?.sourcePacketLossPercent?.toFixed(2) ?? "—"}%
+              </p>
               {liveStatus.data?.state === "online" &&
                 liveStatus.data.audioTrackCount !== 1 && (
                   <p className="program-warning">
@@ -778,18 +1077,22 @@ export function RoomPage() {
               controls={false}
               playsInline
               preload="auto"
-              onLoadedMetadata={(event) =>
-                updateProgramMetrics(event.currentTarget, "loaded-metadata")
-              }
+              onLoadedMetadata={(event) => {
+                updateProgramMetrics(event.currentTarget, "loaded-metadata");
+                reconcileVod("loaded-metadata");
+              }}
+              onCanPlay={() => reconcileVod("can-play")}
+              onSeeked={() => reconcileVod("seeked")}
               onTimeUpdate={(event) =>
                 updateProgramMetrics(event.currentTarget, "time-update")
               }
               onProgress={(event) =>
                 updateProgramMetrics(event.currentTarget, "progress")
               }
-              onPlaying={(event) =>
-                updateProgramMetrics(event.currentTarget, "playing")
-              }
+              onPlaying={(event) => {
+                updateProgramMetrics(event.currentTarget, "playing");
+                reconcileVod("playing");
+              }}
               onWaiting={(event) => {
                 stallCountRef.current += 1;
                 updateProgramMetrics(event.currentTarget, "waiting");
@@ -817,6 +1120,32 @@ export function RoomPage() {
             <div className="blank-screen">
               <i />
               <p>等待主持人装片</p>
+            </div>
+          )}
+          {snapshot?.mode === "live" && !isHost && (
+            <div
+              className={`live-quality quality-${liveStats?.health ?? "unknown"}`}
+              role="status"
+            >
+              <strong>{viewerHealthLabel(liveStats?.health)}</strong>
+              <span>
+                接收 {liveStats ? liveStats.bitrateMbps.toFixed(2) : "—"} Mbps
+              </span>
+              <span>
+                {liveStats ? liveStats.framesPerSecond.toFixed(0) : "—"} fps
+              </span>
+              <span>
+                丢包 {liveStats ? liveStats.packetLossPercent.toFixed(2) : "—"}%
+              </span>
+              <span>
+                RTT {liveStats?.rttMs ? liveStats.rttMs.toFixed(0) : "—"} ms
+              </span>
+              <span>{liveStats?.protocol ?? "—"}</span>
+              {liveQualityExplanation(liveStatus.data, liveStats) && (
+                <small>
+                  {liveQualityExplanation(liveStatus.data, liveStats)}
+                </small>
+              )}
             </div>
           )}
           {snapshot?.mode === "vod" && (
@@ -905,6 +1234,11 @@ export function RoomPage() {
                   </option>
                 ))}
               </select>
+            </div>
+          )}
+          {(snapshot?.mode === "vod" ||
+            (snapshot?.mode === "live" && !isHost)) && (
+            <div className="program-view-controls">
               <button type="button" onClick={() => void toggleFullscreen()}>
                 屏幕全屏
               </button>
@@ -914,6 +1248,11 @@ export function RoomPage() {
               >
                 {theaterMode ? "退出网页全屏" : "网页全屏"}
               </button>
+              {snapshot?.mode === "live" && (
+                <button type="button" onClick={() => reconnectLiveProgram()}>
+                  重新连接节目
+                </button>
+              )}
             </div>
           )}
           <div className="local-mix">
@@ -997,16 +1336,30 @@ export function RoomPage() {
                   切换直播
                 </button>
               )}
-              <button onClick={() => void requestPublishConfig()}>
-                生成 OBS 配置
-              </button>
-              {publishConfig && (
+              {snapshot?.mode === "live" && !publishConfig && (
+                <div className="publish-config-loading" role="status">
+                  <span>
+                    {publishConfigError
+                      ? `OBS 配置暂不可用：${publishConfigError}`
+                      : "正在载入长期 OBS 配置…"}
+                  </span>
+                  {publishConfigError && (
+                    <button onClick={() => void requestPublishConfig()}>
+                      重新获取显示
+                    </button>
+                  )}
+                </div>
+              )}
+              {snapshot?.mode === "live" && publishConfig && (
                 <div className="publish-config">
                   <div className="obs-preset">
                     <strong>OBS 推荐参数</strong>
                     <span>1920×1080 · 30 fps · H.264 硬件编码</span>
-                    <span>CBR 6000 Kbps（链路稳定后可升至 8000）</span>
-                    <span>关键帧间隔 2 秒 · B 帧 0 · Opus 48 kHz 立体声</span>
+                    <span>CBR 3000 Kbps（链路持续绿色后升至 4000–6000）</span>
+                    <span>
+                      Main Profile · 关键帧间隔 1 秒 · B 帧 0 · Opus 48 kHz
+                      立体声 128 Kbps
+                    </span>
                   </div>
                   <div className="obs-audio-checklist" role="note">
                     <strong>推流前音频自检（避免重声）</strong>
@@ -1153,6 +1506,15 @@ function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(Math.max(value, minimum), maximum);
 }
 
+function seekVideo(video: HTMLVideoElement, positionSec: number): void {
+  try {
+    video.currentTime = positionSec;
+  } catch {
+    // Some engines reject seeks until metadata is ready. loadedmetadata and
+    // canplay both invoke reconciliation again, so this target is not lost.
+  }
+}
+
 function bufferedAhead(video: HTMLVideoElement): number {
   for (let index = 0; index < video.buffered.length; index += 1) {
     if (
@@ -1188,4 +1550,82 @@ function liveLabel(state: LiveStatus["state"] | undefined): string {
       : state === "unknown"
         ? "状态未知"
         : "正在检查";
+}
+
+interface LiveStatsSample {
+  readonly atMs: number;
+  readonly bytes: number;
+  readonly packets: number;
+  readonly lost: number;
+}
+
+interface InboundVideoStats extends RTCStats {
+  readonly bytesReceived?: number;
+  readonly packetsReceived?: number;
+  readonly packetsLost?: number;
+  readonly jitter?: number;
+  readonly jitterBufferDelay?: number;
+  readonly jitterBufferEmittedCount?: number;
+  readonly framesPerSecond?: number;
+}
+
+interface CandidatePairStats extends RTCStats {
+  readonly localCandidateId: string;
+  readonly currentRoundTripTime?: number;
+}
+
+export interface LiveViewerStats {
+  readonly bitrateMbps: number;
+  readonly packetLossPercent: number;
+  readonly rttMs: number | null;
+  readonly jitterMs: number;
+  readonly jitterBufferMs: number | null;
+  readonly framesPerSecond: number;
+  readonly protocol: string;
+  readonly health: "good" | "degraded" | "poor";
+}
+
+export function classifyViewerHealth(
+  packetLossPercent: number,
+  rttMs: number | null,
+  framesPerSecond: number,
+): LiveViewerStats["health"] {
+  if (
+    packetLossPercent > 3 ||
+    (rttMs ?? 0) > 400 ||
+    (framesPerSecond > 0 && framesPerSecond < 20)
+  )
+    return "poor";
+  if (
+    packetLossPercent > 1 ||
+    (rttMs ?? 0) > 250 ||
+    (framesPerSecond > 0 && framesPerSecond < 27)
+  )
+    return "degraded";
+  return "good";
+}
+
+function viewerHealthLabel(
+  health: LiveViewerStats["health"] | undefined,
+): string {
+  return health === "good"
+    ? "链路良好"
+    : health === "degraded"
+      ? "链路波动"
+      : health === "poor"
+        ? "链路较差"
+        : "正在测量";
+}
+
+export function liveQualityExplanation(
+  source: LiveStatus | undefined,
+  viewer: LiveViewerStats | null,
+): string {
+  if (source?.sourceHealth === "poor" || source?.sourceHealth === "degraded")
+    return "OBS 到服务器的上行正在丢包，请降低 OBS 码率或更换发起端网络。";
+  if (viewer && viewer.packetLossPercent > 1)
+    return "OBS 上行正常，当前观看端下行丢包较高。";
+  if (viewer && viewer.framesPerSecond > 0 && viewer.framesPerSecond < 27)
+    return "网络未见明显丢包，但当前终端解码或渲染帧率不足。";
+  return "";
 }

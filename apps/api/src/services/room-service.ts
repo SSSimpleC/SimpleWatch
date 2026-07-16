@@ -105,6 +105,7 @@ export class RoomService {
   public async createRoom(
     adminId: string,
     input: CreateRoomRequest,
+    livePath = createOpaqueToken(24),
   ): Promise<CreateRoomResult> {
     const nickname = normalizeNickname(input.hostNickname);
     const passwordHash = await hashPassword(createOpaqueToken(32));
@@ -145,7 +146,7 @@ export class RoomService {
               transport_json, host_member_id, updated_at
             ) VALUES (?, 0, 'idle', NULL, ?, NULL, ?, ?)`,
           )
-          .run(roomId, createOpaqueToken(24), memberId, timestamp);
+          .run(roomId, livePath, memberId, timestamp);
         this.insertRoomSession(
           credential.tokenHash,
           roomId,

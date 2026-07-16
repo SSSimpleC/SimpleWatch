@@ -83,6 +83,7 @@ export interface RoomSnapshot {
     role: "host" | "member";
     online: boolean;
   }>;
+  serverNowMs: number;
 }
 
 export interface LiveStatus {
@@ -91,6 +92,9 @@ export interface LiveStatus {
   hasAudio: boolean;
   videoTrackCount: number;
   audioTrackCount: number;
+  sourceBitrateMbps: number | null;
+  sourcePacketLossPercent: number | null;
+  sourceHealth: "good" | "degraded" | "poor" | "unknown";
   checkedAt: string;
 }
 

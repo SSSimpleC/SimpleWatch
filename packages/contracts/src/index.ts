@@ -166,6 +166,9 @@ export const liveStatusSchema = z.object({
   hasAudio: z.boolean(),
   videoTrackCount: z.number().int().nonnegative(),
   audioTrackCount: z.number().int().nonnegative(),
+  sourceBitrateMbps: z.number().nonnegative().nullable(),
+  sourcePacketLossPercent: z.number().min(0).max(100).nullable(),
+  sourceHealth: z.enum(["good", "degraded", "poor", "unknown"]),
   checkedAt: z.iso.datetime(),
 });
 

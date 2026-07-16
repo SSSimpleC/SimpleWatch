@@ -20,6 +20,8 @@ export function DiagnosticsPage() {
     programState:
       sessionStorage.getItem("simplewatch.program-diagnostics") ??
       "not-playing",
+    liveState:
+      sessionStorage.getItem("simplewatch.live-diagnostics") ?? "not-live",
   };
   return (
     <main className="console-shell settings-shell">
@@ -42,6 +44,8 @@ export function DiagnosticsPage() {
           <dd>{report.roomState}</dd>
           <dt>节目状态</dt>
           <dd>{report.programState}</dd>
+          <dt>直播链路</dt>
+          <dd>{report.liveState}</dd>
         </dl>
         <button
           onClick={() =>

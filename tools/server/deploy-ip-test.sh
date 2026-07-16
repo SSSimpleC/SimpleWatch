@@ -13,6 +13,34 @@ fi
 cd "$release_dir"
 umask 077
 
+sysctl_target=/etc/sysctl.d/99-simplewatch-rtc.conf
+sysctl_backup="$release_dir/.server/sysctl-predeploy.conf"
+sysctl_absent="$release_dir/.server/sysctl-predeploy.absent"
+sysctl_runtime_backup="$release_dir/.server/sysctl-runtime-predeploy"
+sysctl_changed=false
+restore_sysctl() {
+  if [[ "$sysctl_changed" != "true" ]]; then return; fi
+  if [[ -f "$sysctl_backup" ]]; then
+    cp "$sysctl_backup" "$sysctl_target"
+  elif [[ -f "$sysctl_absent" ]]; then
+    rm -f "$sysctl_target"
+  fi
+  sysctl --system >/dev/null
+  if [[ -f "$sysctl_runtime_backup" ]]; then
+    # shellcheck disable=SC1090
+    source "$sysctl_runtime_backup"
+    sysctl -w "net.core.rmem_max=$PREVIOUS_RMEM_MAX" >/dev/null
+    sysctl -w "net.core.wmem_max=$PREVIOUS_WMEM_MAX" >/dev/null
+  fi
+}
+on_exit() {
+  local status=$?
+  trap - EXIT
+  if [[ $status -ne 0 ]]; then restore_sysctl; fi
+  exit "$status"
+}
+trap on_exit EXIT
+
 secret() { openssl rand -hex 32; }
 set_env() {
   local key=$1 value=$2 temporary
@@ -129,6 +157,22 @@ docker image inspect "simplewatch-app:${RELEASE_TAG}" >/dev/null 2>&1 || "${comp
 docker image inspect "simplewatch-mediamtx:${RELEASE_TAG}" >/dev/null 2>&1 || "${compose[@]}" build mediamtx
 docker image inspect "simplewatch-livekit:${RELEASE_TAG}" >/dev/null 2>&1 || "${compose[@]}" build livekit
 
+mkdir -p "$release_dir/.server"
+rm -f "$sysctl_backup" "$sysctl_absent" "$sysctl_runtime_backup"
+printf 'PREVIOUS_RMEM_MAX=%q\nPREVIOUS_WMEM_MAX=%q\n' \
+  "$(sysctl -n net.core.rmem_max)" "$(sysctl -n net.core.wmem_max)" \
+  >"$sysctl_runtime_backup"
+if [[ -f "$sysctl_target" ]]; then
+  cp "$sysctl_target" "$sysctl_backup"
+else
+  : >"$sysctl_absent"
+fi
+install -m 0644 infra/sysctl/99-simplewatch-rtc.conf "$sysctl_target"
+sysctl --system >/dev/null
+sysctl_changed=true
+[[ "$(sysctl -n net.core.rmem_max)" -ge 7500000 ]]
+[[ "$(sysctl -n net.core.wmem_max)" -ge 7500000 ]]
+
 # The project name is fixed in Compose, so this stops only SimpleWatch and leaves
 # FRP, DERP and the unrelated MES stack untouched.
 "${compose[@]}" down --remove-orphans
@@ -180,3 +224,4 @@ curl --fail --silent --show-error --max-time 10 \
   "${public_origin}/health/ready" >/dev/null
 tools/server/ip-cert.sh status "$public_ip"
 "${compose[@]}" ps
+sysctl_changed=false

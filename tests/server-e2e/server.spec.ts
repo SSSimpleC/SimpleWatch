@@ -89,7 +89,6 @@ test("public server supports upload, room admission and two-party voice", async 
       .poll(() => roomRevision(page), { timeout: 15_000 })
       .toBeGreaterThan(revisionBeforeLive);
     await expect(page.getByText("LIVE / 等待 OBS")).toBeVisible();
-    await page.getByRole("button", { name: "生成 OBS 配置" }).click();
     const publishConfig = page.locator(".publish-config code");
     await expect(publishConfig).toHaveCount(2);
     await expect(publishConfig.first()).toHaveText(
@@ -112,6 +111,22 @@ test("public server supports upload, room admission and two-party voice", async 
     await expect(page.getByText("LIVE / 信号在线")).toBeVisible({
       timeout: 15_000,
     });
+    await expect
+      .poll(
+        () =>
+          page.evaluate(async (activeRoomId) => {
+            const response = await fetch(
+              `/api/v1/rooms/${activeRoomId}/live/status`,
+              { credentials: "same-origin" },
+            );
+            const status = (await response.json()) as {
+              sourceBitrateMbps: number | null;
+            };
+            return status.sourceBitrateMbps ?? 0;
+          }, roomId),
+        { timeout: 15_000 },
+      )
+      .toBeGreaterThan(0);
     memberContext = await browser.newContext({ ignoreHTTPSErrors: false });
     const member = await memberContext.newPage();
     await member.goto(inviteUrl!);
@@ -137,6 +152,19 @@ test("public server supports upload, room admission and two-party voice", async 
         { timeout: 20_000 },
       )
       .toEqual(["audio", "video"]);
+    await expect
+      .poll(
+        () =>
+          member.evaluate(() => {
+            const raw = sessionStorage.getItem("simplewatch.live-diagnostics");
+            if (!raw) return 0;
+            return Number(
+              (JSON.parse(raw) as { bitrateMbps?: number }).bitrateMbps ?? 0,
+            );
+          }),
+        { timeout: 15_000 },
+      )
+      .toBeGreaterThan(0);
 
     if (process.env.SIMPLEWATCH_SKIP_RTC !== "true") {
       await page.getByRole("button", { name: "加入语音通话" }).click();
@@ -202,6 +230,7 @@ test("public server supports upload, room admission and two-party voice", async 
       },
       { roomId, csrfToken: adminCsrfToken },
     );
+    await cleanupMediaRows(page, code!, [mediaName, hevcName]);
   }
 });
 
@@ -245,6 +274,25 @@ async function uploadMp4(page: Page, name: string, path: string) {
   const row = page.locator(".media-row").filter({ hasText: name });
   await expect(row).toBeVisible({ timeout: 30_000 });
   await expect(row).toContainText("可放映", { timeout: 30_000 });
+}
+
+async function cleanupMediaRows(page: Page, code: string, names: string[]) {
+  await page.goto("/admin");
+  const login = page.getByLabel("6 位放映口令");
+  if (await login.isVisible()) {
+    await login.fill(code);
+    await page.getByRole("button", { name: "解锁控制台" }).click();
+  }
+  await expect(
+    page.getByRole("heading", { name: "放映控制", exact: true }),
+  ).toBeVisible();
+  for (const name of names) {
+    const row = page.locator(".media-row").filter({ hasText: name });
+    if (!(await row.isVisible())) continue;
+    page.once("dialog", (dialog) => void dialog.accept());
+    await row.getByRole("button", { name: "删除" }).click();
+    await expect(row).toHaveCount(0);
+  }
 }
 
 async function roomRevision(page: Page): Promise<number> {

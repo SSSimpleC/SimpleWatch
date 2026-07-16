@@ -46,6 +46,7 @@ export class TransportService {
   private readonly mediaKey: Uint8Array;
   private readonly obsEncryptionKey: Buffer;
   private readonly webhookReceiver: WebhookReceiver;
+  private readonly liveMetricSamples = new Map<string, SourceMetricSample>();
 
   public constructor(
     private readonly database: AppDatabase,
@@ -131,6 +132,10 @@ export class TransportService {
     };
   }
 
+  public getStablePublishPath(): string {
+    return this.getOrCreateStablePublishCredential().path;
+  }
+
   public rotateStablePublishCredential(): {
     readonly url: string;
     readonly token: string;
@@ -199,6 +204,9 @@ export class TransportService {
     readonly hasAudio: boolean;
     readonly videoTrackCount: number;
     readonly audioTrackCount: number;
+    readonly sourceBitrateMbps: number | null;
+    readonly sourcePacketLossPercent: number | null;
+    readonly sourceHealth: "good" | "degraded" | "poor" | "unknown";
     readonly checkedAt: string;
   }> {
     const checkedAt = new Date(this.now()).toISOString();
@@ -227,6 +235,9 @@ export class TransportService {
           hasAudio: false,
           videoTrackCount: 0,
           audioTrackCount: 0,
+          sourceBitrateMbps: null,
+          sourcePacketLossPercent: null,
+          sourceHealth: "unknown",
           checkedAt,
         };
       }
@@ -244,12 +255,20 @@ export class TransportService {
       ).length;
       const hasVideo = videoTrackCount > 0;
       const hasAudio = audioTrackCount > 0;
+      const quality = await this.getSourceQuality(path).catch(
+        (): SourceQuality => ({
+          sourceBitrateMbps: null,
+          sourcePacketLossPercent: null,
+          sourceHealth: "unknown",
+        }),
+      );
       return {
         state: hasVideo && hasAudio ? "online" : "offline",
         hasVideo,
         hasAudio,
         videoTrackCount,
         audioTrackCount,
+        ...quality,
         checkedAt,
       };
     } catch {
@@ -259,9 +278,70 @@ export class TransportService {
         hasAudio: false,
         videoTrackCount: 0,
         audioTrackCount: 0,
+        sourceBitrateMbps: null,
+        sourcePacketLossPercent: null,
+        sourceHealth: "unknown",
         checkedAt,
       };
     }
+  }
+
+  private async getSourceQuality(path: string): Promise<SourceQuality> {
+    const metricsUrl = new URL(this.options.mediamtxControlUrl);
+    metricsUrl.port = "9998";
+    metricsUrl.pathname = "/metrics";
+    metricsUrl.search = new URLSearchParams({
+      type: "webrtc_sessions",
+      path,
+    }).toString();
+    const response = await fetch(metricsUrl, {
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!response.ok) throw new Error(`MediaMTX metrics ${response.status}`);
+    const metrics = await response.text();
+    const current = {
+      atMs: this.now(),
+      bytes: sumPrometheusMetric(
+        metrics,
+        "webrtc_sessions_inbound_bytes",
+        path,
+      ),
+      packets: sumPrometheusMetric(
+        metrics,
+        "webrtc_sessions_inbound_rtp_packets",
+        path,
+      ),
+      lost: sumPrometheusMetric(
+        metrics,
+        "webrtc_sessions_inbound_rtp_packets_lost",
+        path,
+      ),
+    };
+    const previous = this.liveMetricSamples.get(path);
+    if (previous && current.atMs - previous.atMs < 800) return previous.quality;
+
+    let quality: SourceQuality = {
+      sourceBitrateMbps: null,
+      sourcePacketLossPercent: null,
+      sourceHealth: "unknown",
+    };
+    if (previous && current.atMs > previous.atMs) {
+      const elapsedSeconds = (current.atMs - previous.atMs) / 1000;
+      const bytesDelta = current.bytes - previous.bytes;
+      const packetsDelta = current.packets - previous.packets;
+      const lostDelta = current.lost - previous.lost;
+      if (bytesDelta >= 0 && packetsDelta >= 0 && lostDelta >= 0) {
+        const denominator = packetsDelta + lostDelta;
+        const loss = denominator > 0 ? (lostDelta / denominator) * 100 : 0;
+        quality = {
+          sourceBitrateMbps: (bytesDelta * 8) / elapsedSeconds / 1_000_000,
+          sourcePacketLossPercent: loss,
+          sourceHealth: loss > 3 ? "poor" : loss > 1 ? "degraded" : "good",
+        };
+      }
+    }
+    this.liveMetricSamples.set(path, { ...current, quality });
+    return quality;
   }
 
   public async authorizeMedia(input: {
@@ -493,4 +573,33 @@ export class TransportService {
       "utf8",
     );
   }
+}
+
+interface SourceQuality {
+  readonly sourceBitrateMbps: number | null;
+  readonly sourcePacketLossPercent: number | null;
+  readonly sourceHealth: "good" | "degraded" | "poor" | "unknown";
+}
+
+interface SourceMetricSample {
+  readonly atMs: number;
+  readonly bytes: number;
+  readonly packets: number;
+  readonly lost: number;
+  readonly quality: SourceQuality;
+}
+
+function sumPrometheusMetric(
+  text: string,
+  metric: string,
+  path: string,
+): number {
+  let total = 0;
+  for (const line of text.split("\n")) {
+    if (!line.startsWith(`${metric}{`) || !line.includes(`path="${path}"`))
+      continue;
+    const value = Number(line.slice(line.lastIndexOf(" ") + 1));
+    if (Number.isFinite(value)) total += value;
+  }
+  return total;
 }

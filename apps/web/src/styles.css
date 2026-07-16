@@ -621,6 +621,53 @@ input {
   align-items: center;
   flex-wrap: wrap;
 }
+.program-view-controls {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  padding-top: 0.6rem;
+}
+.program-view-controls button {
+  padding: 0.65rem 0.85rem;
+  font-size: 0.66rem;
+}
+.live-quality {
+  display: flex;
+  gap: 0.45rem 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 0.7rem 0.9rem;
+  border-left: 3px solid #787064;
+  background: #141311;
+  color: #b9b0a3;
+  font: 0.65rem/1.5 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.live-quality strong {
+  color: var(--paper);
+}
+.live-quality small {
+  flex-basis: 100%;
+  color: var(--muted);
+}
+.live-quality.quality-good {
+  border-left-color: #4b9f66;
+}
+.live-quality.quality-degraded {
+  border-left-color: var(--amber);
+}
+.live-quality.quality-poor {
+  border-left-color: #c14e3d;
+  background: #24120f;
+}
+.publish-config-loading {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  width: 100%;
+  color: var(--muted);
+}
 .transport-bar button,
 .transport-bar select {
   padding: 0.7rem 0.9rem;

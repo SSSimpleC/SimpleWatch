@@ -9,6 +9,9 @@ declare global {
       token: string;
       onTrack: (event: RTCTrackEvent) => void;
       onError: (error: string) => void;
-    }) => { close(): void };
+    }) => {
+      close(): void;
+      getPeerConnection(): RTCPeerConnection | null;
+    };
   }
 }

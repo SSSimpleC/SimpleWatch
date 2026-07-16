@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@simplewatch/sync": "workspace:*",
     "@tanstack/react-query": "5.101.2",
     "livekit-client": "2.20.1",
     "react": "19.2.7",

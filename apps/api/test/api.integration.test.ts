@@ -25,8 +25,10 @@ const friendInviteToken = "long-fixed-friend-invite-token-32-characters";
 const temporaryRoots: string[] = [];
 let built: BuiltApp;
 let testRoot: string;
+let currentNow: number;
 
 beforeEach(async () => {
+  currentNow = fixedNow;
   const tmpRoot = resolve("tmp");
   mkdirSync(tmpRoot, { recursive: true });
   testRoot = mkdtempSync(join(tmpRoot, "api-test-"));
@@ -44,7 +46,7 @@ beforeEach(async () => {
     tusEndpoint: `${origin}/files/`,
     contentSigningSecret: "test-content-signing-secret-32-bytes",
     internalHookToken: internalToken,
-    now: () => fixedNow,
+    now: () => currentNow,
   });
   await built.authService.bootstrapAdmin("admin", "260713");
 });
@@ -126,6 +128,12 @@ describe("SimpleWatch API", () => {
 
   it("issues scoped RTC credentials and validates the actual MediaMTX action/path", async () => {
     const room = await createRoom();
+    const roomLivePath = (
+      built.database
+        .prepare("SELECT live_path FROM room_state WHERE room_id = ?")
+        .get(room.roomId) as { live_path: string }
+    ).live_path;
+    expect(roomLivePath).toBe(built.transportService.getStablePublishPath());
     const bootstrap = await built.app.inject({
       method: "GET",
       url: `/api/v1/rooms/${room.roomId}/bootstrap`,
@@ -215,41 +223,44 @@ describe("SimpleWatch API", () => {
         .prepare("SELECT live_path FROM room_state WHERE room_id = ?")
         .get(room.roomId) as { live_path: string }
     ).live_path;
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            items: [
-              null,
-              { name: "another-path", ready: true, source: {} },
-              {
-                name: livePath,
-                ready: true,
-                source: { type: "webRTCSession" },
-                tracks: [{ codec: "H264" }, "Opus"],
-              },
-            ],
-          }),
-          { status: 200 },
-        ),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            items: [{ name: livePath, ready: false, tracks: ["H264"] }],
-          }),
-          { status: 200 },
-        ),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({ items: [{ name: livePath, ready: true }] }),
-          { status: 200 },
-        ),
-      )
-      .mockResolvedValueOnce(new Response(null, { status: 503 }))
-      .mockRejectedValueOnce(new Error("control API unavailable"));
+    const controlResponses = [
+      new Response(
+        JSON.stringify({
+          items: [
+            null,
+            { name: "another-path", ready: true, source: {} },
+            {
+              name: livePath,
+              ready: true,
+              source: { type: "webRTCSession" },
+              tracks: [{ codec: "H264" }, "Opus"],
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+      new Response(
+        JSON.stringify({
+          items: [{ name: livePath, ready: false, tracks: ["H264"] }],
+        }),
+        { status: 200 },
+      ),
+      new Response(
+        JSON.stringify({ items: [{ name: livePath, ready: true }] }),
+        { status: 200 },
+      ),
+      new Response(null, { status: 503 }),
+    ];
+    const fetchMock = vi.fn((input: string | URL | Request) => {
+      const url = requestUrl(input);
+      if (url.includes(":9998/metrics"))
+        return Promise.resolve(
+          new Response("# no previous source sample\n", { status: 200 }),
+        );
+      const next = controlResponses.shift();
+      if (next) return Promise.resolve(next);
+      return Promise.reject(new Error("control API unavailable"));
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(
@@ -260,6 +271,9 @@ describe("SimpleWatch API", () => {
       hasAudio: true,
       videoTrackCount: 1,
       audioTrackCount: 1,
+      sourceBitrateMbps: null,
+      sourcePacketLossPercent: null,
+      sourceHealth: "unknown",
       checkedAt: new Date(fixedNow).toISOString(),
     });
     await expect(
@@ -270,6 +284,9 @@ describe("SimpleWatch API", () => {
       hasAudio: false,
       videoTrackCount: 0,
       audioTrackCount: 0,
+      sourceBitrateMbps: null,
+      sourcePacketLossPercent: null,
+      sourceHealth: "unknown",
       checkedAt: new Date(fixedNow).toISOString(),
     });
     await expect(
@@ -280,6 +297,9 @@ describe("SimpleWatch API", () => {
       hasAudio: false,
       videoTrackCount: 0,
       audioTrackCount: 0,
+      sourceBitrateMbps: null,
+      sourcePacketLossPercent: null,
+      sourceHealth: "unknown",
       checkedAt: new Date(fixedNow).toISOString(),
     });
     await expect(
@@ -290,6 +310,9 @@ describe("SimpleWatch API", () => {
       hasAudio: false,
       videoTrackCount: 0,
       audioTrackCount: 0,
+      sourceBitrateMbps: null,
+      sourcePacketLossPercent: null,
+      sourceHealth: "unknown",
       checkedAt: new Date(fixedNow).toISOString(),
     });
     await expect(
@@ -300,7 +323,63 @@ describe("SimpleWatch API", () => {
       hasAudio: false,
       videoTrackCount: 0,
       audioTrackCount: 0,
+      sourceBitrateMbps: null,
+      sourcePacketLossPercent: null,
+      sourceHealth: "unknown",
       checkedAt: new Date(fixedNow).toISOString(),
+    });
+  });
+
+  it("computes OBS source bitrate and interval packet loss from internal metrics", async () => {
+    const room = await createRoom();
+    const livePath = (
+      built.database
+        .prepare("SELECT live_path FROM room_state WHERE room_id = ?")
+        .get(room.roomId) as { live_path: string }
+    ).live_path;
+    let metricsCall = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: string | URL | Request) => {
+        if (!requestUrl(input).includes(":9998/metrics"))
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                items: [
+                  {
+                    name: livePath,
+                    ready: true,
+                    source: { type: "webRTCSession" },
+                    tracks: ["H264", "Opus"],
+                  },
+                ],
+              }),
+              { status: 200 },
+            ),
+          );
+        metricsCall += 1;
+        const suffix = `path="${livePath}",state="publish"`;
+        return Promise.resolve(
+          new Response(
+            metricsCall === 1
+              ? `webrtc_sessions_inbound_bytes{${suffix}} 0\nwebrtc_sessions_inbound_rtp_packets{${suffix}} 0\nwebrtc_sessions_inbound_rtp_packets_lost{${suffix}} 0\n`
+              : `webrtc_sessions_inbound_bytes{${suffix}} 1000000\nwebrtc_sessions_inbound_rtp_packets{${suffix}} 1000\nwebrtc_sessions_inbound_rtp_packets_lost{${suffix}} 50\n`,
+            { status: 200 },
+          ),
+        );
+      }),
+    );
+
+    await expect(
+      built.transportService.getLiveStatus(room.roomId),
+    ).resolves.toMatchObject({ sourceHealth: "unknown" });
+    currentNow += 2_000;
+    await expect(
+      built.transportService.getLiveStatus(room.roomId),
+    ).resolves.toMatchObject({
+      sourceBitrateMbps: 4,
+      sourcePacketLossPercent: 50 / 10.5,
+      sourceHealth: "poor",
     });
   });
 
@@ -1505,4 +1584,12 @@ function nextMessage(socket: WebSocket): Promise<Record<string, unknown>> {
       );
     });
   });
+}
+
+function requestUrl(input: string | URL | Request): string {
+  return typeof input === "string"
+    ? input
+    : input instanceof URL
+      ? input.href
+      : input.url;
 }

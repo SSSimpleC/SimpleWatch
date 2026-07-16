@@ -421,6 +421,9 @@ function registerApiRoutes(
               hasAudio: false,
               videoTrackCount: 0,
               audioTrackCount: 0,
+              sourceBitrateMbps: null,
+              sourcePacketLossPercent: null,
+              sourceHealth: "unknown" as const,
               checkedAt: new Date(now()).toISOString(),
             };
       return { ...room, live };
@@ -526,7 +529,11 @@ function registerApiRoutes(
     async (request, reply) => {
       const admin = authService.authenticate(request.cookies.sw_admin);
       authService.requireCsrf(admin, getHeader(request, "x-csrf-token"));
-      const result = await roomService.createRoom(admin.admin_id, request.body);
+      const result = await roomService.createRoom(
+        admin.admin_id,
+        request.body,
+        transportService.getStablePublishPath(),
+      );
       setSessionCookie(reply, "sw_room", result.sessionToken, result.expiresAt);
       reply.header("Cache-Control", "no-store");
       return reply.status(201).send({

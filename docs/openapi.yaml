@@ -258,6 +258,22 @@ paths:
                         type: integer
                         minimum: 0
                         maximum: 9007199254740991
+                      sourceBitrateMbps:
+                        nullable: true
+                        type: number
+                        minimum: 0
+                      sourcePacketLossPercent:
+                        nullable: true
+                        type: number
+                        minimum: 0
+                        maximum: 100
+                      sourceHealth:
+                        type: string
+                        enum:
+                          - good
+                          - degraded
+                          - poor
+                          - unknown
                       checkedAt:
                         type: string
                         format: date-time
@@ -268,6 +284,9 @@ paths:
                       - hasAudio
                       - videoTrackCount
                       - audioTrackCount
+                      - sourceBitrateMbps
+                      - sourcePacketLossPercent
+                      - sourceHealth
                       - checkedAt
                     additionalProperties: false
                 required:
@@ -1796,6 +1815,22 @@ paths:
                     type: integer
                     minimum: 0
                     maximum: 9007199254740991
+                  sourceBitrateMbps:
+                    nullable: true
+                    type: number
+                    minimum: 0
+                  sourcePacketLossPercent:
+                    nullable: true
+                    type: number
+                    minimum: 0
+                    maximum: 100
+                  sourceHealth:
+                    type: string
+                    enum:
+                      - good
+                      - degraded
+                      - poor
+                      - unknown
                   checkedAt:
                     type: string
                     format: date-time
@@ -1806,6 +1841,9 @@ paths:
                   - hasAudio
                   - videoTrackCount
                   - audioTrackCount
+                  - sourceBitrateMbps
+                  - sourcePacketLossPercent
+                  - sourceHealth
                   - checkedAt
                 additionalProperties: false
   /api/v1/internal/livekit/webhook:

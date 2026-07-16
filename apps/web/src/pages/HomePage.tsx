@@ -82,9 +82,10 @@ export function HomePage() {
 
   async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const form = event.currentTarget;
     setSubmitting(true);
     setMessage("");
-    const data = new FormData(event.currentTarget);
+    const data = new FormData(form);
     try {
       const session = await api<AccountSession>("/api/v1/auth/login", {
         method: "POST",
@@ -93,7 +94,7 @@ export function HomePage() {
           password: data.get("password"),
         }),
       });
-      event.currentTarget.reset();
+      form.reset();
       acceptSession(session);
     } catch (error) {
       setMessage(error instanceof ApiError ? error.message : "登录失败");

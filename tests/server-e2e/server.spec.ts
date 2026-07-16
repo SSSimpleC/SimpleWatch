@@ -135,7 +135,7 @@ test("public server supports upload, room admission and two-party voice", async 
     await expect(member.getByText("同场观众")).toBeVisible();
     await expect(
       member.getByRole("button", { name: /播放|暂停/ }),
-    ).toBeDisabled();
+    ).toHaveCount(0);
     await member.getByRole("button", { name: "启用节目声音" }).click();
     await expect
       .poll(

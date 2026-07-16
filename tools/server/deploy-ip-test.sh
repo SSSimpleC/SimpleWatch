@@ -156,7 +156,7 @@ chmod 600 infra/livekit/livekit.server-ip.yaml
 
 compose=(docker compose --env-file .env.server -f infra/compose/compose.server-ip.yaml)
 "${compose[@]}" config --quiet
-"${compose[@]}" pull caddy
+"${compose[@]}" pull --policy missing caddy
 docker tag ghcr.io/tus/tusd:v2.9.2 docker.m.daocloud.io/tusproject/tusd:v2.9.2 2>/dev/null || true
 "${compose[@]}" pull --policy missing tusd
 docker image inspect "simplewatch-app:${RELEASE_TAG}" >/dev/null 2>&1 || "${compose[@]}" build app

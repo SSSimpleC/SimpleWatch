@@ -46,7 +46,7 @@ export function registerMediaRoutes(
     "/api/v1/media",
     { schema: { response: { 200: z.array(mediaSchema) } } },
     (request) => {
-      authService.authenticate(request.cookies.sw_admin);
+      authenticateHost(request, authService);
       return mediaService.listMedia();
     },
   );
@@ -95,7 +95,7 @@ export function registerMediaRoutes(
       },
     },
     (request, reply) => {
-      const admin = authService.authenticate(request.cookies.sw_admin);
+      const admin = authenticateHost(request, authService);
       authService.requireCsrf(admin, header(request, "x-csrf-token"));
       reply.status(201);
       return mediaService.authorizeUpload(admin.admin_id, request.body);
@@ -111,7 +111,7 @@ export function registerMediaRoutes(
       },
     },
     (request) => {
-      const admin = authService.authenticate(request.cookies.sw_admin);
+      const admin = authenticateHost(request, authService);
       return mediaService.getUpload(admin.admin_id, request.params.uploadId);
     },
   );
@@ -120,7 +120,7 @@ export function registerMediaRoutes(
     "/api/v1/uploads/:uploadId",
     { schema: { params: uploadParamsSchema, response: { 204: z.null() } } },
     (request, reply) => {
-      const admin = authService.authenticate(request.cookies.sw_admin);
+      const admin = authenticateHost(request, authService);
       authService.requireCsrf(admin, header(request, "x-csrf-token"));
       mediaService.cancelUpload(admin.admin_id, request.params.uploadId);
       reply.status(204);
@@ -137,7 +137,7 @@ export function registerMediaRoutes(
       },
     },
     (request, reply) => {
-      const admin = authService.authenticate(request.cookies.sw_admin);
+      const admin = authenticateHost(request, authService);
       authService.requireCsrf(admin, header(request, "x-csrf-token"));
       reply.status(202);
       return mediaService.rescanMedia(admin.admin_id, request.params.mediaId);
@@ -154,7 +154,7 @@ export function registerMediaRoutes(
       },
     },
     (request, reply) => {
-      const admin = authService.authenticate(request.cookies.sw_admin);
+      const admin = authenticateHost(request, authService);
       authService.requireCsrf(admin, header(request, "x-csrf-token"));
       reply.status(202);
       return mediaService.createSubtitleJob(
@@ -168,7 +168,7 @@ export function registerMediaRoutes(
     "/api/v1/admin/media/:mediaId",
     { schema: { params: mediaParamsSchema, response: { 204: z.null() } } },
     (request, reply) => {
-      const admin = authService.authenticate(request.cookies.sw_admin);
+      const admin = authenticateHost(request, authService);
       authService.requireCsrf(admin, header(request, "x-csrf-token"));
       mediaService.trashMedia(admin.admin_id, request.params.mediaId);
       reply.status(204);
@@ -343,21 +343,31 @@ function resolveIdentity(
   authService: AuthService,
   roomService: RoomService,
 ): ContentIdentity {
-  if (request.cookies.sw_admin) {
-    const session = authService.authenticate(request.cookies.sw_admin);
+  const accountToken = request.cookies["__Host-sw_session"];
+  const account = authService.authenticate(accountToken);
+  if (account.role === "host") {
+    const session = account;
     return {
       kind: "admin",
       sessionHash: session.id_hash,
       expiresAt: session.expires_at,
     };
   }
-  const session = roomService.authenticate(request.cookies.sw_room);
+  const session = roomService.authenticate(accountToken);
   return {
     kind: "room",
     roomId: session.roomId,
     sessionHash: session.sessionHash,
     expiresAt: session.expiresAt,
   };
+}
+
+function authenticateHost(request: FastifyRequest, authService: AuthService) {
+  const session = authService.authenticate(
+    request.cookies["__Host-sw_session"],
+  );
+  authService.requireHost(session);
+  return session;
 }
 
 function requireInternal(request: FastifyRequest, expected: string): void {

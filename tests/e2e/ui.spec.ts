@@ -10,7 +10,7 @@ for (const viewport of [
   { name: "desktop", width: 1440, height: 1000 },
   { name: "mobile", width: 390, height: 844 },
 ]) {
-  test(`landing and admin shell render without overflow on ${viewport.name}`, async ({
+  test(`fixed-account admission renders without overflow on ${viewport.name}`, async ({
     page,
   }) => {
     const browserErrors: string[] = [];
@@ -22,17 +22,13 @@ for (const viewport of [
       width: viewport.width,
       height: viewport.height,
     });
-    await page.route("**/api/v1/admin/session", (route) =>
+    await page.route("**/api/v1/auth/session", (route) =>
       route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({}),
+        status: 204,
       }),
     );
     await page.goto("/", { waitUntil: "networkidle" });
-    await expect(
-      page.getByRole("heading", { name: /让远方的人/ }),
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: /入场凭证/ })).toBeVisible();
     expect(
       await page.evaluate(
         () =>
@@ -41,23 +37,17 @@ for (const viewport of [
       ),
     ).toBe(false);
     await page.screenshot({
-      path: resolve(artifacts, `landing-${viewport.name}.png`),
+      path: resolve(artifacts, `account-login-${viewport.name}.png`),
       fullPage: true,
     });
-    await page.getByRole("link", { name: /放映员入口/ }).click();
-    await expect(
-      page.getByRole("heading", { name: "放映员控制台" }),
-    ).toBeVisible();
-    const codeInput = page.getByLabel("6 位放映口令");
-    await expect(codeInput).toHaveValue("");
-    await expect(codeInput).toHaveAttribute("inputmode", "numeric");
-    await expect(
-      page.getByRole("button", { name: "解锁控制台" }),
-    ).toBeDisabled();
-    await page.screenshot({
-      path: resolve(artifacts, `admin-login-${viewport.name}.png`),
-      fullPage: true,
-    });
+    await expect(page.getByLabel("账户名称")).toHaveAttribute(
+      "autocomplete",
+      "username",
+    );
+    await expect(page.getByLabel("账户密码")).toHaveAttribute(
+      "autocomplete",
+      "current-password",
+    );
     expect(browserErrors).toEqual([]);
   });
 }
@@ -83,6 +73,6 @@ test("settings persist local audio preferences and diagnostics stay redacted", a
   await expect(page.getByRole("heading", { name: "连接诊断" })).toBeVisible();
   await expect(page.getByText(/不包含 Cookie、JWT、房间密码/)).toBeVisible();
   await expect(page.locator("body")).not.toContainText(
-    /sw_admin|sw_room|Bearer /,
+    /__Host-sw_session|sw_admin|sw_room|Bearer /,
   );
 });

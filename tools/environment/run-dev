@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+prefix="$repository_root/.conda/envs/dev"
+if [[ ! -x "$prefix/bin/node" || ! -x "$prefix/bin/pnpm" ]]; then
+  echo "缺少项目Conda环境：$prefix" >&2
+  exit 1
+fi
+export PATH="$prefix/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export CONDA_PREFIX="$prefix"
+export TMPDIR="$repository_root/tmp"
+export XDG_CACHE_HOME="$repository_root/.cache"
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
+exec "$@"

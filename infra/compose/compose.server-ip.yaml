@@ -12,6 +12,9 @@ services:
     read_only: true
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    cpus: 0.35
+    mem_limit: 384m
+    pids_limit: 128
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
     command:
@@ -57,6 +60,9 @@ services:
     read_only: true
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    cpus: 0.35
+    mem_limit: 320m
+    pids_limit: 96
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
     command:
@@ -96,6 +102,9 @@ services:
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     cap_add: [NET_BIND_SERVICE]
+    cpus: 0.20
+    mem_limit: 160m
+    pids_limit: 96
     group_add: ["1000"]
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
@@ -134,6 +143,9 @@ services:
     read_only: true
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    cpus: 0.12
+    mem_limit: 160m
+    pids_limit: 64
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
     command:
@@ -163,6 +175,9 @@ services:
     read_only: true
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    cpus: 0.50
+    mem_limit: 320m
+    pids_limit: 128
     ports:
       - "8189:8189/tcp"
       - "8189:8189/udp"
@@ -184,6 +199,9 @@ services:
     read_only: true
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    cpus: 0.50
+    mem_limit: 448m
+    pids_limit: 192
     command: ["--config", "/etc/livekit.yaml"]
     ports:
       - "7881:7881/tcp"

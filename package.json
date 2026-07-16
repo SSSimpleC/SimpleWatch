@@ -25,15 +25,16 @@
     "test:ids": "node tools/testing/validate-test-ids.mjs",
     "test:coverage": "pnpm test:media && vitest run --config vitest.coverage.config.ts --coverage",
     "audit:prod": "node tools/security/audit-bulk.mjs",
+    "accounts:generate": "node tools/security/generate-account-credentials.mjs",
     "test:security": "vitest run tests/security && pnpm audit:prod",
     "test:integration": "vitest run apps/api/test tests/integration --passWithNoTests",
     "test:media": "pnpm --filter @simplewatch/media test:smoke",
     "test:worker": "pnpm --filter @simplewatch/worker test",
-    "test:range": "pnpm test:media && pwsh -File tools/environment/install-caddy.ps1 && pwsh -File tools/environment/install-tusd.ps1 && pwsh -File tools/testing/range-predeploy.ps1",
-    "test:compose": "docker compose -f infra/compose/compose.local.yaml config --quiet",
-    "test:rtc": "pwsh -File tools/environment/install-mediamtx.ps1 && pwsh -File tools/environment/install-livekit.ps1 && pwsh -File tools/testing/rtc-native-smoke.ps1 && pwsh -File tools/testing/livekit-five-client.ps1",
-    "test:backup": "pwsh -File tools/testing/backup-restore-smoke.ps1",
-    "release:manifest": "pwsh -File tools/release/create-manifest.ps1",
+    "test:range": "pnpm test:media && node tools/testing/platform-gate.mjs range",
+    "test:compose": "node tools/testing/compose-check.mjs",
+    "test:rtc": "node tools/testing/platform-gate.mjs rtc",
+    "test:backup": "node tools/testing/platform-gate.mjs backup",
+    "release:manifest": "node tools/release/create-manifest.mjs",
     "test:e2e": "playwright test",
     "openapi:generate": "pnpm --filter @simplewatch/api openapi:generate",
     "openapi:check": "pnpm --filter @simplewatch/api openapi:check",
@@ -51,6 +52,7 @@
     "prettier": "3.7.4",
     "typescript": "5.9.3",
     "typescript-eslint": "8.48.1",
-    "vitest": "3.2.4"
+    "vitest": "3.2.4",
+    "yaml": "2.9.0"
   }
 }

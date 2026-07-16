@@ -36,7 +36,7 @@ export function registerTransportRoutes(
     },
     (request) => {
       const identity = roomService.authenticate(
-        request.cookies.sw_room,
+        request.cookies["__Host-sw_session"],
         request.params.roomId,
       );
       roomService.requireCsrf(identity, header(request, "x-csrf-token"));
@@ -55,7 +55,10 @@ export function registerTransportRoutes(
       },
     },
     (request) => {
-      roomService.authenticate(request.cookies.sw_room, request.params.roomId);
+      roomService.authenticate(
+        request.cookies["__Host-sw_session"],
+        request.params.roomId,
+      );
       return transportService.getLiveStatus(request.params.roomId);
     },
   );
@@ -104,7 +107,7 @@ export function registerTransportRoutes(
     },
     (request) => {
       const identity = roomService.authenticate(
-        request.cookies.sw_room,
+        request.cookies["__Host-sw_session"],
         request.params.roomId,
       );
       return transportService.getStablePublishCredential(identity);

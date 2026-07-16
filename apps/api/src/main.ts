@@ -6,7 +6,6 @@ const config = parseAppConfig(process.env);
 const { app } = await buildApp({
   databasePath: config.databasePath,
   publicOrigin: config.publicOrigin,
-  friendInviteToken: config.friendInviteToken,
   mediaRoot: config.mediaRoot,
   uploadRoot: config.uploadRoot,
   inboxRoot: config.inboxRoot,
@@ -23,6 +22,7 @@ const { app } = await buildApp({
   livekitUrl: config.livekitUrl,
   mediamtxControlUrl: config.mediamtxControlUrl,
   logger: true,
+  passwordPepper: config.passwordPepper,
 });
 
 const shutdown = async () => {

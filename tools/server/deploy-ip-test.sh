@@ -5,6 +5,7 @@ release_dir=${1:?release directory required}
 public_ip=${2:?public IP required}
 public_port=${3:-443}
 clear_existing_data=${4:-false}
+accounts_file=${5:?root-only fixed account JSON file required}
 if [[ "$public_port" == "443" ]]; then
   public_origin="https://${public_ip}"
 else
@@ -36,6 +37,13 @@ restore_sysctl() {
 on_exit() {
   local status=$?
   trap - EXIT
+  if [[ -f "$accounts_file" ]]; then
+    if command -v shred >/dev/null 2>&1; then
+      shred -u "$accounts_file"
+    else
+      rm -f "$accounts_file"
+    fi
+  fi
   if [[ $status -ne 0 ]]; then restore_sysctl; fi
   exit "$status"
 }
@@ -65,6 +73,7 @@ if [[ ! -f .env.server ]]; then
   livekit_key="sw_$(openssl rand -hex 8)"
   cat >.env.server <<EOF
 SESSION_SECRET=$(secret)
+PASSWORD_PEPPER=$(secret)
 CONTENT_SIGNING_SECRET=$(secret)
 INTERNAL_HOOK_TOKEN=$(secret)
 MEDIA_JWT_SECRET=$(secret)
@@ -74,13 +83,13 @@ LIVEKIT_API_SECRET=$(secret)
 EOF
 fi
 
-friend_invite_token=$(grep '^FRIEND_INVITE_TOKEN=' .env.server | cut -d= -f2- || true)
-if [[ ${#friend_invite_token} -lt 32 ]]; then
-  friend_invite_token=$(openssl rand -base64 48 | tr '+/' '-_' | tr -d '=\n')
-fi
 set_env RELEASE_TAG "$(basename "$release_dir")"
 set_env PUBLIC_ORIGIN "$public_origin"
-set_env FRIEND_INVITE_TOKEN "$friend_invite_token"
+password_pepper=$(grep '^PASSWORD_PEPPER=' .env.server | cut -d= -f2- || true)
+if [[ ${#password_pepper} -lt 32 ]]; then
+  password_pepper=$(secret)
+fi
+set_env PASSWORD_PEPPER "$password_pepper"
 obs_credential_key=$(grep '^OBS_CREDENTIAL_ENCRYPTION_KEY=' .env.server | cut -d= -f2- || true)
 if [[ ${#obs_credential_key} -lt 32 ]]; then
   obs_credential_key=$(secret)
@@ -90,17 +99,14 @@ set_env MEDIA_ORIGIN "$public_origin"
 set_env LIVEKIT_URL "${public_origin/https:/wss:}"
 set_env TUS_ENDPOINT "${public_origin}/files/"
 set_env MEDIAMTX_CONTROL_URL "http://mediamtx:9997"
-set_env ALLOW_NONINTERACTIVE_BOOTSTRAP "true"
-set_env BOOTSTRAP_ADMIN_CODE "260713"
+remove_env FRIEND_INVITE_TOKEN
+remove_env ALLOW_NONINTERACTIVE_BOOTSTRAP
+remove_env BOOTSTRAP_ADMIN_CODE
 remove_env BOOTSTRAP_ADMIN_USERNAME
 remove_env BOOTSTRAP_ADMIN_PASSWORD
 chmod 600 .env.server
-
-cat >/root/simplewatch-initial-credentials <<EOF
-URL=${public_origin}/admin
-CODE=260713
-EOF
-chmod 600 /root/simplewatch-initial-credentials
+[[ -f "$accounts_file" ]]
+[[ "$(stat -c '%a' "$accounts_file")" == "600" ]]
 
 set -a
 # `.env.server` 由本脚本在当前发布目录中生成或继承。
@@ -177,11 +183,15 @@ sysctl_changed=true
 # FRP, DERP and the unrelated MES stack untouched.
 "${compose[@]}" down --remove-orphans
 
-"${compose[@]}" run --rm \
-  -e ALLOW_PRODUCTION_CODE_UPDATE=locked-single-room-code-update \
-  -e BOOTSTRAP_ADMIN_CODE=260713 \
+"${compose[@]}" run --rm -T \
+  -e ALLOW_ACCOUNT_PROVISION=fixed-account-replacement \
   app node apps/api/node_modules/tsx/dist/cli.mjs \
-  apps/api/src/cli/admin-bootstrap-noninteractive.ts
+  apps/api/src/cli/admin-bootstrap.ts <"$accounts_file"
+if command -v shred >/dev/null 2>&1; then
+  shred -u "$accounts_file"
+else
+  rm -f "$accounts_file"
+fi
 
 if [[ "$clear_existing_data" == "true" ]]; then
   quarantine_id="pre-${RELEASE_TAG}-$(date -u +%Y%m%dT%H%M%SZ)"

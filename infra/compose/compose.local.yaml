@@ -13,8 +13,8 @@ services:
       PORT: "3000"
       DATABASE_PATH: /state/simplewatch.sqlite3
       PUBLIC_ORIGIN: http://127.0.0.1:18080
-      FRIEND_INVITE_TOKEN: local-friend-invite-token-at-least-32-bytes
       SESSION_SECRET: local-session-secret-change-before-prod
+      PASSWORD_PEPPER: local-password-pepper-change-before-prod
       CONTENT_SIGNING_SECRET: local-content-signing-secret-prod
       INTERNAL_HOOK_TOKEN: local-internal-hook-token-predeploy
       MEDIA_JWT_SECRET: local-media-jwt-secret-change-before-prod

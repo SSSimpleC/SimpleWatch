@@ -10,10 +10,9 @@ import fastifyStatic from "@fastify/static";
 import swagger from "@fastify/swagger";
 import websocket from "@fastify/websocket";
 import {
-  adminLoginRequestSchema,
-  createRoomRequestSchema,
+  accountRoomEntrySchema,
+  authLoginRequestSchema,
   envelopeSchema,
-  joinActiveRoomRequestSchema,
   kickMemberRequestSchema,
   activeRoomSummarySchema,
   roomCommandRequestSchema,
@@ -43,16 +42,26 @@ import { RoomHub } from "./room-hub.js";
 import { AuthService } from "./services/auth-service.js";
 import { MediaService } from "./services/media-service.js";
 import { OutboxService } from "./services/outbox-service.js";
-import { RoomService, type RoomIdentity } from "./services/room-service.js";
+import {
+  RoomService,
+  type AccountRoomEntry,
+  type RoomIdentity,
+} from "./services/room-service.js";
 import { TransportService } from "./services/transport-service.js";
 import { registerTransportRoutes } from "./transport-routes.js";
 
 const roomParamsSchema = z.object({ roomId: z.string().uuid() });
 const emptyResponseSchema = z.null();
-const adminLoginResponseSchema = z.object({
-  admin: z.object({ id: z.string().uuid(), username: z.string() }),
+const authSessionResponseSchema = z.object({
+  account: z.object({
+    id: z.string().uuid(),
+    username: z.string(),
+    role: z.enum(["host", "viewer"]),
+  }),
   csrfToken: z.string(),
-  expiresAt: z.iso.datetime(),
+  idleExpiresAt: z.iso.datetime(),
+  absoluteExpiresAt: z.iso.datetime(),
+  destination: accountRoomEntrySchema,
 });
 const roomSessionResponseSchema = z.object({
   room: z.object({ id: z.string().uuid(), joinUrl: z.url().optional() }),
@@ -72,7 +81,6 @@ const commandEnvelopeSchema = envelopeSchema(roomCommandRequestSchema);
 export interface BuildAppOptions {
   readonly databasePath: string;
   readonly publicOrigin: string;
-  readonly friendInviteToken?: string;
   readonly mediaRoot?: string;
   readonly uploadRoot?: string;
   readonly inboxRoot?: string;
@@ -92,6 +100,8 @@ export interface BuildAppOptions {
   readonly migrationsPath?: string;
   readonly now?: () => number;
   readonly logger?: boolean;
+  readonly authFailureDelay?: (milliseconds: number) => Promise<void>;
+  readonly passwordPepper?: string;
 }
 
 export interface BuiltApp {
@@ -113,13 +123,13 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
       : {}),
     now,
   });
-  const authService = new AuthService(database, now);
-  const roomService = new RoomService(
+  const authService = new AuthService(
     database,
-    options.publicOrigin,
-    options.friendInviteToken ?? "test-friend-invite-token-32-characters",
     now,
+    options.passwordPepper ?? "test-password-pepper-not-for-production",
+    options.authFailureDelay,
   );
+  const roomService = new RoomService(database, now);
   const mediaService = new MediaService(database, {
     mediaRoot: options.mediaRoot ?? "tmp/media",
     uploadRoot: options.uploadRoot ?? "tmp/uploads",
@@ -188,7 +198,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
       ["GET", "POST"].includes(request.method) &&
       (/^\/api\/v1\/rooms\/[^/]+\/credentials$/.test(path) ||
         /^\/api\/v1\/rooms\/[^/]+\/live\/publish-config$/.test(path));
-    const roomSession = request.cookies.sw_room;
+    const roomSession = getAccountCookie(request);
     const credentialKey = roomSession
       ? createHash("sha256").update(roomSession).digest("hex")
       : request.ip;
@@ -246,7 +256,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
   });
 
   registerHealthRoutes(app, database);
-  registerApiRoutes(
+  registerUnifiedApiRoutes(
     app,
     authService,
     roomService,
@@ -254,7 +264,6 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
     hub,
     options.publicOrigin,
     now,
-    publicRateLimiter,
   );
   registerMediaRoutes(
     app,
@@ -329,7 +338,7 @@ function registerHealthRoutes(
   );
 }
 
-function registerApiRoutes(
+function registerUnifiedApiRoutes(
   baseApp: FastifyInstance,
   authService: AuthService,
   roomService: RoomService,
@@ -337,79 +346,170 @@ function registerApiRoutes(
   hub: RoomHub,
   publicOrigin: string,
   now: () => number,
-  publicRateLimiter: PublicRateLimiter,
 ): void {
   const app = baseApp.withTypeProvider<ZodTypeProvider>();
 
+  const destinationFor = (
+    session: ReturnType<AuthService["authenticate"]>,
+    forceTakeover = false,
+  ) => {
+    if (session.role === "host") return { state: "admin" as const };
+    const entry = forceTakeover
+      ? roomService.takeoverAccountRoom(session)
+      : roomService.getAccountRoomState(session);
+    return toPublicEntry(entry);
+  };
+
   app.post(
-    "/api/v1/admin/login",
+    "/api/v1/auth/login",
     {
       schema: {
-        body: adminLoginRequestSchema,
-        response: { 200: adminLoginResponseSchema },
+        body: authLoginRequestSchema,
+        response: { 200: authSessionResponseSchema },
       },
     },
     async (request, reply) => {
-      const minuteKey = `login:${request.ip}:minute`;
-      const hourKey = `login:${request.ip}:hour`;
-      requireRateLimit(publicRateLimiter, minuteKey, 5, hourKey, 20);
-      let result;
-      try {
-        result = await authService.login(request.body.code);
-      } catch (error) {
-        publicRateLimiter.record(minuteKey, 60_000);
-        publicRateLimiter.record(hourKey, 60 * 60_000);
-        throw error;
-      }
-      setSessionCookie(
-        reply,
-        "sw_admin",
-        result.sessionToken,
-        result.expiresAt,
+      const result = await authService.login(
+        request.body.username,
+        request.body.password,
+        request.ip,
       );
+      const session = authService.authenticate(result.sessionToken);
+      setAccountCookie(reply, result.sessionToken, result.absoluteExpiresAt);
       reply.header("Cache-Control", "no-store");
       return {
-        admin: result.admin,
+        account: result.account,
         csrfToken: result.csrfToken,
-        expiresAt: new Date(result.expiresAt).toISOString(),
+        idleExpiresAt: new Date(result.idleExpiresAt).toISOString(),
+        absoluteExpiresAt: new Date(result.absoluteExpiresAt).toISOString(),
+        destination: destinationFor(session, true),
       };
     },
   );
 
-  app.patch(
-    "/api/v1/rooms/:roomId",
-    {
-      schema: {
-        params: roomParamsSchema,
-        body: updateRoomRequestSchema,
-        response: {
-          200: z.object({
-            id: z.string().uuid(),
-            status: z.enum(["active", "closed"]),
-          }),
+  app.get(
+    "/api/v1/auth/session",
+    { schema: { response: { 200: authSessionResponseSchema } } },
+    (request, reply) => {
+      const resumed = authService.resume(getAccountCookie(request));
+      if (resumed.sessionToken) {
+        setAccountCookie(
+          reply,
+          resumed.sessionToken,
+          resumed.session.absolute_expires_at,
+        );
+      }
+      reply.header("Cache-Control", "no-store");
+      return {
+        account: {
+          id: resumed.session.account_id,
+          username: resumed.session.username,
+          role: resumed.session.role,
         },
-      },
-    },
-    (request) => {
-      const admin = authService.authenticate(request.cookies.sw_admin);
-      authService.requireCsrf(admin, getHeader(request, "x-csrf-token"));
-      const result = roomService.updateRoom(
-        admin.admin_id,
-        request.params.roomId,
-        request.body,
-      );
-      if (result.status === "closed")
-        hub.closeRoom(result.id, 4010, "room closed");
-      return result;
+        csrfToken: resumed.csrfToken,
+        idleExpiresAt: new Date(resumed.session.idle_expires_at).toISOString(),
+        absoluteExpiresAt: new Date(
+          resumed.session.absolute_expires_at,
+        ).toISOString(),
+        destination: destinationFor(resumed.session),
+      };
     },
   );
+
+  app.post(
+    "/api/v1/auth/logout",
+    { schema: { response: { 204: emptyResponseSchema } } },
+    (request, reply) => {
+      const token = getAccountCookie(request);
+      const session = authService.authenticate(token);
+      authService.requireCsrf(session, getHeader(request, "x-csrf-token"));
+      roomService.releaseAccountSession(session);
+      if (token) authService.logout(token);
+      reply.clearCookie("__Host-sw_session", {
+        secure: true,
+        httpOnly: true,
+        sameSite: "strict",
+        path: "/",
+      });
+      reply.header("Clear-Site-Data", '"cache", "cookies", "storage"');
+      reply.status(204);
+      return null;
+    },
+  );
+
+  app.post(
+    "/api/v1/room/enter",
+    { schema: { response: { 200: accountRoomEntrySchema } } },
+    (request) => {
+      const session = authService.authenticate(getAccountCookie(request));
+      if (session.role === "host") return { state: "admin" as const };
+      const entry = roomService.enterAccountRoom(session, {
+        forceTakeover: true,
+      });
+      if (entry.state === "room" && entry.tookOverSessionHash) {
+        hub.closeMember(entry.roomId, entry.memberId, 4001, "seat taken over");
+      }
+      return toPublicEntry(entry);
+    },
+  );
+
+  app.post(
+    "/api/v1/room/takeover",
+    { schema: { response: { 200: accountRoomEntrySchema } } },
+    (request) => {
+      const session = authService.authenticate(getAccountCookie(request));
+      const entry = roomService.takeoverAccountRoom(session);
+      if (entry.state === "room" && entry.tookOverSessionHash) {
+        hub.closeMember(entry.roomId, entry.memberId, 4001, "seat taken over");
+      }
+      return toPublicEntry(entry);
+    },
+  );
+
+  app.get("/api/v1/lobby/events", (request, reply) => {
+    const token = getAccountCookie(request);
+    const session = authService.authenticate(token);
+    if (session.role === "host") throw forbidden("Host 无需进入观众等待队列");
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-store",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    let previous = "";
+    const emit = () => {
+      try {
+        const currentSession = authService.authenticate(token);
+        const payload = JSON.stringify(
+          toPublicEntry(roomService.getAccountRoomState(currentSession)),
+        );
+        if (payload !== previous) {
+          previous = payload;
+          reply.raw.write(`event: room-state\ndata: ${payload}\n\n`);
+        } else {
+          reply.raw.write(": keepalive\n\n");
+        }
+      } catch {
+        reply.raw.write(
+          `event: session-expired\ndata: {"state":"expired"}\n\n`,
+        );
+        reply.raw.end();
+      }
+    };
+    emit();
+    const timer = setInterval(emit, 2_000);
+    timer.unref();
+    request.raw.once("close", () => clearInterval(timer));
+  });
 
   app.get(
     "/api/v1/admin/active-room",
     { schema: { response: { 200: activeRoomSummarySchema } } },
     async (request, reply) => {
-      const admin = authService.authenticate(request.cookies.sw_admin);
-      const room = roomService.getActiveRoomSummary(admin.admin_id);
+      const account = authService.authenticate(getAccountCookie(request));
+      authService.requireHost(account);
+      const room = roomService.getActiveRoomSummary(account.account_id);
       reply.header("Cache-Control", "no-store");
       if (!room) return null;
       const live =
@@ -431,20 +531,62 @@ function registerApiRoutes(
   );
 
   app.post(
-    "/api/v1/admin/active-room/host-session",
-    { schema: { response: { 200: roomSessionResponseSchema } } },
-    async (request, reply) => {
-      const admin = authService.authenticate(request.cookies.sw_admin);
-      authService.requireCsrf(admin, getHeader(request, "x-csrf-token"));
-      const result = roomService.createActiveHostSession(admin.admin_id);
-      setSessionCookie(reply, "sw_room", result.sessionToken, result.expiresAt);
+    "/api/v1/rooms",
+    {
+      schema: {
+        body: z.object({}).strict(),
+        response: { 201: roomSessionResponseSchema },
+      },
+    },
+    (request, reply) => {
+      const account = authService.authenticate(getAccountCookie(request));
+      authService.requireHost(account);
+      authService.requireCsrf(account, getHeader(request, "x-csrf-token"));
+      const result = roomService.createAccountRoom(
+        account,
+        transportService.getStablePublishPath(),
+      );
       reply.header("Cache-Control", "no-store");
+      reply.status(201);
       return {
-        room: { id: result.roomId, joinUrl: result.joinUrl },
-        member: result.member,
-        csrfToken: result.csrfToken,
-        expiresAt: new Date(result.expiresAt).toISOString(),
+        room: { id: result.roomId },
+        member: {
+          id: result.memberId,
+          nickname: result.nickname,
+          role: result.role,
+        },
+        csrfToken: rotateUnifiedCsrf(authService, account),
+        expiresAt: new Date(account.absolute_expires_at).toISOString(),
       };
+    },
+  );
+
+  app.patch(
+    "/api/v1/rooms/:roomId",
+    {
+      schema: {
+        params: roomParamsSchema,
+        body: updateRoomRequestSchema,
+        response: {
+          200: z.object({
+            id: z.string().uuid(),
+            status: z.enum(["active", "closed"]),
+          }),
+        },
+      },
+    },
+    (request) => {
+      const account = authService.authenticate(getAccountCookie(request));
+      authService.requireHost(account);
+      authService.requireCsrf(account, getHeader(request, "x-csrf-token"));
+      const result = roomService.updateRoom(
+        account.account_id,
+        request.params.roomId,
+        request.body,
+      );
+      if (result.status === "closed")
+        hub.closeRoom(result.id, 4010, "room closed");
+      return result;
     },
   );
 
@@ -458,25 +600,34 @@ function registerApiRoutes(
       },
     },
     (request) => {
-      const admin = authService.authenticate(request.cookies.sw_admin);
-      authService.requireCsrf(admin, getHeader(request, "x-csrf-token"));
-      const result = roomService.closeActiveRoom(admin.admin_id);
+      const account = authService.authenticate(getAccountCookie(request));
+      authService.requireHost(account);
+      authService.requireCsrf(account, getHeader(request, "x-csrf-token"));
+      const result = roomService.closeActiveRoom(account.account_id);
       hub.closeRoom(result.id, 4010, "room force closed");
       return result;
     },
   );
 
-  app.post(
-    "/api/v1/admin/logout",
-    { schema: { response: { 204: emptyResponseSchema } } },
-    (request, reply) => {
-      const token = request.cookies.sw_admin;
-      const session = authService.authenticate(token);
-      authService.requireCsrf(session, getHeader(request, "x-csrf-token"));
-      if (token) authService.logout(token);
-      reply.clearCookie("sw_admin", { path: "/" });
-      reply.status(204);
-      return null;
+  app.delete(
+    "/api/v1/rooms/:roomId",
+    {
+      schema: {
+        params: roomParamsSchema,
+        response: {
+          200: z.object({ id: z.string().uuid(), status: z.literal("closed") }),
+        },
+      },
+    },
+    (request) => {
+      const identity = roomService.authenticate(
+        getAccountCookie(request),
+        request.params.roomId,
+      );
+      roomService.requireCsrf(identity, getHeader(request, "x-csrf-token"));
+      const result = roomService.closeByHost(identity);
+      hub.closeRoom(result.id, 4010, "room closed");
+      return result;
     },
   );
 
@@ -494,7 +645,7 @@ function registerApiRoutes(
     },
     (request) => {
       const identity = roomService.authenticate(
-        request.cookies.sw_room,
+        getAccountCookie(request),
         request.params.roomId,
       );
       roomService.requireCsrf(identity, getHeader(request, "x-csrf-token"));
@@ -518,125 +669,6 @@ function registerApiRoutes(
     },
   );
 
-  app.post(
-    "/api/v1/rooms",
-    {
-      schema: {
-        body: createRoomRequestSchema,
-        response: { 201: roomSessionResponseSchema },
-      },
-    },
-    async (request, reply) => {
-      const admin = authService.authenticate(request.cookies.sw_admin);
-      authService.requireCsrf(admin, getHeader(request, "x-csrf-token"));
-      const result = await roomService.createRoom(
-        admin.admin_id,
-        request.body,
-        transportService.getStablePublishPath(),
-      );
-      setSessionCookie(reply, "sw_room", result.sessionToken, result.expiresAt);
-      reply.header("Cache-Control", "no-store");
-      return reply.status(201).send({
-        room: { id: result.roomId, joinUrl: result.joinUrl },
-        member: result.member,
-        csrfToken: result.csrfToken,
-        expiresAt: new Date(result.expiresAt).toISOString(),
-      });
-    },
-  );
-
-  app.delete(
-    "/api/v1/rooms/:roomId",
-    {
-      schema: {
-        params: roomParamsSchema,
-        response: {
-          200: z.object({ id: z.string().uuid(), status: z.literal("closed") }),
-        },
-      },
-    },
-    (request) => {
-      const identity = roomService.authenticate(
-        request.cookies.sw_room,
-        request.params.roomId,
-      );
-      roomService.requireCsrf(identity, getHeader(request, "x-csrf-token"));
-      const result = roomService.closeByHost(identity);
-      hub.closeRoom(result.id, 4010, "room closed");
-      return result;
-    },
-  );
-
-  app.get(
-    "/api/v1/admin/session",
-    { schema: { response: { 200: adminLoginResponseSchema } } },
-    (request) => {
-      const admin = authService.authenticate(request.cookies.sw_admin);
-      const csrfToken = authService.rotateCsrf(admin);
-      return {
-        admin: { id: admin.admin_id, username: admin.username },
-        csrfToken,
-        expiresAt: new Date(admin.expires_at).toISOString(),
-      };
-    },
-  );
-
-  app.post(
-    "/api/v1/admin/obs-credentials/rotate",
-    {
-      schema: {
-        body: z.object({ confirmation: z.literal("重新生成OBS配置") }),
-        response: {
-          200: z.object({
-            url: z.url(),
-            token: z.string(),
-            path: z.string(),
-            expiresAt: z.string(),
-          }),
-        },
-      },
-    },
-    (request) => {
-      const admin = authService.authenticate(request.cookies.sw_admin);
-      authService.requireCsrf(admin, getHeader(request, "x-csrf-token"));
-      return transportService.rotateStablePublishCredential();
-    },
-  );
-
-  app.post(
-    "/api/v1/rooms/active/join",
-    {
-      schema: {
-        body: joinActiveRoomRequestSchema,
-        response: { 200: roomSessionResponseSchema },
-      },
-    },
-    async (request, reply) => {
-      const prefix = `join:${request.ip}`;
-      const minuteKey = `${prefix}:minute`;
-      const hourKey = `${prefix}:hour`;
-      requireRateLimit(publicRateLimiter, minuteKey, 5, hourKey, 20);
-      let result;
-      try {
-        result = roomService.joinActiveRoom(request.body);
-      } catch (error) {
-        if (error instanceof AppError && error.statusCode === 401) {
-          publicRateLimiter.record(minuteKey, 60_000);
-          publicRateLimiter.record(hourKey, 60 * 60_000);
-        }
-        throw error;
-      }
-      setSessionCookie(reply, "sw_room", result.sessionToken, result.expiresAt);
-      reply.header("Cache-Control", "no-store");
-      return {
-        room: { id: result.roomId },
-        member: result.member,
-        csrfToken: result.csrfToken,
-        expiresAt: new Date(result.expiresAt).toISOString(),
-      };
-    },
-  );
-
   app.get(
     "/api/v1/rooms/:roomId/bootstrap",
     {
@@ -654,7 +686,7 @@ function registerApiRoutes(
     },
     (request, reply) => {
       const identity = roomService.authenticate(
-        request.cookies.sw_room,
+        getAccountCookie(request),
         request.params.roomId,
       );
       roomService.touch(identity);
@@ -678,7 +710,7 @@ function registerApiRoutes(
     },
     (request, reply) => {
       const identity = roomService.authenticate(
-        request.cookies.sw_room,
+        getAccountCookie(request),
         request.params.roomId,
       );
       roomService.requireCsrf(identity, getHeader(request, "x-csrf-token"));
@@ -689,9 +721,31 @@ function registerApiRoutes(
         identity.roomId,
         createEnvelope(identity.roomId, "room.snapshot", snapshot, now),
       );
-      reply.clearCookie("sw_room", { path: "/" });
       reply.status(204);
       return null;
+    },
+  );
+
+  app.post(
+    "/api/v1/admin/obs-credentials/rotate",
+    {
+      schema: {
+        body: z.object({ confirmation: z.literal("重新生成OBS配置") }),
+        response: {
+          200: z.object({
+            url: z.url(),
+            token: z.string(),
+            path: z.string(),
+            expiresAt: z.string(),
+          }),
+        },
+      },
+    },
+    (request) => {
+      const account = authService.authenticate(getAccountCookie(request));
+      authService.requireHost(account);
+      authService.requireCsrf(account, getHeader(request, "x-csrf-token"));
+      return transportService.rotateStablePublishCredential();
     },
   );
 
@@ -710,13 +764,29 @@ function registerApiRoutes(
     },
     (request, reply) => {
       const receivedAtMs = now();
-      if (request.cookies.sw_room)
-        roomService.authenticate(request.cookies.sw_room);
-      else authService.authenticate(request.cookies.sw_admin);
+      authService.authenticate(getAccountCookie(request));
       reply.header("Cache-Control", "no-store");
       return { receivedAtMs, sentAtMs: now(), origin: publicOrigin };
     },
   );
+
+  for (const legacyPath of [
+    "/api/v1/admin/login",
+    "/api/v1/admin/session",
+    "/api/v1/admin/logout",
+    "/api/v1/admin/active-room/host-session",
+    "/api/v1/rooms/active/join",
+  ]) {
+    app.all(legacyPath, (_request, reply) =>
+      reply.status(410).send({
+        error: {
+          code: "LEGACY_AUTH_REMOVED",
+          message: "旧登录入口已经停用",
+          requestId: "legacy-auth",
+        },
+      }),
+    );
+  }
 }
 
 function registerWebSocketRoute(
@@ -743,7 +813,7 @@ function registerWebSocketRoute(
         }
         const params = roomParamsSchema.parse(request.params);
         identity = roomService.authenticate(
-          request.cookies.sw_room,
+          getAccountCookie(request),
           params.roomId,
         );
       } catch {
@@ -855,34 +925,41 @@ function registerWebSocketRoute(
   );
 }
 
-function requireRateLimit(
-  limiter: PublicRateLimiter,
-  minuteKey: string,
-  minuteLimit: number,
-  hourKey: string,
-  hourLimit: number,
-): void {
-  if (
-    !limiter.isAllowed(minuteKey, minuteLimit) ||
-    !limiter.isAllowed(hourKey, hourLimit)
-  ) {
-    throw new AppError(429, "RATE_LIMITED", "请求过于频繁，请稍后重试");
-  }
-}
-
-function setSessionCookie(
+function setAccountCookie(
   reply: FastifyReply,
-  name: "sw_admin" | "sw_room",
   value: string,
-  expiresAt: number,
+  absoluteExpiresAt: number,
 ): void {
-  reply.setCookie(name, value, {
+  reply.setCookie("__Host-sw_session", value, {
     secure: true,
     httpOnly: true,
     sameSite: "strict",
     path: "/",
-    expires: new Date(expiresAt),
+    expires: new Date(absoluteExpiresAt),
   });
+}
+
+function getAccountCookie(request: FastifyRequest): string | undefined {
+  return request.cookies["__Host-sw_session"];
+}
+
+function rotateUnifiedCsrf(
+  authService: AuthService,
+  session: ReturnType<AuthService["authenticate"]>,
+): string {
+  return authService.rotateCsrf(session);
+}
+
+function toPublicEntry(entry: AccountRoomEntry) {
+  if (entry.state !== "room") return entry;
+  return {
+    state: "room" as const,
+    roomId: entry.roomId,
+    memberId: entry.memberId,
+    nickname: entry.nickname,
+    role: entry.role,
+    tookOver: entry.tookOverSessionHash !== null,
+  };
 }
 
 function getHeader(request: FastifyRequest, name: string): string | undefined {

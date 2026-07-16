@@ -31,20 +31,38 @@ export const errorResponseSchema = z.object({
 });
 export type ErrorResponse = z.infer<typeof errorResponseSchema>;
 
-export const adminLoginRequestSchema = z.object({
-  code: z.string().regex(/^\d{6}$/, "放映口令必须为 6 位数字"),
+export const authLoginRequestSchema = z.object({
+  username: z.string().trim().min(1).max(64),
+  password: z.string().min(1).max(128),
 });
 
-export const createRoomRequestSchema = z.object({
-  hostNickname: z.string().trim().min(1).max(24),
-});
-export type CreateRoomRequest = z.infer<typeof createRoomRequestSchema>;
+export const accountRoleSchema = z.enum(["host", "viewer"]);
 
-export const joinActiveRoomRequestSchema = z.object({
-  nickname: z.string().trim().min(1).max(24),
-  inviteToken: z.string().regex(/^[A-Za-z0-9_-]{32,128}$/),
-});
-export type JoinActiveRoomRequest = z.infer<typeof joinActiveRoomRequestSchema>;
+export const accountRoomEntrySchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("admin"),
+  }),
+  z.object({
+    state: z.literal("room"),
+    roomId: roomIdSchema,
+    memberId: participantIdSchema,
+    nickname: z.string(),
+    role: z.enum(["host", "member"]),
+    tookOver: z.boolean(),
+  }),
+  z.object({
+    state: z.literal("waiting"),
+    reason: z.enum(["no-room", "room-full", "left", "removed"]),
+    roomId: roomIdSchema.nullable(),
+    position: z.number().int().positive().nullable(),
+  }),
+  z.object({
+    state: z.literal("taken-over"),
+    roomId: roomIdSchema,
+    memberId: participantIdSchema,
+  }),
+]);
+export type AccountRoomEntry = z.infer<typeof accountRoomEntrySchema>;
 
 export const updateRoomRequestSchema = z
   .object({
@@ -176,7 +194,6 @@ export const activeRoomSummarySchema = z
   .object({
     id: roomIdSchema,
     createdAt: z.iso.datetime(),
-    inviteUrl: z.url(),
     memberCount: z.number().int().min(1).max(5),
     onlineCount: z.number().int().min(0).max(5),
     maxMembers: z.literal(5),

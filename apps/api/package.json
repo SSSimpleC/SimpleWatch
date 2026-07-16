@@ -7,7 +7,8 @@
     "dev": "node --watch --import tsx src/main.ts",
     "typecheck": "tsc --noEmit",
     "start": "node dist/main.js",
-    "admin:bootstrap": "node --import tsx src/cli/admin-bootstrap.ts",
+    "accounts:provision": "node --import tsx src/cli/admin-bootstrap.ts",
+    "accounts:manage": "node --import tsx src/cli/account-manage.ts",
     "openapi:generate": "node --import tsx src/cli/generate-openapi.ts",
     "openapi:check": "node --import tsx src/cli/generate-openapi.ts --check"
   },

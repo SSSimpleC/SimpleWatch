@@ -23,7 +23,6 @@ interface UploadProgress {
 
 export function AdminPage() {
   const { adminCsrf, setAdminCsrf, setRoomCsrf, setMemberId } = useSession();
-  const [code, setCode] = useState("");
   const [message, setMessage] = useState("");
   const [selectedMedia, setSelectedMedia] = useState<string[]>([]);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(
@@ -36,10 +35,19 @@ export function AdminPage() {
 
   useEffect(() => {
     if (adminCsrf) return;
-    void api<{ csrfToken: string }>("/api/v1/admin/session")
-      .then((session) => setAdminCsrf(session.csrfToken))
-      .catch(() => undefined);
-  }, [adminCsrf, setAdminCsrf]);
+    void api<{
+      account: { role: "host" | "viewer" };
+      csrfToken: string;
+    }>("/api/v1/auth/session")
+      .then((session) => {
+        if (session.account.role !== "host") {
+          void navigate("/", { replace: true });
+          return;
+        }
+        setAdminCsrf(session.csrfToken);
+      })
+      .catch(() => void navigate("/", { replace: true }));
+  }, [adminCsrf, navigate, setAdminCsrf]);
 
   const media = useQuery({
     queryKey: ["media"],
@@ -54,39 +62,22 @@ export function AdminPage() {
     refetchInterval: 2000,
   });
 
-  async function login(event: FormEvent) {
-    event.preventDefault();
-    try {
-      const result = await api<{ csrfToken: string }>("/api/v1/admin/login", {
-        method: "POST",
-        body: JSON.stringify({ code }),
-      });
-      setAdminCsrf(result.csrfToken);
-      setCode("");
-      setMessage("控制台已解锁");
-      await queryClient.invalidateQueries();
-    } catch (error) {
-      setMessage(error instanceof ApiError ? error.message : "登录失败");
-    }
-  }
-
   async function createRoom(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!adminCsrf) return;
-    const data = new FormData(event.currentTarget);
     try {
       const result = await api<{
-        room: { id: string; joinUrl: string };
+        room: { id: string };
         member: { id: string };
         csrfToken: string;
       }>("/api/v1/rooms", {
         method: "POST",
         headers: { "x-csrf-token": adminCsrf },
-        body: JSON.stringify({ hostNickname: data.get("nickname") }),
+        body: "{}",
       });
       setRoomCsrf(result.csrfToken);
       setMemberId(result.member.id);
-      setMessage("放映室已开放，可复制好友链接");
+      setMessage("放映室已开放，已登录好友会自动入场");
       await queryClient.invalidateQueries({ queryKey: ["admin-active-room"] });
     } catch (error) {
       setMessage(error instanceof ApiError ? error.message : "无法开启放映室");
@@ -97,17 +88,16 @@ export function AdminPage() {
     if (!adminCsrf || !activeRoom.data) return;
     try {
       const result = await api<{
-        room: { id: string };
-        member: { id: string };
-        csrfToken: string;
-      }>("/api/v1/admin/active-room/host-session", {
+        state: "room";
+        roomId: string;
+        memberId: string;
+      }>("/api/v1/room/takeover", {
         method: "POST",
-        headers: { "x-csrf-token": adminCsrf },
         body: "{}",
       });
-      setRoomCsrf(result.csrfToken);
-      setMemberId(result.member.id);
-      void navigate(`/room/${result.room.id}`);
+      setRoomCsrf(adminCsrf);
+      setMemberId(result.memberId);
+      void navigate(`/room/${result.roomId}`);
     } catch (error) {
       setMessage(
         error instanceof ApiError ? error.message : "无法进入主持房间",
@@ -311,35 +301,28 @@ export function AdminPage() {
     await queryClient.invalidateQueries({ queryKey: ["media"] });
   }
 
+  async function logout() {
+    if (!adminCsrf) return;
+    await api<void>("/api/v1/auth/logout", {
+      method: "POST",
+      headers: { "x-csrf-token": adminCsrf },
+      body: "{}",
+    });
+    useSession.getState().clear();
+    void navigate("/", { replace: true });
+  }
+
   if (!adminCsrf) {
     return (
       <main className="console-shell login-shell">
         <Link to="/" className="brand-mark">
           SW / 返回门厅
         </Link>
-        <form className="login-card" onSubmit={login}>
-          <p className="eyebrow">PROJECTIONIST ONLY</p>
-          <h1>放映员控制台</h1>
-          <label>
-            6 位放映口令
-            <input
-              type="password"
-              inputMode="numeric"
-              pattern="[0-9]{6}"
-              maxLength={6}
-              value={code}
-              onChange={(event) =>
-                setCode(event.target.value.replace(/\D/g, "").slice(0, 6))
-              }
-              autoComplete="current-password"
-              autoFocus
-            />
-          </label>
-          <button type="submit" disabled={code.length !== 6}>
-            解锁控制台
-          </button>
-          <output aria-live="polite">{message}</output>
-        </form>
+        <section className="login-card" aria-live="polite">
+          <p className="eyebrow">PROJECTIONIST SESSION</p>
+          <h1>正在验证 Host 账户</h1>
+          <p className="muted-copy">控制台不再接受独立六位口令。</p>
+        </section>
       </main>
     );
   }
@@ -363,9 +346,18 @@ export function AdminPage() {
           <span className="brand-mark">SIMPLEWATCH</span>
           <h1>放映控制</h1>
         </div>
-        <span className="status-pill">
-          <i /> SYSTEM READY
-        </span>
+        <div className="header-actions">
+          <span className="status-pill">
+            <i /> HOST VERIFIED
+          </span>
+          <button
+            type="button"
+            className="text-button"
+            onClick={() => void logout()}
+          >
+            退出账户
+          </button>
+        </div>
       </header>
       <div className="console-grid">
         <section className="panel room-panel">
@@ -401,19 +393,9 @@ export function AdminPage() {
                   <dd>{liveLabel(activeRoom.data.live.state)}</dd>
                 </div>
               </dl>
-              <div className="invite-copy">
-                <code>{activeRoom.data.inviteUrl}</code>
-                <button
-                  type="button"
-                  onClick={() =>
-                    void navigator.clipboard.writeText(
-                      activeRoom.data!.inviteUrl,
-                    )
-                  }
-                >
-                  复制好友链接
-                </button>
-              </div>
+              <p className="muted-copy">
+                固定账户会自动发现本房间，无需复制或更新好友链接。
+              </p>
               <div className="room-actions">
                 <button type="button" onClick={() => void enterHostRoom()}>
                   进入主持房间
@@ -430,17 +412,9 @@ export function AdminPage() {
           ) : (
             <form onSubmit={createRoom} className="stack-form">
               <p className="muted-copy">
-                系统同时只开放一间放映室。无需设置房间编号或好友口令。
+                系统同时只开放一间放映室。Host
+                固定为主持席；好友登录后会自动入场。
               </p>
-              <label>
-                主持人昵称
-                <input
-                  name="nickname"
-                  required
-                  maxLength={24}
-                  defaultValue="Host"
-                />
-              </label>
               <button type="submit">开启放映室 →</button>
             </form>
           )}

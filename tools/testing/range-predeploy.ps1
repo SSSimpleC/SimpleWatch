@@ -30,8 +30,8 @@ $env:HOST = '127.0.0.1'
 $env:PORT = '13900'
 $env:DATABASE_PATH = Join-Path $stateRoot 'simplewatch.sqlite3'
 $env:PUBLIC_ORIGIN = 'http://127.0.0.1:18080'
-$env:FRIEND_INVITE_TOKEN = 'predeploy-friend-invite-token-at-least-32-bytes'
 $env:SESSION_SECRET = 'predeploy-session-secret-at-least-32-bytes'
+$env:PASSWORD_PEPPER = 'predeploy-password-pepper-at-least-32-bytes'
 $env:CONTENT_SIGNING_SECRET = 'predeploy-content-secret-at-least-32-bytes'
 $env:INTERNAL_HOOK_TOKEN = 'predeploy-internal-token-at-least-32-bytes'
 $env:MEDIA_JWT_SECRET = 'predeploy-media-jwt-secret-at-least-32-bytes'
@@ -44,8 +44,7 @@ $env:UPLOAD_ROOT = $uploadRoot
 $env:INBOX_ROOT = $inboxRoot
 $env:SUBTITLE_ROOT = $subtitleRoot
 $env:TUS_ENDPOINT = 'http://127.0.0.1:18080/files/'
-$env:ALLOW_NONINTERACTIVE_BOOTSTRAP = 'true'
-$env:BOOTSTRAP_ADMIN_CODE = '260713'
+$env:ALLOW_ACCOUNT_PROVISION = 'fixed-account-replacement'
 $env:WORKER_ID = 'predeploy-worker'
 $env:API_ORIGIN = 'http://127.0.0.1:13900'
 $env:FFPROBE_PATH = $ffprobe
@@ -58,7 +57,15 @@ $workerProcess = $null
 $caddyProcess = $null
 $tusdProcess = $null
 try {
-  & $node $apiTsx apps/api/src/cli/admin-bootstrap-noninteractive.ts
+  $accounts = @(
+    @{ username = 'Host'; role = 'host'; password = 'range-host-password-24-characters' },
+    @{ username = 'Simple'; role = 'viewer'; password = 'range-viewer-password-24-chars' },
+    @{ username = 'FJ233'; role = 'viewer'; password = 'range-fj233-password-24-chars' },
+    @{ username = 'Conflict'; role = 'viewer'; password = 'range-conflict-password-24-chars' },
+    @{ username = 'Fpliy'; role = 'viewer'; password = 'range-fpliy-password-24-chars' },
+    @{ username = 'Lorrence'; role = 'viewer'; password = 'range-lorrence-password-24-chars' }
+  ) | ConvertTo-Json -Compress
+  $accounts | & $node $apiTsx apps/api/src/cli/admin-bootstrap.ts
   if ($LASTEXITCODE -ne 0) { throw '测试管理员初始化失败' }
 
   & $caddy validate --config infra/caddy/Caddyfile.predeploy --adapter caddyfile
@@ -83,7 +90,7 @@ try {
   if ($edgeHeaders.Headers['X-Frame-Options'] -ne 'DENY') { throw '边缘缺少 frame 拒绝策略' }
   if ($edgeHeaders.Headers['Content-Security-Policy'] -notmatch "default-src 'self'") { throw '边缘缺少 CSP' }
 
-  $login = Invoke-WebRequest -Method Post -Uri 'http://127.0.0.1:18080/api/v1/admin/login' -Headers @{ Origin = $env:PUBLIC_ORIGIN } -ContentType 'application/json' -Body '{"code":"260713"}'
+  $login = Invoke-WebRequest -Method Post -Uri 'http://127.0.0.1:18080/api/v1/auth/login' -Headers @{ Origin = $env:PUBLIC_ORIGIN } -ContentType 'application/json' -Body '{"username":"Host","password":"range-host-password-24-characters"}'
   $cookie = ($login.Headers['Set-Cookie'] -split ';')[0]
   $csrf = ($login.Content | ConvertFrom-Json).csrfToken
   if (-not $cookie -or -not $csrf) { throw '登录未返回会话或 CSRF' }

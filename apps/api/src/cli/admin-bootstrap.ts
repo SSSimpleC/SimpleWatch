@@ -1,72 +1,65 @@
 import { stdin, stdout } from "node:process";
-import { createInterface } from "node:readline/promises";
 
 import { parseAppConfig } from "@simplewatch/config";
 
 import { openDatabase } from "../database.js";
-import { AppError } from "../errors.js";
-import { AuthService } from "../services/auth-service.js";
+import {
+  AuthService,
+  type ProvisionedAccount,
+} from "../services/auth-service.js";
 
-if (!stdin.isTTY || !stdout.isTTY) {
-  console.error("admin-bootstrap 必须在 TTY 中运行");
-  process.exit(1);
+const expectedAccounts = new Map([
+  ["host", "host"],
+  ["simple", "viewer"],
+  ["fj233", "viewer"],
+  ["conflict", "viewer"],
+  ["fpliy", "viewer"],
+  ["lorrence", "viewer"],
+] as const);
+
+if (process.env.ALLOW_ACCOUNT_PROVISION !== "fixed-account-replacement") {
+  throw new Error("必须显式确认固定账户替换");
+}
+
+stdin.setEncoding("utf8");
+let input = "";
+for await (const chunk of stdin) input += chunk;
+const raw: unknown = JSON.parse(input);
+if (!Array.isArray(raw)) throw new Error("账户输入必须是JSON数组");
+const accounts = raw as ProvisionedAccount[];
+if (accounts.length !== expectedAccounts.size)
+  throw new Error("必须提供恰好六个固定账户");
+const seen = new Set<string>();
+for (const account of accounts) {
+  if (
+    !account ||
+    typeof account.username !== "string" ||
+    typeof account.password !== "string" ||
+    (account.role !== "host" && account.role !== "viewer")
+  ) {
+    throw new Error("账户结构无效");
+  }
+  const folded = account.username.trim().toLocaleLowerCase("en-US");
+  const expectedRole = expectedAccounts.get(
+    folded as "host" | "simple" | "fj233" | "conflict" | "fpliy" | "lorrence",
+  );
+  if (!expectedRole || account.role !== expectedRole || seen.has(folded)) {
+    throw new Error(`固定账户或角色不匹配：${account.username}`);
+  }
+  seen.add(folded);
 }
 
 const config = parseAppConfig(process.env);
 const database = openDatabase({ databasePath: config.databasePath });
-const readline = createInterface({ input: stdin, output: stdout });
-
 try {
-  const code = await readHidden("输入 6 位放映口令：");
-  const confirmation = await readHidden("再次输入放映口令：");
-  if (code !== confirmation) throw new Error("两次输入的口令不一致");
-
-  const admin = await new AuthService(database).configureAccessCode(code);
-  stdout.write(`放映员 ${admin.username} 的口令已更新，旧控制台会话已撤销。\n`);
-} catch (error) {
-  if (error instanceof AppError) {
-    console.error(error.message);
-    process.exitCode = 2;
-  } else {
-    console.error(error instanceof Error ? error.message : "初始化失败");
-    process.exitCode = 1;
-  }
+  const provisioned = await new AuthService(
+    database,
+    Date.now,
+    config.passwordPepper,
+  ).provisionAccounts(accounts);
+  stdout.write(
+    `${provisioned.map((account) => `${account.username}:${account.role}`).join("\n")}\n`,
+  );
 } finally {
-  readline.close();
   database.close();
-}
-
-async function readHidden(prompt: string): Promise<string> {
-  stdout.write(prompt);
-  stdin.setRawMode(true);
-  stdin.resume();
-  stdin.setEncoding("utf8");
-
-  return new Promise((resolve, reject) => {
-    let value = "";
-    const onData = (key: string) => {
-      if (key === "\u0003") {
-        cleanup();
-        reject(new Error("操作已取消"));
-        return;
-      }
-      if (key === "\r" || key === "\n") {
-        cleanup();
-        stdout.write("\n");
-        resolve(value);
-        return;
-      }
-      if (key === "\u007f" || key === "\b") {
-        value = value.slice(0, -1);
-        return;
-      }
-      value += key;
-    };
-    const cleanup = () => {
-      stdin.off("data", onData);
-      stdin.setRawMode(false);
-      stdin.pause();
-    };
-    stdin.on("data", onData);
-  });
 }

@@ -199,6 +199,151 @@ a {
   font-size: 0.67rem;
   letter-spacing: 0.1em;
 }
+.auth-stage {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.75fr);
+  align-items: center;
+  gap: clamp(3rem, 8vw, 9rem);
+  min-height: calc(100vh - 142px);
+  padding: 5vh 8vw 11vh;
+}
+.auth-intro h1 {
+  max-width: 820px;
+  margin: 1.3rem 0 2rem;
+  font-family: "Iowan Old Style", "Baskerville", serif;
+  font-size: clamp(3.3rem, 7vw, 7.2rem);
+  font-weight: 400;
+  letter-spacing: -0.055em;
+  line-height: 0.9;
+}
+.auth-intro h1 em {
+  color: var(--amber);
+  font-weight: 400;
+}
+.security-stamp {
+  padding: 0.45rem 0.65rem;
+  border: 1px solid #61ad7277;
+  color: #82c890;
+  font-size: 0.62rem;
+  letter-spacing: 0.13em;
+}
+.ticket-card {
+  position: relative;
+  display: grid;
+  gap: 1.1rem;
+  padding: clamp(1.6rem, 3vw, 2.7rem);
+  border: 1px solid #756c60;
+  border-left: 5px solid var(--amber);
+  background:
+    linear-gradient(135deg, #1b1814ee, #100f0ddd),
+    repeating-linear-gradient(0deg, transparent 0 26px, #ffffff05 27px);
+  box-shadow: 26px 28px 0 #08070688;
+  animation: ticket-enter 560ms cubic-bezier(0.22, 0.8, 0.2, 1) both;
+}
+.ticket-card::after {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  right: 1rem;
+  border-right: 1px dashed #ffffff22;
+}
+.ticket-number {
+  color: var(--amber);
+  font-size: 0.66rem;
+  letter-spacing: 0.15em;
+}
+.ticket-card h2 {
+  margin: 0.4rem 0 0.7rem;
+  font-family: "Iowan Old Style", "Baskerville", serif;
+  font-size: clamp(2.2rem, 4vw, 3.7rem);
+  font-weight: 400;
+  line-height: 1;
+}
+.ticket-card label {
+  display: grid;
+  gap: 0.55rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+}
+.ticket-card input {
+  width: calc(100% - 1.2rem);
+  border: 1px solid var(--line);
+  color: var(--paper);
+  background: #090806aa;
+  padding: 0.95rem 1rem;
+}
+.ticket-card output {
+  min-height: 1.4rem;
+  color: #e7907e;
+  line-height: 1.5;
+}
+.ticket-card small,
+.waiting-card p {
+  max-width: 36rem;
+  color: var(--muted);
+  line-height: 1.7;
+}
+.queue-number {
+  width: fit-content;
+  padding: 0.7rem 0.9rem;
+  border: 1px solid var(--line);
+  color: var(--amber);
+}
+.waiting-pulse {
+  width: 100%;
+  height: 2px;
+  overflow: hidden;
+  background: #ffffff12;
+}
+.waiting-pulse::after {
+  content: "";
+  display: block;
+  width: 38%;
+  height: 100%;
+  background: var(--amber);
+  animation: scan-seat 1.25s ease-in-out infinite alternate;
+}
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+@keyframes ticket-enter {
+  from {
+    opacity: 0;
+    transform: translateX(28px) rotate(0.8deg);
+  }
+}
+@keyframes scan-seat {
+  to {
+    transform: translateX(164%);
+  }
+}
+@media (max-width: 820px) {
+  .auth-stage {
+    grid-template-columns: 1fr;
+    align-items: start;
+    padding-top: 3rem;
+  }
+  .auth-intro h1 {
+    font-size: clamp(3rem, 14vw, 5.4rem);
+  }
+  .ticket-card {
+    box-shadow: 12px 14px 0 #08070688;
+  }
+  .security-stamp {
+    display: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ticket-card,
+  .waiting-pulse::after {
+    animation: none;
+  }
+}
 @keyframes enter {
   from {
     opacity: 0;

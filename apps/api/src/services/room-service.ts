@@ -1,10 +1,6 @@
-import { timingSafeEqual } from "node:crypto";
-
 import { v7 as uuidv7 } from "uuid";
 
 import type {
-  CreateRoomRequest,
-  JoinActiveRoomRequest,
   RoomCommandRequest,
   RoomSnapshot,
   TransportAnchor,
@@ -19,21 +15,8 @@ import {
   notFound,
   unauthorized,
 } from "../errors.js";
-import {
-  createOpaqueToken,
-  createSessionCredential,
-  hashPassword,
-  hashToken,
-  verifyTokenHash,
-} from "../security.js";
-
-interface RoomRow {
-  readonly id: string;
-  readonly password_hash: string;
-  readonly status: "active" | "closed";
-  readonly max_members: number;
-  readonly created_at: number;
-}
+import { createOpaqueToken, hashToken, verifyTokenHash } from "../security.js";
+import type { AccountSession } from "./auth-service.js";
 
 interface RoomSessionRow {
   readonly id_hash: string;
@@ -70,6 +53,8 @@ interface MemberRow {
 
 export interface RoomIdentity {
   readonly sessionHash: string;
+  readonly accountId: string;
+  readonly deviceId: string;
   readonly roomId: string;
   readonly memberId: string;
   readonly nickname: string;
@@ -78,43 +63,42 @@ export interface RoomIdentity {
   readonly expiresAt: number;
 }
 
-export interface RoomSessionResult {
-  readonly roomId: string;
-  readonly member: {
-    readonly id: string;
-    readonly nickname: string;
-    readonly role: "host" | "member";
-  };
-  readonly sessionToken: string;
-  readonly csrfToken: string;
-  readonly expiresAt: number;
-}
-
-export interface CreateRoomResult extends RoomSessionResult {
-  readonly joinUrl: string;
-}
+export type AccountRoomEntry =
+  | {
+      readonly state: "room";
+      readonly roomId: string;
+      readonly memberId: string;
+      readonly nickname: string;
+      readonly role: "host" | "member";
+      readonly tookOverSessionHash: string | null;
+    }
+  | {
+      readonly state: "waiting";
+      readonly reason: "no-room" | "room-full" | "left" | "removed";
+      readonly roomId: string | null;
+      readonly position: number | null;
+    }
+  | {
+      readonly state: "taken-over";
+      readonly roomId: string;
+      readonly memberId: string;
+    };
 
 export class RoomService {
   public constructor(
     private readonly database: AppDatabase,
-    private readonly publicOrigin: string,
-    private readonly friendInviteToken: string,
     private readonly now: () => number = Date.now,
   ) {}
 
-  public async createRoom(
-    adminId: string,
-    input: CreateRoomRequest,
+  public createAccountRoom(
+    session: AccountSession,
     livePath = createOpaqueToken(24),
-  ): Promise<CreateRoomResult> {
-    const nickname = normalizeNickname(input.hostNickname);
-    const passwordHash = await hashPassword(createOpaqueToken(32));
-    const credential = createSessionCredential();
+  ): AccountRoomEntry & { readonly state: "room" } {
+    if (session.role !== "host") throw forbidden("仅放映管理员可以创建房间");
     const roomId = uuidv7();
     const memberId = uuidv7();
     const timestamp = this.now();
-    const expiresAt = timestamp + 12 * 60 * 60 * 1000;
-
+    const passwordHash = "fixed-account-auth";
     try {
       this.database.transaction(() => {
         this.database
@@ -123,21 +107,22 @@ export class RoomService {
               id, password_hash, status, max_members, created_by, created_at, closed_at
             ) VALUES (?, ?, 'active', 5, ?, ?, NULL)`,
           )
-          .run(roomId, passwordHash, adminId, timestamp);
+          .run(roomId, passwordHash, session.account_id, timestamp);
         this.database
           .prepare(
             `INSERT INTO room_members(
               member_id, room_id, nickname, nickname_folded, role,
-              joined_at, last_seen_at, left_at, kicked_at
-            ) VALUES (?, ?, ?, ?, 'host', ?, ?, NULL, NULL)`,
+              joined_at, last_seen_at, left_at, kicked_at, account_id
+            ) VALUES (?, ?, ?, ?, 'host', ?, ?, NULL, NULL, ?)`,
           )
           .run(
             memberId,
             roomId,
-            nickname,
-            foldNickname(nickname),
+            session.username,
+            foldNickname(session.username),
             timestamp,
             timestamp,
+            session.account_id,
           );
         this.database
           .prepare(
@@ -147,15 +132,15 @@ export class RoomService {
             ) VALUES (?, 0, 'idle', NULL, ?, NULL, ?, ?)`,
           )
           .run(roomId, livePath, memberId, timestamp);
-        this.insertRoomSession(
-          credential.tokenHash,
-          roomId,
-          memberId,
-          nickname,
-          credential.csrfHash,
-          expiresAt,
-          timestamp,
-        );
+        this.database
+          .prepare(
+            `INSERT INTO room_device_leases(member_id, session_hash, device_id, acquired_at)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(memberId, session.id_hash, session.device_id, timestamp);
+        this.database
+          .prepare("DELETE FROM room_wait_queue WHERE account_id = ?")
+          .run(session.account_id);
       })();
     } catch (error) {
       if (error instanceof Error && error.message.includes("rooms.status")) {
@@ -163,35 +148,135 @@ export class RoomService {
       }
       throw error;
     }
-
     return {
+      state: "room",
       roomId,
-      joinUrl: `${this.publicOrigin}/join/${this.friendInviteToken}`,
-      member: { id: memberId, nickname, role: "host" },
-      sessionToken: credential.token,
-      csrfToken: credential.csrfToken,
-      expiresAt,
+      memberId,
+      nickname: session.username,
+      role: "host",
+      tookOverSessionHash: null,
     };
   }
 
-  public joinActiveRoom(input: JoinActiveRoomRequest): RoomSessionResult {
-    if (!safeEqual(input.inviteToken, this.friendInviteToken)) {
-      throw notFound("好友链接无效");
-    }
+  public enterAccountRoom(
+    session: AccountSession,
+    options: { readonly forceTakeover?: boolean } = {},
+  ): AccountRoomEntry {
     const room = this.database
       .prepare(
-        "SELECT id, password_hash, status, max_members, created_at FROM rooms WHERE status = 'active' LIMIT 1",
+        "SELECT id, max_members FROM rooms WHERE status = 'active' LIMIT 1",
       )
-      .get() as RoomRow | undefined;
-    if (!room) throw new AppError(410, "ROOM_CLOSED", "放映室尚未开放");
-    const roomId = room.id;
+      .get() as
+      | { readonly id: string; readonly max_members: number }
+      | undefined;
+    if (!room) return this.enqueueWaiting(session, "no-room", null);
 
-    const nickname = normalizeNickname(input.nickname);
-    const memberId = uuidv7();
-    const credential = createSessionCredential();
+    let previous = this.database
+      .prepare(
+        `SELECT member_id, role, left_at, kicked_at
+         FROM room_members WHERE room_id = ? AND account_id = ?
+         ORDER BY joined_at DESC LIMIT 1`,
+      )
+      .get(room.id, session.account_id) as
+      | {
+          readonly member_id: string;
+          readonly role: "host" | "member";
+          readonly left_at: number | null;
+          readonly kicked_at: number | null;
+        }
+      | undefined;
+    const waiting = this.database
+      .prepare(
+        "SELECT suppressed_room_id FROM room_wait_queue WHERE account_id = ?",
+      )
+      .get(session.account_id) as
+      | { readonly suppressed_room_id: string | null }
+      | undefined;
+    if (previous?.kicked_at) {
+      return this.enqueueWaiting(session, "removed", room.id, room.id);
+    }
+    if (previous?.left_at) {
+      if (waiting?.suppressed_room_id === room.id) {
+        return this.enqueueWaiting(session, "left", room.id, room.id);
+      }
+      previous = undefined;
+    }
+
     const timestamp = this.now();
-    const expiresAt = timestamp + 12 * 60 * 60 * 1000;
+    if (previous) {
+      const lease = this.database
+        .prepare(
+          "SELECT session_hash FROM room_device_leases WHERE member_id = ?",
+        )
+        .get(previous.member_id) as
+        | { readonly session_hash: string }
+        | undefined;
+      if (
+        lease &&
+        lease.session_hash !== session.id_hash &&
+        !options.forceTakeover
+      ) {
+        return {
+          state: "taken-over",
+          roomId: room.id,
+          memberId: previous.member_id,
+        };
+      }
+      this.database.transaction(() => {
+        this.database
+          .prepare(
+            `INSERT INTO room_device_leases(member_id, session_hash, device_id, acquired_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(member_id) DO UPDATE SET
+               session_hash = excluded.session_hash,
+               device_id = excluded.device_id,
+               acquired_at = excluded.acquired_at`,
+          )
+          .run(
+            previous.member_id,
+            session.id_hash,
+            session.device_id,
+            timestamp,
+          );
+        this.database
+          .prepare(
+            "UPDATE room_members SET last_seen_at = ? WHERE member_id = ?",
+          )
+          .run(timestamp, previous.member_id);
+        this.database
+          .prepare("DELETE FROM room_wait_queue WHERE account_id = ?")
+          .run(session.account_id);
+        if (lease && lease.session_hash !== session.id_hash) {
+          this.revokeMediaForTakeover(room.id, previous.member_id, timestamp);
+        }
+      })();
+      return {
+        state: "room",
+        roomId: room.id,
+        memberId: previous.member_id,
+        nickname: session.username,
+        role: previous.role,
+        tookOverSessionHash:
+          lease && lease.session_hash !== session.id_hash
+            ? lease.session_hash
+            : null,
+      };
+    }
 
+    if (session.role === "host") {
+      throw forbidden("Host 只能进入自己创建的活动房间");
+    }
+    const queueHead = this.database
+      .prepare(
+        `SELECT account_id FROM room_wait_queue
+         WHERE suppressed_room_id IS NULL
+         ORDER BY queued_at, account_id LIMIT 1`,
+      )
+      .get() as { readonly account_id: string } | undefined;
+    if (queueHead && queueHead.account_id !== session.account_id) {
+      return this.enqueueWaiting(session, "room-full", room.id);
+    }
+    const memberId = uuidv7();
     try {
       this.database.transaction(() => {
         const count = this.database
@@ -199,101 +284,95 @@ export class RoomService {
             `SELECT COUNT(*) AS count FROM room_members
              WHERE room_id = ? AND left_at IS NULL AND kicked_at IS NULL`,
           )
-          .get(roomId) as { readonly count: number };
+          .get(room.id) as { readonly count: number };
         if (count.count >= room.max_members) {
           throw new AppError(429, "ROOM_FULL", "房间人数已满");
         }
-
         this.database
           .prepare(
             `INSERT INTO room_members(
               member_id, room_id, nickname, nickname_folded, role,
-              joined_at, last_seen_at, left_at, kicked_at
-            ) VALUES (?, ?, ?, ?, 'member', ?, ?, NULL, NULL)`,
+              joined_at, last_seen_at, left_at, kicked_at, account_id
+            ) VALUES (?, ?, ?, ?, 'member', ?, ?, NULL, NULL, ?)`,
           )
           .run(
             memberId,
-            roomId,
-            nickname,
-            foldNickname(nickname),
+            room.id,
+            session.username,
+            foldNickname(session.username),
             timestamp,
             timestamp,
+            session.account_id,
           );
-        this.insertRoomSession(
-          credential.tokenHash,
-          roomId,
-          memberId,
-          nickname,
-          credential.csrfHash,
-          expiresAt,
-          timestamp,
-        );
+        this.database
+          .prepare(
+            `INSERT INTO room_device_leases(member_id, session_hash, device_id, acquired_at)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(memberId, session.id_hash, session.device_id, timestamp);
+        this.database
+          .prepare("DELETE FROM room_wait_queue WHERE account_id = ?")
+          .run(session.account_id);
       })();
     } catch (error) {
-      if (isSqliteConstraint(error)) {
-        throw conflict("NICKNAME_IN_USE", "该昵称已在房间中使用");
+      if (error instanceof AppError && error.code === "ROOM_FULL") {
+        return this.enqueueWaiting(session, "room-full", room.id);
       }
       throw error;
     }
-
     return {
-      roomId,
-      member: { id: memberId, nickname, role: "member" },
-      sessionToken: credential.token,
-      csrfToken: credential.csrfToken,
-      expiresAt,
+      state: "room",
+      roomId: room.id,
+      memberId,
+      nickname: session.username,
+      role: "member",
+      tookOverSessionHash: null,
     };
   }
 
-  public createActiveHostSession(adminId: string): CreateRoomResult {
-    const row = this.database
+  public getAccountRoomState(session: AccountSession): AccountRoomEntry {
+    return this.enterAccountRoom(session, { forceTakeover: false });
+  }
+
+  public releaseAccountSession(session: AccountSession): void {
+    const lease = this.database
       .prepare(
-        `SELECT r.id AS room_id, s.host_member_id, m.nickname
-         FROM rooms r
-         JOIN room_state s ON s.room_id = r.id
-         JOIN room_members m ON m.member_id = s.host_member_id
-         WHERE r.status = 'active' AND r.created_by = ?
-           AND m.left_at IS NULL AND m.kicked_at IS NULL
-         LIMIT 1`,
+        `SELECT l.member_id, m.room_id, m.role
+         FROM room_device_leases l
+         JOIN room_members m ON m.member_id = l.member_id
+         WHERE l.session_hash = ?`,
       )
-      .get(adminId) as
+      .get(session.id_hash) as
       | {
+          readonly member_id: string;
           readonly room_id: string;
-          readonly host_member_id: string;
-          readonly nickname: string;
+          readonly role: "host" | "member";
         }
       | undefined;
-    if (!row) throw notFound("当前没有可接管的活动房间");
-    const credential = createSessionCredential();
+    if (!lease) return;
     const timestamp = this.now();
-    const expiresAt = timestamp + 12 * 60 * 60 * 1000;
     this.database.transaction(() => {
       this.database
-        .prepare(
-          "UPDATE room_sessions SET revoked_at = ? WHERE member_id = ? AND revoked_at IS NULL",
-        )
-        .run(timestamp, row.host_member_id);
-      this.insertRoomSession(
-        credential.tokenHash,
-        row.room_id,
-        row.host_member_id,
-        row.nickname,
-        credential.csrfHash,
-        expiresAt,
-        timestamp,
-      );
-      this.database
-        .prepare("UPDATE room_members SET last_seen_at = ? WHERE member_id = ?")
-        .run(timestamp, row.host_member_id);
+        .prepare("DELETE FROM room_device_leases WHERE member_id = ?")
+        .run(lease.member_id);
+      if (lease.role === "member") {
+        this.database
+          .prepare(
+            "UPDATE room_members SET left_at = ?, last_seen_at = ? WHERE member_id = ?",
+          )
+          .run(timestamp, timestamp, lease.member_id);
+        this.revokeRealtimeAccess(
+          lease.room_id,
+          lease.member_id,
+          "account-logout",
+          timestamp,
+        );
+      }
     })();
-    return {
-      roomId: row.room_id,
-      joinUrl: `${this.publicOrigin}/join/${this.friendInviteToken}`,
-      member: { id: row.host_member_id, nickname: row.nickname, role: "host" },
-      sessionToken: credential.token,
-      csrfToken: credential.csrfToken,
-      expiresAt,
-    };
+  }
+
+  public takeoverAccountRoom(session: AccountSession): AccountRoomEntry {
+    return this.enterAccountRoom(session, { forceTakeover: true });
   }
 
   public getActiveRoomSummary(adminId: string) {
@@ -313,7 +392,6 @@ export class RoomService {
     return {
       id: room.id,
       createdAt: new Date(room.created_at).toISOString(),
-      inviteUrl: `${this.publicOrigin}/join/${this.friendInviteToken}`,
       memberCount: snapshot.members.length,
       onlineCount: snapshot.members.filter((member) => member.online).length,
       maxMembers: 5 as const,
@@ -340,24 +418,35 @@ export class RoomService {
     if (!sessionToken) throw unauthorized();
     const row = this.database
       .prepare(
-        `SELECT s.id_hash, s.room_id, s.member_id, s.nickname, s.csrf_hash, s.expires_at, m.role
-         FROM room_sessions s
-         JOIN room_members m ON m.member_id = s.member_id
-         JOIN rooms r ON r.id = s.room_id
-         WHERE s.id_hash = ?
-           AND s.revoked_at IS NULL
-           AND s.expires_at > ?
+        `SELECT s.id_hash, s.account_id, s.device_id, s.csrf_hash,
+                s.absolute_expires_at AS expires_at,
+                m.room_id, m.member_id, m.nickname, m.role
+         FROM account_sessions s
+         JOIN room_device_leases l ON l.session_hash = s.id_hash
+         JOIN room_members m ON m.member_id = l.member_id
+         JOIN rooms r ON r.id = m.room_id
+         JOIN accounts a ON a.id = s.account_id
+         WHERE s.id_hash = ? AND m.account_id = s.account_id
+           AND s.revoked_at IS NULL AND a.enabled = 1
+           AND s.idle_expires_at > ? AND s.absolute_expires_at > ?
            AND m.left_at IS NULL
            AND m.kicked_at IS NULL
            AND r.status = 'active'`,
       )
-      .get(hashToken(sessionToken), this.now()) as RoomSessionRow | undefined;
+      .get(hashToken(sessionToken), this.now(), this.now()) as
+      | (RoomSessionRow & {
+          readonly account_id: string;
+          readonly device_id: string;
+        })
+      | undefined;
     if (!row) throw unauthorized();
     if (expectedRoomId && row.room_id !== expectedRoomId)
       throw forbidden("房间会话不匹配");
 
     return {
       sessionHash: row.id_hash,
+      accountId: row.account_id,
+      deviceId: row.device_id,
       roomId: row.room_id,
       memberId: row.member_id,
       nickname: row.nickname,
@@ -380,7 +469,7 @@ export class RoomService {
     const csrfToken = createOpaqueToken();
     const result = this.database
       .prepare(
-        "UPDATE room_sessions SET csrf_hash = ? WHERE id_hash = ? AND revoked_at IS NULL",
+        "UPDATE account_sessions SET csrf_hash = ? WHERE id_hash = ? AND revoked_at IS NULL",
       )
       .run(hashToken(csrfToken), identity.sessionHash);
     if (result.changes !== 1) throw unauthorized();
@@ -511,13 +600,23 @@ export class RoomService {
     const now = this.now();
     this.database.transaction(() => {
       this.database
-        .prepare("UPDATE room_sessions SET revoked_at = ? WHERE id_hash = ?")
-        .run(now, identity.sessionHash);
-      this.database
         .prepare(
           "UPDATE room_members SET left_at = ?, last_seen_at = ? WHERE member_id = ?",
         )
         .run(now, now, identity.memberId);
+      this.database
+        .prepare("DELETE FROM room_device_leases WHERE member_id = ?")
+        .run(identity.memberId);
+      this.database
+        .prepare(
+          `INSERT INTO room_wait_queue(account_id, session_hash, queued_at, suppressed_room_id)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(account_id) DO UPDATE SET
+             session_hash = excluded.session_hash,
+             queued_at = excluded.queued_at,
+             suppressed_room_id = excluded.suppressed_room_id`,
+        )
+        .run(identity.accountId, identity.sessionHash, now, identity.roomId);
       this.revokeRealtimeAccess(
         identity.roomId,
         identity.memberId,
@@ -550,10 +649,41 @@ export class RoomService {
         .prepare("UPDATE room_members SET kicked_at = ? WHERE member_id = ?")
         .run(now, targetMemberId);
       this.database
-        .prepare(
-          "UPDATE room_sessions SET revoked_at = ? WHERE member_id = ? AND revoked_at IS NULL",
-        )
-        .run(now, targetMemberId);
+        .prepare("DELETE FROM room_device_leases WHERE member_id = ?")
+        .run(targetMemberId);
+      const targetAccount = this.database
+        .prepare("SELECT account_id FROM room_members WHERE member_id = ?")
+        .get(targetMemberId) as
+        | { readonly account_id: string | null }
+        | undefined;
+      if (targetAccount?.account_id) {
+        const currentSession = this.database
+          .prepare(
+            `SELECT id_hash FROM account_sessions
+             WHERE account_id = ? AND revoked_at IS NULL
+             ORDER BY last_seen_at DESC LIMIT 1`,
+          )
+          .get(targetAccount.account_id) as
+          | { readonly id_hash: string }
+          | undefined;
+        if (currentSession) {
+          this.database
+            .prepare(
+              `INSERT INTO room_wait_queue(account_id, session_hash, queued_at, suppressed_room_id)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(account_id) DO UPDATE SET
+                 session_hash = excluded.session_hash,
+                 queued_at = excluded.queued_at,
+                 suppressed_room_id = excluded.suppressed_room_id`,
+            )
+            .run(
+              targetAccount.account_id,
+              currentSession.id_hash,
+              now,
+              identity.roomId,
+            );
+        }
+      }
       this.revokeRealtimeAccess(
         identity.roomId,
         targetMemberId,
@@ -721,6 +851,13 @@ export class RoomService {
           .run(now, roomId);
         this.database
           .prepare(
+            `DELETE FROM room_device_leases
+             WHERE member_id IN (SELECT member_id FROM room_members WHERE room_id = ?)`,
+          )
+          .run(roomId);
+        this.database.prepare("DELETE FROM room_wait_queue").run();
+        this.database
+          .prepare(
             `UPDATE token_jti SET revoked_at = ?
              WHERE revoked_at IS NULL AND (
                room_id = ? OR subject_id IN (
@@ -794,6 +931,85 @@ export class RoomService {
     return updated;
   }
 
+  private enqueueWaiting(
+    session: AccountSession,
+    reason: "no-room" | "room-full" | "left" | "removed",
+    roomId: string | null,
+    suppressedRoomId: string | null = null,
+  ): AccountRoomEntry & { readonly state: "waiting" } {
+    const timestamp = this.now();
+    this.database
+      .prepare(
+        `INSERT INTO room_wait_queue(account_id, session_hash, queued_at, suppressed_room_id)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(account_id) DO UPDATE SET
+           session_hash = excluded.session_hash,
+           queued_at = CASE
+             WHEN room_wait_queue.suppressed_room_id IS excluded.suppressed_room_id
+               THEN room_wait_queue.queued_at
+             ELSE excluded.queued_at
+           END,
+           suppressed_room_id = excluded.suppressed_room_id`,
+      )
+      .run(session.account_id, session.id_hash, timestamp, suppressedRoomId);
+    const queued = this.database
+      .prepare(`SELECT queued_at FROM room_wait_queue WHERE account_id = ?`)
+      .get(session.account_id) as { readonly queued_at: number };
+    const rank = this.database
+      .prepare(
+        `SELECT COUNT(*) AS count FROM room_wait_queue
+         WHERE suppressed_room_id IS NULL
+           AND (queued_at < ? OR (queued_at = ? AND account_id <= ?))`,
+      )
+      .get(queued.queued_at, queued.queued_at, session.account_id) as {
+      readonly count: number;
+    };
+    return {
+      state: "waiting",
+      reason,
+      roomId,
+      position: suppressedRoomId ? null : rank.count,
+    };
+  }
+
+  private revokeMediaForTakeover(
+    roomId: string,
+    memberId: string,
+    timestamp: number,
+  ): void {
+    this.database
+      .prepare(
+        "UPDATE token_jti SET revoked_at = ? WHERE subject_id = ? AND revoked_at IS NULL",
+      )
+      .run(timestamp, memberId);
+    const sessionIds = this.database
+      .prepare(
+        `SELECT mediamtx_session_id FROM media_transport_sessions
+         WHERE member_id = ? AND closed_at IS NULL
+           AND mediamtx_session_id IS NOT NULL`,
+      )
+      .all(memberId)
+      .map(
+        (row) =>
+          (row as { readonly mediamtx_session_id: string }).mediamtx_session_id,
+      );
+    if (sessionIds.length === 0) return;
+    this.database
+      .prepare(
+        `INSERT INTO service_outbox(
+          id, kind, dedupe_key, payload_json, state, attempts,
+          not_before, lease_until, last_error, created_at, completed_at
+        ) VALUES (?, 'mediamtx.kick-sessions', ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL)`,
+      )
+      .run(
+        uuidv7(),
+        `mediamtx-takeover:${uuidv7()}`,
+        JSON.stringify({ roomId, memberId, sessionIds }),
+        timestamp,
+        timestamp,
+      );
+  }
+
   public touch(identity: RoomIdentity): void {
     this.database
       .prepare("UPDATE room_members SET last_seen_at = ? WHERE member_id = ?")
@@ -807,68 +1023,10 @@ export class RoomService {
     if (!state) throw notFound("房间状态不存在");
     return state;
   }
-
-  private insertRoomSession(
-    tokenHash: string,
-    roomId: string,
-    memberId: string,
-    nickname: string,
-    csrfHash: string,
-    expiresAt: number,
-    createdAt: number,
-  ): void {
-    this.database
-      .prepare(
-        `INSERT INTO room_sessions(
-          id_hash, room_id, member_id, nickname, csrf_hash, expires_at, revoked_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
-      )
-      .run(
-        tokenHash,
-        roomId,
-        memberId,
-        nickname,
-        csrfHash,
-        expiresAt,
-        createdAt,
-      );
-  }
-}
-
-function normalizeNickname(value: string): string {
-  const normalized = value.trim().normalize("NFC");
-  const length = [...normalized].length;
-  if (length < 1 || length > 24) {
-    throw new AppError(
-      400,
-      "INVALID_NICKNAME",
-      "昵称必须为 1–24 个 Unicode 字符",
-    );
-  }
-  return normalized;
 }
 
 function foldNickname(value: string): string {
   return value.normalize("NFC").toLocaleLowerCase();
-}
-
-function safeEqual(left: string, right: string): boolean {
-  const leftBytes = Buffer.from(left);
-  const rightBytes = Buffer.from(right);
-  return (
-    leftBytes.length === rightBytes.length &&
-    timingSafeEqual(leftBytes, rightBytes)
-  );
-}
-
-function isSqliteConstraint(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    typeof error.code === "string" &&
-    error.code.startsWith("SQLITE_CONSTRAINT")
-  );
 }
 
 function parseTransport(value: string | null): TransportAnchor | null {

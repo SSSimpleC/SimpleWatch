@@ -28,8 +28,8 @@ $env:HOST = "127.0.0.1"
 $env:PORT = "13900"
 $env:DATABASE_PATH = Join-Path $stateRoot "simplewatch.sqlite3"
 $env:PUBLIC_ORIGIN = "http://127.0.0.1:18080"
-$env:FRIEND_INVITE_TOKEN = "rtc-friend-invite-token-at-least-32-characters"
 $env:SESSION_SECRET = "rtc-predeploy-session-secret-at-least-32-bytes"
+$env:PASSWORD_PEPPER = "rtc-predeploy-password-pepper-at-least-32-bytes"
 $env:CONTENT_SIGNING_SECRET = "rtc-predeploy-content-secret-at-least-32-bytes"
 $env:INTERNAL_HOOK_TOKEN = "rtc-predeploy-internal-token-at-least-32-bytes"
 $env:MEDIA_JWT_SECRET = "rtc-predeploy-media-jwt-secret-at-least-32-bytes"
@@ -42,8 +42,7 @@ $env:UPLOAD_ROOT = $roots[1]
 $env:INBOX_ROOT = $roots[2]
 $env:SUBTITLE_ROOT = $roots[3]
 $env:TUS_ENDPOINT = "http://127.0.0.1:18080/files/"
-$env:ALLOW_NONINTERACTIVE_BOOTSTRAP = "true"
-$env:BOOTSTRAP_ADMIN_CODE = "260713"
+$env:ALLOW_ACCOUNT_PROVISION = "fixed-account-replacement"
 $env:WORKER_ID = "rtc-native-worker"
 $env:API_ORIGIN = "http://127.0.0.1:13900"
 $env:FFPROBE_PATH = "ffprobe"
@@ -56,7 +55,15 @@ $mtx = $null
 $lk = $null
 Push-Location $repoRoot
 try {
-  & $node $apiTsx apps/api/src/cli/admin-bootstrap-noninteractive.ts
+  $accounts = @(
+    @{ username = "Host"; role = "host"; password = "rtc-host-password-24-characters" },
+    @{ username = "Simple"; role = "viewer"; password = "rtc-viewer-password-24-chars" },
+    @{ username = "FJ233"; role = "viewer"; password = "rtc-fj233-password-24-chars" },
+    @{ username = "Conflict"; role = "viewer"; password = "rtc-conflict-password-24-chars" },
+    @{ username = "Fpliy"; role = "viewer"; password = "rtc-fpliy-password-24-chars" },
+    @{ username = "Lorrence"; role = "viewer"; password = "rtc-lorrence-password-24-chars" }
+  ) | ConvertTo-Json -Compress
+  $accounts | & $node $apiTsx apps/api/src/cli/admin-bootstrap.ts
   if ($LASTEXITCODE -ne 0) { throw "RTC 管理员初始化失败" }
   $api = Start-Process -FilePath $node -ArgumentList @($apiTsx, "apps/api/src/main.ts") -WorkingDirectory $repoRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $logRoot "api.out.log") -RedirectStandardError (Join-Path $logRoot "api.err.log")
   $mtx = Start-Process -FilePath $mediaMtx -ArgumentList "infra/mediamtx/mediamtx.native.yml" -WorkingDirectory $repoRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $logRoot "mediamtx.out.log") -RedirectStandardError (Join-Path $logRoot "mediamtx.err.log")
@@ -77,18 +84,18 @@ try {
   $worker = Start-Process -FilePath $node -ArgumentList @($workerTsx, "apps/worker/src/main.ts") -WorkingDirectory $repoRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $logRoot "worker.out.log") -RedirectStandardError (Join-Path $logRoot "worker.err.log")
 
   $origin = $env:PUBLIC_ORIGIN
-  $login = Invoke-WebRequest -Method Post -Uri "http://127.0.0.1:13900/api/v1/admin/login" -Headers @{ Origin = $origin } -ContentType "application/json" -Body '{"code":"260713"}'
+  $login = Invoke-WebRequest -Method Post -Uri "http://127.0.0.1:13900/api/v1/auth/login" -Headers @{ Origin = $origin } -ContentType "application/json" -Body '{"username":"Host","password":"rtc-host-password-24-characters"}'
   $adminCookie = ($login.Headers["Set-Cookie"] -split ";")[0]
   $adminCsrf = ($login.Content | ConvertFrom-Json).csrfToken
-  $room = Invoke-WebRequest -Method Post -Uri "http://127.0.0.1:13900/api/v1/rooms" -Headers @{ Origin = $origin; Cookie = $adminCookie; "X-CSRF-Token" = $adminCsrf } -ContentType "application/json" -Body '{"hostNickname":"RTC Host"}'
+  $room = Invoke-WebRequest -Method Post -Uri "http://127.0.0.1:13900/api/v1/rooms" -Headers @{ Origin = $origin; Cookie = $adminCookie; "X-CSRF-Token" = $adminCsrf } -ContentType "application/json" -Body '{}'
   $roomBody = $room.Content | ConvertFrom-Json
-  $roomCookie = ($room.Headers["Set-Cookie"] -split ";")[0]
+  $roomCookie = $adminCookie
   $roomId = $roomBody.room.id
   $roomCsrf = $roomBody.csrfToken
   $credentialHeaders = @{ Origin = $origin; Cookie = $roomCookie; "X-CSRF-Token" = $roomCsrf }
   $voice = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:13900/api/v1/rooms/$roomId/credentials" -Headers $credentialHeaders -ContentType "application/json" -Body '{"purpose":"voice"}'
   $whep = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:13900/api/v1/rooms/$roomId/credentials" -Headers $credentialHeaders -ContentType "application/json" -Body '{"purpose":"whep"}'
-  $publish = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:13900/api/v1/rooms/$roomId/live/publish-config" -Headers $credentialHeaders -ContentType "application/json" -Body "{}"
+  $publish = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:13900/api/v1/rooms/$roomId/live/publish-config" -Headers $credentialHeaders
   $authBody = @{ token = $whep.token; action = "read"; path = $whep.path; id = "native-smoke" } | ConvertTo-Json -Compress
   $authCode = & curl.exe -sS -o NUL -w "%{http_code}" -X POST "http://127.0.0.1:13900/api/v1/internal/mediamtx/auth" -H "Content-Type: application/json" --data-binary $authBody
   $badAuthBody = @{ token = $whep.token; action = "publish"; path = $whep.path } | ConvertTo-Json -Compress
@@ -100,7 +107,7 @@ try {
   $whepRejectedCode = & curl.exe -sS -o NUL -w "%{http_code}" -X POST $nativeWhepUrl -H "Authorization: Bearer invalid-token" -H "Content-Type: application/sdp" --data-binary $invalidOffer
   if ($whepAuthenticatedCode -eq "401" -or $whepRejectedCode -ne "401") { throw "真实 MediaMTX WHEP 鉴权链失败" }
 
-  $closeCode = & curl.exe -sS -o NUL -w "%{http_code}" -X PATCH "http://127.0.0.1:13900/api/v1/rooms/$roomId" -H "Origin: $origin" -H "Cookie: $adminCookie" -H "X-CSRF-Token: $adminCsrf" -H "Content-Type: application/json" --data-binary '{"close":true}'
+  $closeCode = & curl.exe -sS -o NUL -w "%{http_code}" -X PATCH "http://127.0.0.1:13900/api/v1/rooms/$roomId" -H "Origin: $origin" -H "Cookie: $adminCookie" -H "X-CSRF-Token: $roomCsrf" -H "Content-Type: application/json" --data-binary '{"close":true}'
   if ($closeCode -ne "200") { throw "RTC 鉴权样例房间关闭失败：HTTP $closeCode" }
 
   & pwsh -File tools/environment/run-dev.ps1 pnpm exec playwright test --config playwright.revocation.config.ts --workers=1

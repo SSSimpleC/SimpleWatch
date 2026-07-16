@@ -14,9 +14,9 @@ test("a kicked member is removed from real LiveKit and cannot reuse the token", 
   });
   const page = await memberBrowser.newPage();
   try {
-    const login = await hostApi.post("/api/v1/admin/login", {
+    const login = await hostApi.post("/api/v1/auth/login", {
       headers: { origin: browserOrigin },
-      data: { code: "260713" },
+      data: { username: "Host", password: "rtc-host-password-24-characters" },
     });
     expect(login.status()).toBe(200);
     const adminCsrf = (await login.json()) as { csrfToken: string };
@@ -28,27 +28,24 @@ test("a kicked member is removed from real LiveKit and cannot reuse the token", 
         "x-csrf-token": adminCsrf.csrfToken,
         cookie: adminCookie ?? "",
       },
-      data: {
-        hostNickname: "RTC Host",
-      },
+      data: {},
     });
     expect(created.status()).toBe(201);
     const room = (await created.json()) as {
       room: { id: string };
       csrfToken: string;
     };
-    const hostRoomCookie = created.headers()["set-cookie"]?.split(";", 1)[0];
-    expect(hostRoomCookie).toBeTruthy();
-    const joined = await memberApi.post("/api/v1/rooms/active/join", {
+    const hostRoomCookie = adminCookie;
+    const joined = await memberApi.post("/api/v1/auth/login", {
       headers: { origin: browserOrigin },
       data: {
-        nickname: "Kicked Member",
-        inviteToken: "rtc-friend-invite-token-at-least-32-characters",
+        username: "Simple",
+        password: "rtc-viewer-password-24-chars",
       },
     });
     expect(joined.status()).toBe(200);
     const member = (await joined.json()) as {
-      member: { id: string };
+      destination: { memberId: string };
       csrfToken: string;
     };
     const memberCookie = joined.headers()["set-cookie"]?.split(";", 1)[0];
@@ -88,7 +85,7 @@ test("a kicked member is removed from real LiveKit and cannot reuse the token", 
 
     // Act
     const kicked = await hostApi.post(
-      `/api/v1/rooms/${room.room.id}/members/${member.member.id}/kick`,
+      `/api/v1/rooms/${room.room.id}/members/${member.destination.memberId}/kick`,
       {
         headers: {
           origin: browserOrigin,
@@ -100,7 +97,7 @@ test("a kicked member is removed from real LiveKit and cannot reuse the token", 
     );
 
     // Assert
-    expect(kicked.status()).toBe(204);
+    expect(kicked.status()).toBe(200);
     await expect
       .poll(
         () =>

@@ -44,7 +44,7 @@ paths:
                   - status
                   - database
                 additionalProperties: false
-  /api/v1/admin/login:
+  /api/v1/auth/login:
     post:
       requestBody:
         required: true
@@ -53,11 +53,17 @@ paths:
             schema:
               type: object
               properties:
-                code:
+                username:
                   type: string
-                  pattern: ^\d{6}$
+                  minLength: 1
+                  maxLength: 64
+                password:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
               required:
-                - code
+                - username
+                - password
       responses:
         "200":
           description: Default Response
@@ -66,7 +72,7 @@ paths:
               schema:
                 type: object
                 properties:
-                  admin:
+                  account:
                     type: object
                     properties:
                       id:
@@ -75,40 +81,125 @@ paths:
                         pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
                       username:
                         type: string
+                      role:
+                        type: string
+                        enum:
+                          - host
+                          - viewer
                     required:
                       - id
                       - username
+                      - role
                     additionalProperties: false
                   csrfToken:
                     type: string
-                  expiresAt:
+                  idleExpiresAt:
                     type: string
                     format: date-time
                     pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  absoluteExpiresAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  destination:
+                    oneOf:
+                      - type: object
+                        properties:
+                          state:
+                            type: string
+                            enum:
+                              - admin
+                        required:
+                          - state
+                        additionalProperties: false
+                      - type: object
+                        properties:
+                          state:
+                            type: string
+                            enum:
+                              - room
+                          roomId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                          memberId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                          nickname:
+                            type: string
+                          role:
+                            type: string
+                            enum:
+                              - host
+                              - member
+                          tookOver:
+                            type: boolean
+                        required:
+                          - state
+                          - roomId
+                          - memberId
+                          - nickname
+                          - role
+                          - tookOver
+                        additionalProperties: false
+                      - type: object
+                        properties:
+                          state:
+                            type: string
+                            enum:
+                              - waiting
+                          reason:
+                            type: string
+                            enum:
+                              - no-room
+                              - room-full
+                              - left
+                              - removed
+                          roomId:
+                            nullable: true
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                          position:
+                            nullable: true
+                            type: integer
+                            exclusiveMinimum: true
+                            maximum: 9007199254740991
+                        required:
+                          - state
+                          - reason
+                          - roomId
+                          - position
+                        additionalProperties: false
+                      - type: object
+                        properties:
+                          state:
+                            type: string
+                            enum:
+                              - taken-over
+                          roomId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                          memberId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        required:
+                          - state
+                          - roomId
+                          - memberId
+                        additionalProperties: false
                 required:
-                  - admin
+                  - account
                   - csrfToken
-                  - expiresAt
+                  - idleExpiresAt
+                  - absoluteExpiresAt
+                  - destination
                 additionalProperties: false
-  /api/v1/rooms/{roomId}:
-    patch:
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                close:
-                  type: boolean
-      parameters:
-        - schema:
-            type: string
-            format: uuid
-            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
-          in: path
-          name: roomId
-          required: true
+  /api/v1/auth/session:
+    get:
       responses:
         "200":
           description: Default Response
@@ -117,48 +208,343 @@ paths:
               schema:
                 type: object
                 properties:
-                  id:
+                  account:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                      username:
+                        type: string
+                      role:
+                        type: string
+                        enum:
+                          - host
+                          - viewer
+                    required:
+                      - id
+                      - username
+                      - role
+                    additionalProperties: false
+                  csrfToken:
                     type: string
-                    format: uuid
-                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
-                  status:
+                  idleExpiresAt:
                     type: string
-                    enum:
-                      - active
-                      - closed
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  absoluteExpiresAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  destination:
+                    oneOf:
+                      - type: object
+                        properties:
+                          state:
+                            type: string
+                            enum:
+                              - admin
+                        required:
+                          - state
+                        additionalProperties: false
+                      - type: object
+                        properties:
+                          state:
+                            type: string
+                            enum:
+                              - room
+                          roomId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                          memberId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                          nickname:
+                            type: string
+                          role:
+                            type: string
+                            enum:
+                              - host
+                              - member
+                          tookOver:
+                            type: boolean
+                        required:
+                          - state
+                          - roomId
+                          - memberId
+                          - nickname
+                          - role
+                          - tookOver
+                        additionalProperties: false
+                      - type: object
+                        properties:
+                          state:
+                            type: string
+                            enum:
+                              - waiting
+                          reason:
+                            type: string
+                            enum:
+                              - no-room
+                              - room-full
+                              - left
+                              - removed
+                          roomId:
+                            nullable: true
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                          position:
+                            nullable: true
+                            type: integer
+                            exclusiveMinimum: true
+                            maximum: 9007199254740991
+                        required:
+                          - state
+                          - reason
+                          - roomId
+                          - position
+                        additionalProperties: false
+                      - type: object
+                        properties:
+                          state:
+                            type: string
+                            enum:
+                              - taken-over
+                          roomId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                          memberId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        required:
+                          - state
+                          - roomId
+                          - memberId
+                        additionalProperties: false
                 required:
-                  - id
-                  - status
+                  - account
+                  - csrfToken
+                  - idleExpiresAt
+                  - absoluteExpiresAt
+                  - destination
                 additionalProperties: false
-    delete:
-      parameters:
-        - schema:
-            type: string
-            format: uuid
-            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
-          in: path
-          name: roomId
-          required: true
+  /api/v1/auth/logout:
+    post:
+      responses:
+        "204":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: string
+                nullable: true
+                enum:
+                  - null
+  /api/v1/room/enter:
+    post:
       responses:
         "200":
           description: Default Response
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id:
-                    type: string
-                    format: uuid
-                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
-                  status:
-                    type: string
-                    enum:
-                      - closed
-                required:
-                  - id
-                  - status
-                additionalProperties: false
+                oneOf:
+                  - type: object
+                    properties:
+                      state:
+                        type: string
+                        enum:
+                          - admin
+                    required:
+                      - state
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      state:
+                        type: string
+                        enum:
+                          - room
+                      roomId:
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                      memberId:
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                      nickname:
+                        type: string
+                      role:
+                        type: string
+                        enum:
+                          - host
+                          - member
+                      tookOver:
+                        type: boolean
+                    required:
+                      - state
+                      - roomId
+                      - memberId
+                      - nickname
+                      - role
+                      - tookOver
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      state:
+                        type: string
+                        enum:
+                          - waiting
+                      reason:
+                        type: string
+                        enum:
+                          - no-room
+                          - room-full
+                          - left
+                          - removed
+                      roomId:
+                        nullable: true
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                      position:
+                        nullable: true
+                        type: integer
+                        exclusiveMinimum: true
+                        maximum: 9007199254740991
+                    required:
+                      - state
+                      - reason
+                      - roomId
+                      - position
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      state:
+                        type: string
+                        enum:
+                          - taken-over
+                      roomId:
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                      memberId:
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                    required:
+                      - state
+                      - roomId
+                      - memberId
+                    additionalProperties: false
+  /api/v1/room/takeover:
+    post:
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      state:
+                        type: string
+                        enum:
+                          - admin
+                    required:
+                      - state
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      state:
+                        type: string
+                        enum:
+                          - room
+                      roomId:
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                      memberId:
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                      nickname:
+                        type: string
+                      role:
+                        type: string
+                        enum:
+                          - host
+                          - member
+                      tookOver:
+                        type: boolean
+                    required:
+                      - state
+                      - roomId
+                      - memberId
+                      - nickname
+                      - role
+                      - tookOver
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      state:
+                        type: string
+                        enum:
+                          - waiting
+                      reason:
+                        type: string
+                        enum:
+                          - no-room
+                          - room-full
+                          - left
+                          - removed
+                      roomId:
+                        nullable: true
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                      position:
+                        nullable: true
+                        type: integer
+                        exclusiveMinimum: true
+                        maximum: 9007199254740991
+                    required:
+                      - state
+                      - reason
+                      - roomId
+                      - position
+                    additionalProperties: false
+                  - type: object
+                    properties:
+                      state:
+                        type: string
+                        enum:
+                          - taken-over
+                      roomId:
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                      memberId:
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                    required:
+                      - state
+                      - roomId
+                      - memberId
+                    additionalProperties: false
+  /api/v1/lobby/events:
+    get:
+      responses:
+        "200":
+          description: Default Response
   /api/v1/admin/active-room:
     get:
       responses:
@@ -178,9 +564,6 @@ paths:
                     type: string
                     format: date-time
                     pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
-                  inviteUrl:
-                    type: string
-                    format: uri
                   memberCount:
                     type: integer
                     minimum: 1
@@ -292,7 +675,6 @@ paths:
                 required:
                   - id
                   - createdAt
-                  - inviteUrl
                   - memberCount
                   - onlineCount
                   - maxMembers
@@ -322,10 +704,18 @@ paths:
                   - id
                   - status
                 additionalProperties: false
-  /api/v1/admin/active-room/host-session:
+  /api/v1/rooms:
     post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: {}
+              additionalProperties: false
       responses:
-        "200":
+        "201":
           description: Default Response
           content:
             application/json:
@@ -376,18 +766,75 @@ paths:
                   - csrfToken
                   - expiresAt
                 additionalProperties: false
-  /api/v1/admin/logout:
-    post:
+  /api/v1/rooms/{roomId}:
+    patch:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                close:
+                  type: boolean
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: roomId
+          required: true
       responses:
-        "204":
+        "200":
           description: Default Response
           content:
             application/json:
               schema:
-                type: string
-                nullable: true
-                enum:
-                  - null
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  status:
+                    type: string
+                    enum:
+                      - active
+                      - closed
+                required:
+                  - id
+                  - status
+                additionalProperties: false
+    delete:
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: roomId
+          required: true
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  status:
+                    type: string
+                    enum:
+                      - closed
+                required:
+                  - id
+                  - status
+                additionalProperties: false
   /api/v1/rooms/{roomId}/members/{memberId}/kick:
     post:
       requestBody:
@@ -544,216 +991,6 @@ paths:
                   - hostMemberId
                   - members
                   - serverNowMs
-                additionalProperties: false
-  /api/v1/rooms:
-    post:
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                hostNickname:
-                  type: string
-                  minLength: 1
-                  maxLength: 24
-              required:
-                - hostNickname
-      responses:
-        "201":
-          description: Default Response
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  room:
-                    type: object
-                    properties:
-                      id:
-                        type: string
-                        format: uuid
-                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
-                      joinUrl:
-                        type: string
-                        format: uri
-                    required:
-                      - id
-                    additionalProperties: false
-                  member:
-                    type: object
-                    properties:
-                      id:
-                        type: string
-                        format: uuid
-                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
-                      nickname:
-                        type: string
-                      role:
-                        type: string
-                        enum:
-                          - host
-                          - member
-                    required:
-                      - id
-                      - nickname
-                      - role
-                    additionalProperties: false
-                  csrfToken:
-                    type: string
-                  expiresAt:
-                    type: string
-                    format: date-time
-                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
-                required:
-                  - room
-                  - member
-                  - csrfToken
-                  - expiresAt
-                additionalProperties: false
-  /api/v1/admin/session:
-    get:
-      responses:
-        "200":
-          description: Default Response
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  admin:
-                    type: object
-                    properties:
-                      id:
-                        type: string
-                        format: uuid
-                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
-                      username:
-                        type: string
-                    required:
-                      - id
-                      - username
-                    additionalProperties: false
-                  csrfToken:
-                    type: string
-                  expiresAt:
-                    type: string
-                    format: date-time
-                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
-                required:
-                  - admin
-                  - csrfToken
-                  - expiresAt
-                additionalProperties: false
-  /api/v1/admin/obs-credentials/rotate:
-    post:
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                confirmation:
-                  type: string
-                  enum:
-                    - 重新生成OBS配置
-              required:
-                - confirmation
-      responses:
-        "200":
-          description: Default Response
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  url:
-                    type: string
-                    format: uri
-                  token:
-                    type: string
-                  path:
-                    type: string
-                  expiresAt:
-                    type: string
-                required:
-                  - url
-                  - token
-                  - path
-                  - expiresAt
-                additionalProperties: false
-  /api/v1/rooms/active/join:
-    post:
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                nickname:
-                  type: string
-                  minLength: 1
-                  maxLength: 24
-                inviteToken:
-                  type: string
-                  pattern: ^[A-Za-z0-9_-]{32,128}$
-              required:
-                - nickname
-                - inviteToken
-      responses:
-        "200":
-          description: Default Response
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  room:
-                    type: object
-                    properties:
-                      id:
-                        type: string
-                        format: uuid
-                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
-                      joinUrl:
-                        type: string
-                        format: uri
-                    required:
-                      - id
-                    additionalProperties: false
-                  member:
-                    type: object
-                    properties:
-                      id:
-                        type: string
-                        format: uuid
-                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
-                      nickname:
-                        type: string
-                      role:
-                        type: string
-                        enum:
-                          - host
-                          - member
-                    required:
-                      - id
-                      - nickname
-                      - role
-                    additionalProperties: false
-                  csrfToken:
-                    type: string
-                  expiresAt:
-                    type: string
-                    format: date-time
-                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
-                required:
-                  - room
-                  - member
-                  - csrfToken
-                  - expiresAt
                 additionalProperties: false
   /api/v1/rooms/{roomId}/bootstrap:
     get:
@@ -934,6 +1171,44 @@ paths:
                 nullable: true
                 enum:
                   - null
+  /api/v1/admin/obs-credentials/rotate:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                confirmation:
+                  type: string
+                  enum:
+                    - 重新生成OBS配置
+              required:
+                - confirmation
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url:
+                    type: string
+                    format: uri
+                  token:
+                    type: string
+                  path:
+                    type: string
+                  expiresAt:
+                    type: string
+                required:
+                  - url
+                  - token
+                  - path
+                  - expiresAt
+                additionalProperties: false
   /api/v1/time:
     get:
       responses:
@@ -960,6 +1235,66 @@ paths:
                   - sentAtMs
                   - origin
                 additionalProperties: false
+  /api/v1/admin/login:
+    get: &a1
+      responses:
+        "200":
+          description: Default Response
+    head: *a1
+    trace: *a1
+    delete: *a1
+    options: *a1
+    patch: *a1
+    put: *a1
+    post: *a1
+  /api/v1/admin/session:
+    get: &a2
+      responses:
+        "200":
+          description: Default Response
+    head: *a2
+    trace: *a2
+    delete: *a2
+    options: *a2
+    patch: *a2
+    put: *a2
+    post: *a2
+  /api/v1/admin/logout:
+    get: &a3
+      responses:
+        "200":
+          description: Default Response
+    head: *a3
+    trace: *a3
+    delete: *a3
+    options: *a3
+    patch: *a3
+    put: *a3
+    post: *a3
+  /api/v1/admin/active-room/host-session:
+    get: &a4
+      responses:
+        "200":
+          description: Default Response
+    head: *a4
+    trace: *a4
+    delete: *a4
+    options: *a4
+    patch: *a4
+    put: *a4
+    post: *a4
+  /api/v1/rooms/active/join:
+    get: &a5
+      responses:
+        "200":
+          description: Default Response
+    head: *a5
+    trace: *a5
+    delete: *a5
+    options: *a5
+    patch: *a5
+    put: *a5
+    post: *a5
   /api/v1/media:
     get:
       responses:
@@ -1253,7 +1588,7 @@ paths:
                   - subtitles
                 additionalProperties: false
   /api/v1/media/{mediaId}/content:
-    get: &a1
+    get: &a6
       parameters:
         - schema:
             type: string
@@ -1265,7 +1600,7 @@ paths:
       responses:
         "200":
           description: Default Response
-    head: *a1
+    head: *a6
   /api/v1/uploads/authorize:
     post:
       requestBody:

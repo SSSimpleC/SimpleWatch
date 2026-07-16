@@ -101,7 +101,6 @@ export interface LiveStatus {
 export interface ActiveRoomSummary {
   id: string;
   createdAt: string;
-  inviteUrl: string;
   memberCount: number;
   onlineCount: number;
   maxMembers: 5;
@@ -112,4 +111,30 @@ export interface ActiveRoomSummary {
     | { kind: "live"; title: string }
     | null;
   live: LiveStatus;
+}
+
+export type AccountDestination =
+  | { state: "admin" }
+  | {
+      state: "room";
+      roomId: string;
+      memberId: string;
+      nickname: string;
+      role: "host" | "member";
+      tookOver: boolean;
+    }
+  | {
+      state: "waiting";
+      reason: "no-room" | "room-full" | "left" | "removed";
+      roomId: string | null;
+      position: number | null;
+    }
+  | { state: "taken-over"; roomId: string; memberId: string };
+
+export interface AccountSession {
+  account: { id: string; username: string; role: "host" | "viewer" };
+  csrfToken: string;
+  idleExpiresAt: string;
+  absoluteExpiresAt: string;
+  destination: AccountDestination;
 }

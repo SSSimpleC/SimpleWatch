@@ -123,7 +123,7 @@ export function RoomPage() {
         clockOffsetMsRef.current = bootstrap.snapshot.serverNowMs - Date.now();
         setJoined(true);
       })
-      .catch(() => setError("房间会话已失效，请重新打开好友链接"));
+      .catch(() => setError("当前设备未持有观影席，请返回门厅重新接管"));
     return () => {
       active = false;
     };
@@ -887,6 +887,7 @@ export function RoomPage() {
     });
     closeLiveProgram();
     voiceRoomRef.current?.disconnect();
+    setMemberId(null);
     void navigate("/", { replace: true });
   }
 
@@ -947,7 +948,7 @@ export function RoomPage() {
           <p className="eyebrow">SESSION REQUIRED</p>
           <h1>这张入场券已经失效。</h1>
           <p className="muted-copy">
-            请重新打开好友发送的固定入场链接，只需输入昵称即可回来。
+            请返回门厅。若席位已在另一台设备使用，可以选择在本设备接管。
           </p>
           <output>{error}</output>
         </section>

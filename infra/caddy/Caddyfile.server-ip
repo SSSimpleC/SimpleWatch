@@ -32,14 +32,23 @@ https://8.134.239.34 {
 	tls /etc/caddy/ip-cert/current/fullchain.pem /etc/caddy/ip-cert/current/privkey.pem
 	header {
 		-Server
-		Content-Security-Policy "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' ws: wss:; media-src 'self' blob:; worker-src 'self'"
+		Content-Security-Policy "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; media-src 'self' blob:; worker-src 'self'"
 		Permissions-Policy "camera=(), microphone=(self), geolocation=(), payment=(), usb=()"
 		Referrer-Policy "no-referrer"
-		Strict-Transport-Security "max-age=86400"
+		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-origin"
+		X-Permitted-Cross-Domain-Policies "none"
 	}
 	route {
+		@public_health path /health/live /health/ready
+		handle @public_health {
+			header Content-Type "text/plain; charset=utf-8"
+			header Cache-Control "no-store"
+			respond "ready" 200
+		}
 		@media path /media-files/*
 		@media_bad_method {
 			path /media-files/*
@@ -82,6 +91,9 @@ https://8.134.239.34 {
 			file_server
 		}
 		handle {
+			request_body {
+				max_size 2MB
+			}
 			reverse_proxy app:3000
 		}
 	}

@@ -62,19 +62,14 @@ test("clock-skewed viewers converge after play, seek and a locally ignored seek"
   const early = await earlyContext.newPage();
   const late = await lateContext.newPage();
 
-  await host.goto("/admin");
-  await host.getByLabel("6 位放映口令").fill("260713");
-  await host.getByRole("button", { name: "解锁控制台" }).click();
+  await loginAccount(host, "Host", "range-host-password-24-characters");
   await ensureNoActiveRoom(host);
-  await host.getByLabel("主持人昵称").fill("Sync Host");
   await host.getByRole("button", { name: /开启放映室/ }).click();
-  const inviteUrl = await host.locator(".invite-copy code").textContent();
-  expect(inviteUrl).toBeTruthy();
   await host.getByRole("button", { name: "进入主持房间" }).click();
   await host.getByLabel("选择点播影片").selectOption({ label: "sync-60s.mp4" });
 
-  await joinViewer(early, inviteUrl!, "Early Clock");
-  await joinViewer(late, inviteUrl!, "Late Clock");
+  await joinViewer(early, "Simple", "range-viewer-password-24-chars");
+  await joinViewer(late, "FJ233", "range-fj233-password-24-chars");
   for (const page of [host, early, late]) await loadTestMedia(page);
   for (const page of [host, early, late])
     await page.getByRole("button", { name: "启用节目声音" }).click();
@@ -118,15 +113,11 @@ test("live mode automatically reveals stable OBS config and viewer display contr
   const viewerContext = await browser.newContext();
   const host = await hostContext.newPage();
   const viewer = await viewerContext.newPage();
-  await host.goto("/admin");
-  await host.getByLabel("6 位放映口令").fill("260713");
-  await host.getByRole("button", { name: "解锁控制台" }).click();
+  await loginAccount(host, "Host", "range-host-password-24-characters");
   await ensureNoActiveRoom(host);
-  await host.getByLabel("主持人昵称").fill("Live Host");
   await host.getByRole("button", { name: /开启放映室/ }).click();
-  const inviteUrl = await host.locator(".invite-copy code").textContent();
   await host.getByRole("button", { name: "进入主持房间" }).click();
-  await joinViewer(viewer, inviteUrl!, "Live Viewer");
+  await joinViewer(viewer, "Simple", "range-viewer-password-24-chars");
 
   await host.getByRole("button", { name: "切换直播" }).click();
   await expect(host.locator(".publish-config code")).toHaveCount(2);
@@ -173,20 +164,25 @@ async function loadTestMedia(page: Page) {
 }
 
 async function ensureNoActiveRoom(page: Page) {
-  const hostNickname = page.getByLabel("主持人昵称");
+  const createButton = page.getByRole("button", { name: /开启放映室/ });
   const closeButton = page.getByRole("button", { name: "强制关闭房间" });
-  await expect(hostNickname.or(closeButton)).toBeVisible();
-  if (await hostNickname.isVisible()) return;
+  await expect(createButton.or(closeButton)).toBeVisible();
+  if (await createButton.isVisible()) return;
   page.once("dialog", (dialog) => void dialog.accept());
   await closeButton.click();
-  await expect(hostNickname).toBeVisible();
+  await expect(createButton).toBeVisible();
 }
 
-async function joinViewer(page: Page, inviteUrl: string, nickname: string) {
-  await page.goto(inviteUrl);
-  await page.getByLabel("昵称").fill(nickname);
-  await page.getByRole("button", { name: "进入放映室" }).click();
+async function joinViewer(page: Page, username: string, password: string) {
+  await loginAccount(page, username, password);
   await expect(page.getByText("同场观众")).toBeVisible();
+}
+
+async function loginAccount(page: Page, username: string, password: string) {
+  await page.goto("/");
+  await page.getByLabel("账户名称").fill(username);
+  await page.getByLabel("账户密码").fill(password);
+  await page.getByRole("button", { name: /凭证入场/ }).click();
 }
 
 async function positions(pages: Page[]): Promise<number[]> {

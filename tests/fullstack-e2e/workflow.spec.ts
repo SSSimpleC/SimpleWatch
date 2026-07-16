@@ -1,12 +1,10 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
 test("real admin creates a room and a second browser joins read-only", async ({
   browser,
   page,
 }) => {
-  await page.goto("/admin");
-  await page.getByLabel("6 位放映口令").fill("260713");
-  await page.getByRole("button", { name: "解锁控制台" }).click();
+  await login(page, "Host", "range-host-password-24-characters");
   await expect(page.getByRole("heading", { name: "放映控制" })).toBeVisible();
 
   await page
@@ -23,10 +21,7 @@ test("real admin creates a room and a second browser joins read-only", async ({
     page.getByText(/字幕 predeploy.vtt 已进入处理队列/),
   ).toBeVisible();
 
-  await page.getByLabel("主持人昵称").fill("Predeploy Host");
   await page.getByRole("button", { name: /开启放映室/ }).click();
-  const inviteUrl = await page.locator(".invite-copy code").textContent();
-  expect(inviteUrl).toBeTruthy();
   await page.getByRole("button", { name: "进入主持房间" }).click();
   await expect(page.getByText("主持控制")).toBeVisible();
   await expect(page.getByText("同步在线")).toBeVisible();
@@ -40,9 +35,7 @@ test("real admin creates a room and a second browser joins read-only", async ({
   await expect(page.getByRole("button", { name: /播放|暂停/ })).toBeEnabled();
   const memberContext = await browser.newContext();
   const member = await memberContext.newPage();
-  await member.goto(inviteUrl!);
-  await member.getByLabel("昵称").fill("Second Browser");
-  await member.getByRole("button", { name: "进入放映室" }).click();
+  await login(member, "Simple", "range-viewer-password-24-chars");
   await expect(member.getByText("同场观众")).toBeVisible();
   await expect(
     member.getByRole("button", { name: /播放|暂停/ }),
@@ -62,7 +55,14 @@ test("real admin creates a room and a second browser joins read-only", async ({
     .click();
   await expect(member).toHaveURL("/");
   await expect(
-    member.getByRole("heading", { name: /让远方的人/ }),
+    member.getByRole("heading", { name: /本场席位已被移出/ }),
   ).toBeVisible();
   await memberContext.close();
 });
+
+async function login(page: Page, username: string, password: string) {
+  await page.goto("/");
+  await page.getByLabel("账户名称").fill(username);
+  await page.getByLabel("账户密码").fill(password);
+  await page.getByRole("button", { name: /凭证入场/ }).click();
+}

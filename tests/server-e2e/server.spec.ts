@@ -6,8 +6,10 @@ test("public server supports upload, room admission and two-party voice", async 
   browser,
   page,
 }) => {
-  const code = process.env.SIMPLEWATCH_ADMIN_CODE;
-  expect(code).toMatch(/^\d{6}$/);
+  const hostPassword = process.env.SIMPLEWATCH_HOST_PASSWORD;
+  const viewerPassword = process.env.SIMPLEWATCH_VIEWER_PASSWORD;
+  expect(hostPassword?.length).toBeGreaterThanOrEqual(20);
+  expect(viewerPassword?.length).toBeGreaterThanOrEqual(20);
 
   await page.route("**/admin", async (route) => {
     const response = await route.fetch();
@@ -16,14 +18,15 @@ test("public server supports upload, room admission and two-party voice", async 
     await route.fulfill({ response, headers });
   });
 
-  await page.goto("/admin");
-  await page.getByLabel("6 位放映口令").fill(code!);
+  await page.goto("/");
+  await page.getByLabel("账户名称").fill("Host");
+  await page.getByLabel("账户密码").fill(hostPassword!);
   const loginResponsePromise = page.waitForResponse(
     (response) =>
-      response.url().endsWith("/api/v1/admin/login") &&
+      response.url().endsWith("/api/v1/auth/login") &&
       response.request().method() === "POST",
   );
-  await page.getByRole("button", { name: "解锁控制台" }).click();
+  await page.getByRole("button", { name: /凭证入场/ }).click();
   let { csrfToken: adminCsrfToken } = (await (
     await loginResponsePromise
   ).json()) as { csrfToken: string };
@@ -46,7 +49,6 @@ test("public server supports upload, room admission and two-party voice", async 
     page.locator(".media-row").filter({ hasText: hevcName }),
   ).toContainText("H.265 · 终端相关");
 
-  await page.getByLabel("主持人昵称").fill("Server Host");
   const roomResponsePromise = page.waitForResponse(
     (response) =>
       response.url().endsWith("/api/v1/rooms") &&
@@ -59,11 +61,6 @@ test("public server supports upload, room admission and two-party voice", async 
     .id;
   let memberContext: BrowserContext | undefined;
   try {
-    const inviteUrl = await page.locator(".invite-copy code").textContent();
-    expect(inviteUrl).toBeTruthy();
-    expect(new URL(inviteUrl!).pathname).toMatch(
-      /^\/join\/[A-Za-z0-9_-]{32,}$/,
-    );
     await page.getByRole("button", { name: "进入主持房间" }).click();
     await expect(page.getByText("主持控制")).toBeVisible();
     await expect(page.getByText("同步在线")).toBeVisible({ timeout: 15_000 });
@@ -129,9 +126,10 @@ test("public server supports upload, room admission and two-party voice", async 
       .toBeGreaterThan(0);
     memberContext = await browser.newContext({ ignoreHTTPSErrors: false });
     const member = await memberContext.newPage();
-    await member.goto(inviteUrl!);
-    await member.getByLabel("昵称").fill("Server Member");
-    await member.getByRole("button", { name: "进入放映室" }).click();
+    await member.goto("/");
+    await member.getByLabel("账户名称").fill("Simple");
+    await member.getByLabel("账户密码").fill(viewerPassword!);
+    await member.getByRole("button", { name: /凭证入场/ }).click();
     await expect(member.getByText("同场观众")).toBeVisible();
     await expect(member.getByRole("button", { name: /播放|暂停/ })).toHaveCount(
       0,
@@ -178,18 +176,6 @@ test("public server supports upload, room admission and two-party voice", async 
     }
     const monitor = await page.context().newPage();
     await monitor.goto("/admin");
-    await monitor.getByLabel("6 位放映口令").fill(code!);
-    const monitorLoginPromise = monitor.waitForResponse(
-      (response) =>
-        response.url().endsWith("/api/v1/admin/login") &&
-        response.request().method() === "POST",
-    );
-    await monitor.getByRole("button", { name: "解锁控制台" }).click();
-    adminCsrfToken = (
-      (await (await monitorLoginPromise).json()) as {
-        csrfToken: string;
-      }
-    ).csrfToken;
     await expect(
       monitor.getByText("OBS 直播", { exact: true }).first(),
     ).toBeVisible();
@@ -214,6 +200,13 @@ test("public server supports upload, room admission and two-party voice", async 
   } finally {
     await stopWhipFromBrowser(page);
     await memberContext?.close();
+    adminCsrfToken = await page.evaluate(async (fallback) => {
+      const response = await fetch("/api/v1/auth/session", {
+        credentials: "same-origin",
+      });
+      if (!response.ok) return fallback;
+      return ((await response.json()) as { csrfToken: string }).csrfToken;
+    }, adminCsrfToken);
     await page.evaluate(
       async ({ roomId, csrfToken }) => {
         const response = await fetch(`/api/v1/rooms/${roomId}`, {
@@ -230,16 +223,20 @@ test("public server supports upload, room admission and two-party voice", async 
       },
       { roomId, csrfToken: adminCsrfToken },
     );
-    await cleanupMediaRows(page, code!, adminCsrfToken, [mediaName, hevcName]);
+    await cleanupMediaRows(page, hostPassword!, adminCsrfToken, [
+      mediaName,
+      hevcName,
+    ]);
   }
 });
 
 test("public upload reports speed and can be cancelled", async ({ page }) => {
-  const code = process.env.SIMPLEWATCH_ADMIN_CODE;
-  expect(code).toMatch(/^\d{6}$/);
-  await page.goto("/admin");
-  await page.getByLabel("6 位放映口令").fill(code!);
-  await page.getByRole("button", { name: "解锁控制台" }).click();
+  const hostPassword = process.env.SIMPLEWATCH_HOST_PASSWORD;
+  expect(hostPassword?.length).toBeGreaterThanOrEqual(20);
+  await page.goto("/");
+  await page.getByLabel("账户名称").fill("Host");
+  await page.getByLabel("账户密码").fill(hostPassword!);
+  await page.getByRole("button", { name: /凭证入场/ }).click();
   await expect(
     page.getByRole("heading", { name: "放映控制", exact: true }),
   ).toBeVisible();
@@ -278,21 +275,22 @@ async function uploadMp4(page: Page, name: string, path: string) {
 
 async function cleanupMediaRows(
   page: Page,
-  code: string,
+  password: string,
   initialCsrfToken: string,
   names: string[],
 ) {
   await page.goto("/admin");
-  const login = page.getByLabel("6 位放映口令");
+  const login = page.getByLabel("账户密码");
   let csrfToken = initialCsrfToken;
   if (await login.isVisible()) {
-    await login.fill(code);
+    await page.getByLabel("账户名称").fill("Host");
+    await login.fill(password);
     const loginResponsePromise = page.waitForResponse(
       (response) =>
-        response.url().endsWith("/api/v1/admin/login") &&
+        response.url().endsWith("/api/v1/auth/login") &&
         response.request().method() === "POST",
     );
-    await page.getByRole("button", { name: "解锁控制台" }).click();
+    await page.getByRole("button", { name: /凭证入场/ }).click();
     csrfToken = (
       (await (await loginResponsePromise).json()) as { csrfToken: string }
     ).csrfToken;
@@ -300,6 +298,13 @@ async function cleanupMediaRows(
   await expect(
     page.getByRole("heading", { name: "放映控制", exact: true }),
   ).toBeVisible();
+  csrfToken = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/auth/session", {
+      credentials: "same-origin",
+    });
+    if (!response.ok) throw new Error(`恢复Host会话失败：${response.status}`);
+    return ((await response.json()) as { csrfToken: string }).csrfToken;
+  });
   await page.evaluate(
     async ({ names, csrfToken }) => {
       const list = async () => {

@@ -6,7 +6,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { join, resolve } from "node:path";
 
 import { v7 as uuidv7 } from "uuid";
@@ -17,11 +17,13 @@ import type { RawData, WebSocket } from "ws";
 import { buildApp, type BuiltApp } from "../src/app.js";
 import { openDatabase } from "../src/database.js";
 import { clearLibraryData } from "../src/services/library-reset-service.js";
+import { hashPassword } from "../src/security.js";
 
 const origin = "https://watch.example.test";
 const fixedNow = 1_750_000_000_000;
 const internalToken = "test-internal-service-token-32-bytes";
-const friendInviteToken = "long-fixed-friend-invite-token-32-characters";
+const hostPassword = "host-test-password-24-characters";
+const viewerPassword = "viewer-test-password-24-chars";
 const temporaryRoots: string[] = [];
 let built: BuiltApp;
 let testRoot: string;
@@ -37,7 +39,6 @@ beforeEach(async () => {
     databasePath: join(testRoot, "simplewatch.sqlite3"),
     migrationsPath: resolve("migrations"),
     publicOrigin: origin,
-    friendInviteToken,
     mediaRoot: join(testRoot, "media"),
     uploadRoot: join(testRoot, "uploads"),
     inboxRoot: join(testRoot, "inbox"),
@@ -47,8 +48,9 @@ beforeEach(async () => {
     contentSigningSecret: "test-content-signing-secret-32-bytes",
     internalHookToken: internalToken,
     now: () => currentNow,
+    authFailureDelay: () => Promise.resolve(),
   });
-  await built.authService.bootstrapAdmin("admin", "260713");
+  await built.authService.bootstrapAdmin("Host", hostPassword);
 });
 
 afterEach(async () => {
@@ -730,23 +732,18 @@ describe("SimpleWatch API", () => {
         origin,
         "x-csrf-token": admin.csrfToken,
       },
-      payload: {
-        hostNickname: "主持人",
-      },
+      payload: {},
     });
 
     expect(created.statusCode).toBe(201);
     const createdBody = created.json<{
-      room: { id: string; joinUrl: string };
+      room: { id: string };
       member: { role: string };
       csrfToken: string;
     }>();
-    expect(createdBody).toMatchObject({
-      room: { joinUrl: `${origin}/join/${friendInviteToken}` },
-      member: { role: "host" },
-    });
+    expect(createdBody).toMatchObject({ member: { role: "host" } });
 
-    const roomCookie = readCookie(created, "sw_room");
+    const roomCookie = admin.cookie;
     const bootstrap = await built.app.inject({
       method: "GET",
       url: `/api/v1/rooms/${createdBody.room.id}/bootstrap`,
@@ -773,16 +770,25 @@ describe("SimpleWatch API", () => {
     expect(staleCsrfLeave.statusCode).toBe(401);
   });
 
-  it("enforces room capacity and active nickname uniqueness", async () => {
+  it("enforces five account seats and lets a new device take over one account", async () => {
     await createRoom();
     const firstJoin = await joinRoom("Alice");
     expect(firstJoin.statusCode).toBe(200);
+    const firstCookie = readCookie(firstJoin, "__Host-sw_session");
+    const firstMember = firstJoin.json<{ member: { id: string } }>().member.id;
 
     const duplicate = await joinRoom("alice");
-    expect(duplicate.statusCode).toBe(409);
+    expect(duplicate.statusCode).toBe(200);
     expect(duplicate.json()).toMatchObject({
-      error: { code: "NICKNAME_IN_USE" },
+      tookOver: true,
+      member: { id: firstMember },
     });
+    const oldDevice = await built.app.inject({
+      method: "GET",
+      url: `/api/v1/rooms/${firstJoin.json<{ room: { id: string } }>().room.id}/bootstrap`,
+      headers: { cookie: firstCookie },
+    });
+    expect(oldDevice.statusCode).toBe(401);
 
     await joinRoom("Bob");
     await joinRoom("Carol");
@@ -987,7 +993,7 @@ describe("SimpleWatch API", () => {
       member: { id: string };
       csrfToken: string;
     }>();
-    const joinedCookie = readCookie(joined, "sw_room");
+    const joinedCookie = readCookie(joined, "__Host-sw_session");
     const mediaCredential = await built.app.inject({
       method: "POST",
       url: `/api/v1/rooms/${room.roomId}/credentials`,
@@ -1157,19 +1163,18 @@ describe("SimpleWatch API", () => {
         origin,
         "x-csrf-token": admin.csrfToken,
       },
-      payload: {
-        hostNickname: "Host",
-      },
+      payload: {},
     });
     const roomId = created.json<{ room: { id: string } }>().room.id;
-    const roomCookie = readCookie(created, "sw_room");
+    const roomCsrf = created.json<{ csrfToken: string }>().csrfToken;
+    const roomCookie = admin.cookie;
     const closed = await built.app.inject({
       method: "PATCH",
       url: `/api/v1/rooms/${roomId}`,
       headers: {
         cookie: admin.cookie,
         origin,
-        "x-csrf-token": admin.csrfToken,
+        "x-csrf-token": roomCsrf,
       },
       payload: { close: true },
     });
@@ -1194,11 +1199,12 @@ describe("SimpleWatch API", () => {
         origin,
         "x-csrf-token": admin.csrfToken,
       },
-      payload: { hostNickname: "Console Host" },
+      payload: {},
     });
     const roomId = created.json<{ room: { id: string } }>().room.id;
+    const roomCsrf = created.json<{ csrfToken: string }>().csrfToken;
     const member = await joinRoom("Friend");
-    const memberCookie = readCookie(member, "sw_room");
+    const memberCookie = readCookie(member, "__Host-sw_session");
 
     const summary = await built.app.inject({
       method: "GET",
@@ -1208,10 +1214,9 @@ describe("SimpleWatch API", () => {
     expect(summary.statusCode).toBe(200);
     expect(summary.json()).toMatchObject({
       id: roomId,
-      inviteUrl: `${origin}/join/${friendInviteToken}`,
       memberCount: 2,
       maxMembers: 5,
-      host: { nickname: "Console Host" },
+      host: { nickname: "Host" },
       mode: "idle",
       content: null,
       live: { state: "offline" },
@@ -1219,16 +1224,16 @@ describe("SimpleWatch API", () => {
 
     const hostSession = await built.app.inject({
       method: "POST",
-      url: "/api/v1/admin/active-room/host-session",
+      url: "/api/v1/room/takeover",
       headers: {
         cookie: admin.cookie,
         origin,
-        "x-csrf-token": admin.csrfToken,
+        "x-csrf-token": roomCsrf,
       },
       payload: {},
     });
     expect(hostSession.statusCode).toBe(200);
-    const reentryCookie = readCookie(hostSession, "sw_room");
+    const reentryCookie = admin.cookie;
 
     const closed = await built.app.inject({
       method: "DELETE",
@@ -1236,7 +1241,7 @@ describe("SimpleWatch API", () => {
       headers: {
         cookie: admin.cookie,
         origin,
-        "x-csrf-token": admin.csrfToken,
+        "x-csrf-token": roomCsrf,
       },
     });
     expect(closed.statusCode).toBe(200);
@@ -1316,7 +1321,7 @@ describe("SimpleWatch API", () => {
     );
   });
 
-  it("uses one fixed unguessable friend link and rejects invalid invite tokens", async () => {
+  it("retires the legacy friend-link endpoint and uses fixed accounts", async () => {
     const room = await createRoom();
     expect(room.roomId).toBeTruthy();
     const invalid = await built.app.inject({
@@ -1328,7 +1333,7 @@ describe("SimpleWatch API", () => {
         inviteToken: "invalid-friend-token-with-32-characters",
       },
     });
-    expect(invalid.statusCode).toBe(404);
+    expect(invalid.statusCode).toBe(410);
 
     const valid = await joinRoom("Valid Friend");
     expect(valid.statusCode).toBe(200);
@@ -1454,13 +1459,13 @@ describe("SimpleWatch API", () => {
 async function loginAdmin(): Promise<{ cookie: string; csrfToken: string }> {
   const response = await built.app.inject({
     method: "POST",
-    url: "/api/v1/admin/login",
+    url: "/api/v1/auth/login",
     headers: { origin },
-    payload: { code: "260713" },
+    payload: { username: "Host", password: hostPassword },
   });
   expect(response.statusCode).toBe(200);
   return {
-    cookie: readCookie(response, "sw_admin"),
+    cookie: readCookie(response, "__Host-sw_session"),
     csrfToken: response.json<{ csrfToken: string }>().csrfToken,
   };
 }
@@ -1471,14 +1476,12 @@ async function createRoom(): Promise<{ roomId: string; roomCookie: string }> {
     method: "POST",
     url: "/api/v1/rooms",
     headers: { cookie: admin.cookie, origin, "x-csrf-token": admin.csrfToken },
-    payload: {
-      hostNickname: "Host",
-    },
+    payload: {},
   });
   expect(response.statusCode).toBe(201);
   return {
     roomId: response.json<{ room: { id: string } }>().room.id,
-    roomCookie: readCookie(response, "sw_room"),
+    roomCookie: admin.cookie,
   };
 }
 
@@ -1514,13 +1517,65 @@ function insertPublishedMedia(storageKey: string, durationMs: number): string {
   return mediaId;
 }
 
-function joinRoom(nickname: string) {
-  return built.app.inject({
+async function joinRoom(nickname: string) {
+  const folded = nickname.normalize("NFC").toLocaleLowerCase("en-US");
+  let account = built.database
+    .prepare("SELECT id FROM accounts WHERE username_folded = ?")
+    .get(folded) as { id: string } | undefined;
+  if (!account) {
+    account = { id: uuidv7() };
+    const passwordHash = await hashPassword(
+      createHmac("sha256", "test-password-pepper-not-for-production")
+        .update(viewerPassword)
+        .digest("base64url"),
+    );
+    built.database
+      .prepare(
+        `INSERT INTO accounts(
+          id, username, username_folded, role, password_hash, enabled,
+          created_at, password_changed_at
+        ) VALUES (?, ?, ?, 'viewer', ?, 1, ?, ?)`,
+      )
+      .run(account.id, nickname, folded, passwordHash, fixedNow, fixedNow);
+  }
+  const login = await built.app.inject({
     method: "POST",
-    url: "/api/v1/rooms/active/join",
+    url: "/api/v1/auth/login",
     headers: { origin },
-    payload: { nickname, inviteToken: friendInviteToken },
+    payload: { username: nickname, password: viewerPassword },
   });
+  const loginBody = login.json<{
+    csrfToken: string;
+    destination: {
+      state: string;
+      roomId?: string;
+      memberId?: string;
+      tookOver?: boolean;
+      reason?: string;
+    };
+  }>();
+  const csrfToken = loginBody.csrfToken;
+  const entry = loginBody.destination as {
+    state: string;
+    roomId?: string;
+    memberId?: string;
+    tookOver?: boolean;
+    reason?: string;
+  };
+  const full = entry.state === "waiting" && entry.reason === "room-full";
+  return {
+    statusCode: full ? 429 : login.statusCode,
+    headers: login.headers,
+    json<T = unknown>(): T {
+      if (full) return { error: { code: "ROOM_FULL" } } as T;
+      return {
+        ...entry,
+        room: { id: entry.roomId },
+        member: { id: entry.memberId },
+        csrfToken,
+      } as T;
+    },
+  };
 }
 
 function compatibleH264Probe() {

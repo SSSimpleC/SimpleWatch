@@ -28,7 +28,10 @@ tools/environment/run-dev pnpm release:manifest
 
 Edge Agent 必须在云端 App/Worker 与010–012加法迁移通过上述回归后发布：
 
-1. 在云端通过 `edge-agent-manage.mjs` 登记机器身份；令牌只允许经标准输入直接
+1. 在云端通过 `edge-agent-manage.mjs` 登记机器身份；生产 App 容器移除了全部
+   Linux capabilities，且 `/state` 为 `0750 node:node`，所以该要求 UID 0 的维护
+   CLI 应通过一次性的 `docker exec --privileged --user 0:0` 运行，不能修改数据库
+   目录权限，也不能把长期特权加入 Compose。令牌只允许经标准输入直接
    管道到家庭服务器的 `install-edge-agent-token.sh`，不得显示、落盘到项目或
    出现在命令行参数中。
 2. 本地构建 `dist/edge-agent/main.mjs`，生成 SHA-256，并与不可变发布标签一并

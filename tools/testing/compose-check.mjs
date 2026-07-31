@@ -5,6 +5,8 @@ import YAML from "yaml";
 
 const pinnedNodeImage =
   "docker.m.daocloud.io/library/node@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d";
+const pinnedEdgeNodeImage =
+  "docker.1ms.run/library/node@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d";
 const files = [
   "infra/compose/compose.local.yaml",
   "infra/compose/compose.server-ip.yaml",
@@ -180,6 +182,9 @@ if (
 ) {
   throw new Error("edge-agent镜像必须绑定发布标签与构建产物SHA-256");
 }
+if (edgeAgent.build?.args?.NODE_IMAGE !== pinnedEdgeNodeImage) {
+  throw new Error("Edge Agent Compose未固定经家庭网络验证的Node基础镜像digest");
+}
 
 const app = server.services.app;
 const worker = server.services.worker;
@@ -232,7 +237,7 @@ const edgeDockerfile = readFileSync(
 if (!dockerfile.includes(`ARG NODE_IMAGE=${pinnedNodeImage}`)) {
   throw new Error("Dockerfile未固定Node基础镜像digest");
 }
-if (!edgeDockerfile.includes(`ARG NODE_IMAGE=${pinnedNodeImage}`)) {
+if (!edgeDockerfile.includes(`ARG NODE_IMAGE=${pinnedEdgeNodeImage}`)) {
   throw new Error("Edge Agent Dockerfile未固定Node基础镜像digest");
 }
 if (edgeDockerfile.includes("ffmpeg") || edgeDockerfile.includes("apt-get")) {

@@ -74,6 +74,19 @@ interface JobRow {
   readonly attempts: number;
 }
 
+interface WorkerHeartbeatRow {
+  readonly worker_id: string;
+  readonly status: "idle" | "busy" | "degraded";
+  readonly current_job_id: string | null;
+  readonly last_error: string | null;
+  readonly started_at: number;
+  readonly last_seen_at: number;
+}
+
+const JOB_LEASE_MILLISECONDS = 60_000;
+const WORKER_FRESHNESS_MILLISECONDS = 60_000;
+const MAX_JOB_ATTEMPTS = 5;
+
 export interface MediaServiceOptions {
   readonly mediaRoot: string;
   readonly uploadRoot: string;
@@ -409,10 +422,13 @@ export class MediaService {
       this.database
         .prepare(
           `UPDATE media_jobs SET state = 'completed', lease_until = NULL,
-             lease_token_hash = NULL, progress_json = ?, updated_at = ? WHERE id = ?`,
+             lease_token_hash = NULL, worker_id = NULL, progress_json = ?,
+             error_code = NULL, error_message = NULL, finished_at = ?,
+             updated_at = ? WHERE id = ?`,
         )
         .run(
           JSON.stringify({ sha256: result.sha256, bytes: result.bytes }),
+          now,
           now,
           jobId,
         );
@@ -708,24 +724,45 @@ export class MediaService {
     const leaseToken = createOpaqueToken();
     let claimed: JobRow | undefined;
     this.database.transaction(() => {
+      this.database
+        .prepare(
+          `UPDATE media_jobs
+           SET state = 'pending', attempts = 0, not_before = ?,
+               lease_until = NULL, worker_id = NULL, lease_token_hash = NULL,
+               error_code = 'LEGACY_RECOVERY',
+               error_message = 'Granted one bounded recovery for a legacy lease without an error',
+               updated_at = ?
+           WHERE state = 'leased' AND lease_until <= ?
+             AND attempts >= ? AND error_code IS NULL`,
+        )
+        .run(now, now, now, MAX_JOB_ATTEMPTS);
+      this.finalizeExhaustedJobs(now);
       claimed = this.database
         .prepare(
           `SELECT id, media_id, kind, payload_json, attempts
            FROM media_jobs
-           WHERE (state = 'pending' AND not_before <= ?)
-              OR (state = 'leased' AND lease_until <= ?)
+           WHERE ((state = 'pending' AND not_before <= ?)
+              OR (state = 'leased' AND lease_until <= ?))
+             AND attempts < ?
            ORDER BY created_at ASC LIMIT 1`,
         )
-        .get(now, now) as JobRow | undefined;
+        .get(now, now, MAX_JOB_ATTEMPTS) as JobRow | undefined;
       if (!claimed) return;
       this.database
         .prepare(
           `UPDATE media_jobs
            SET state = 'leased', attempts = attempts + 1, worker_id = ?,
-               lease_token_hash = ?, lease_until = ?, updated_at = ?
+               lease_token_hash = ?, lease_until = ?, error_message = NULL,
+               finished_at = NULL, updated_at = ?
            WHERE id = ?`,
         )
-        .run(workerId, hashToken(leaseToken), now + 60_000, now, claimed.id);
+        .run(
+          workerId,
+          hashToken(leaseToken),
+          now + JOB_LEASE_MILLISECONDS,
+          now,
+          claimed.id,
+        );
     })();
     if (!claimed) return null;
     return {
@@ -734,7 +771,91 @@ export class MediaService {
       kind: claimed.kind,
       payload: JSON.parse(claimed.payload_json) as unknown,
       leaseToken,
-      leaseUntil: new Date(now + 60_000).toISOString(),
+      leaseUntil: new Date(now + JOB_LEASE_MILLISECONDS).toISOString(),
+      attempt: claimed.attempts + 1,
+      maxAttempts: MAX_JOB_ATTEMPTS,
+    };
+  }
+
+  public recordWorkerHeartbeat(input: {
+    readonly workerId: string;
+    readonly currentJobId?: string | null | undefined;
+    readonly lastError?: string | null | undefined;
+  }): void {
+    const now = this.now();
+    const currentJobId = input.currentJobId ?? null;
+    const lastError = input.lastError?.trim().slice(0, 2048) || null;
+    const status = currentJobId ? "busy" : lastError ? "degraded" : "idle";
+    this.database
+      .prepare(
+        `INSERT INTO worker_heartbeats(
+           worker_id, status, current_job_id, last_error, started_at, last_seen_at
+         ) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(worker_id) DO UPDATE SET
+           status = excluded.status,
+           current_job_id = excluded.current_job_id,
+           last_error = excluded.last_error,
+           started_at = CASE
+             WHEN worker_heartbeats.last_seen_at < excluded.last_seen_at - ?
+               THEN excluded.started_at
+             ELSE worker_heartbeats.started_at
+           END,
+           last_seen_at = excluded.last_seen_at`,
+      )
+      .run(
+        input.workerId,
+        status,
+        currentJobId,
+        lastError,
+        now,
+        now,
+        WORKER_FRESHNESS_MILLISECONDS,
+      );
+  }
+
+  public getWorkerHealth(workerId?: string) {
+    const row = (
+      workerId
+        ? this.database
+            .prepare(
+              `SELECT worker_id, status, current_job_id, last_error,
+                    started_at, last_seen_at
+             FROM worker_heartbeats WHERE worker_id = ?`,
+            )
+            .get(workerId)
+        : this.database
+            .prepare(
+              `SELECT worker_id, status, current_job_id, last_error,
+                    started_at, last_seen_at
+             FROM worker_heartbeats ORDER BY last_seen_at DESC LIMIT 1`,
+            )
+            .get()
+    ) as WorkerHeartbeatRow | undefined;
+    if (!row) {
+      return {
+        health: "missing" as const,
+        healthy: false,
+        workerId: workerId ?? null,
+        status: null,
+        currentJobId: null,
+        lastError: null,
+        startedAt: null,
+        lastSeenAt: null,
+        ageMs: null,
+      };
+    }
+    const ageMs = Math.max(0, this.now() - row.last_seen_at);
+    const healthy = ageMs <= WORKER_FRESHNESS_MILLISECONDS;
+    return {
+      health: healthy ? ("healthy" as const) : ("stale" as const),
+      healthy,
+      workerId: row.worker_id,
+      status: row.status,
+      currentJobId: row.current_job_id,
+      lastError: row.last_error,
+      startedAt: new Date(row.started_at).toISOString(),
+      lastSeenAt: new Date(row.last_seen_at).toISOString(),
+      ageMs,
     };
   }
 
@@ -750,7 +871,7 @@ export class MediaService {
          WHERE id = ? AND state = 'leased' AND lease_token_hash = ? AND lease_until > ?`,
       )
       .run(
-        now + 60_000,
+        now + JOB_LEASE_MILLISECONDS,
         JSON.stringify(progress),
         now,
         jobId,
@@ -759,6 +880,131 @@ export class MediaService {
       );
     if (result.changes !== 1)
       throw conflict("JOB_LEASE_EXPIRED", "任务租约已失效");
+  }
+
+  public failJob(
+    jobId: string,
+    leaseToken: string,
+    error: string,
+    errorCode = "WORKER_ERROR",
+  ) {
+    const now = this.now();
+    const message = error.trim().slice(0, 2048) || "Worker task failed";
+    let outcome:
+      | {
+          readonly state: "pending";
+          readonly attempt: number;
+          readonly maxAttempts: number;
+          readonly retryAt: string;
+        }
+      | {
+          readonly state: "failed";
+          readonly attempt: number;
+          readonly maxAttempts: number;
+          readonly retryAt: null;
+        };
+    this.database.transaction(() => {
+      const job = this.database
+        .prepare(
+          `SELECT id, media_id, kind, payload_json, attempts
+           FROM media_jobs
+           WHERE id = ? AND state = 'leased' AND lease_token_hash = ?
+             AND lease_until > ?`,
+        )
+        .get(jobId, hashToken(leaseToken), now) as JobRow | undefined;
+      if (!job) throw conflict("JOB_LEASE_EXPIRED", "任务租约已失效");
+      if (job.attempts >= MAX_JOB_ATTEMPTS) {
+        this.finalizeJobFailure(job, errorCode, message, now);
+        outcome = {
+          state: "failed",
+          attempt: job.attempts,
+          maxAttempts: MAX_JOB_ATTEMPTS,
+          retryAt: null,
+        };
+        return;
+      }
+      const retryDelay = Math.min(
+        5 * 60_000,
+        5_000 * 2 ** Math.max(0, job.attempts - 1),
+      );
+      const retryAt = now + retryDelay;
+      this.database
+        .prepare(
+          `UPDATE media_jobs
+           SET state = 'pending', not_before = ?, lease_until = NULL,
+               lease_token_hash = NULL, worker_id = NULL,
+               error_code = ?, error_message = ?, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(retryAt, errorCode, message, now, job.id);
+      outcome = {
+        state: "pending",
+        attempt: job.attempts,
+        maxAttempts: MAX_JOB_ATTEMPTS,
+        retryAt: new Date(retryAt).toISOString(),
+      };
+    })();
+    return outcome!;
+  }
+
+  private finalizeExhaustedJobs(now: number): void {
+    const exhausted = this.database
+      .prepare(
+        `SELECT id, media_id, kind, payload_json, attempts
+         FROM media_jobs
+         WHERE attempts >= ?
+           AND (state = 'pending' OR (state = 'leased' AND lease_until <= ?))`,
+      )
+      .all(MAX_JOB_ATTEMPTS, now) as JobRow[];
+    for (const job of exhausted) {
+      this.finalizeJobFailure(
+        job,
+        "MAX_ATTEMPTS_EXCEEDED",
+        "任务超过最大重试次数",
+        now,
+      );
+    }
+  }
+
+  private finalizeJobFailure(
+    job: JobRow,
+    errorCode: string,
+    errorMessage: string,
+    now: number,
+  ): void {
+    this.database
+      .prepare(
+        `UPDATE media_jobs
+         SET state = 'failed', lease_until = NULL, lease_token_hash = NULL,
+             worker_id = NULL, error_code = ?, error_message = ?,
+             finished_at = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(errorCode, errorMessage, now, now, job.id);
+    if (job.kind !== "probe") return;
+    this.database
+      .prepare(
+        `UPDATE media SET state = 'failed'
+         WHERE id = ? AND state = 'scanning'`,
+      )
+      .run(job.media_id);
+    let uploadId: string | undefined;
+    try {
+      const payload = JSON.parse(job.payload_json) as { uploadId?: unknown };
+      if (typeof payload.uploadId === "string") uploadId = payload.uploadId;
+    } catch {
+      // 终态失败仍需可记录；损坏的历史 payload 不应阻止队列继续领取。
+    }
+    if (uploadId) {
+      this.database
+        .prepare(
+          `UPDATE uploads
+           SET state = 'failed', error_code = ?, reserved_bytes = 0,
+               finished_at = ?
+           WHERE id = ?`,
+        )
+        .run(errorCode, now, uploadId);
+    }
   }
 
   public completeJob(
@@ -821,10 +1067,12 @@ export class MediaService {
       this.database
         .prepare(
           `UPDATE media_jobs
-           SET state = 'completed', lease_until = NULL, lease_token_hash = NULL, updated_at = ?
+           SET state = 'completed', lease_until = NULL, lease_token_hash = NULL,
+               worker_id = NULL, error_code = NULL, error_message = NULL,
+               finished_at = ?, updated_at = ?
            WHERE id = ?`,
         )
-        .run(now, jobId);
+        .run(now, now, jobId);
       this.database
         .prepare(
           `UPDATE uploads SET state = ?, finished_at = ?

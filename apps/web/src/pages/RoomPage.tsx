@@ -8,7 +8,7 @@ import {
 import type { Room as LiveKitRoom } from "livekit-client";
 import { v7 as uuidv7 } from "uuid";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router";
 
 import {
   api,

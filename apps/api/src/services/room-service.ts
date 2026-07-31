@@ -17,6 +17,7 @@ import {
 } from "../errors.js";
 import { createOpaqueToken, hashToken, verifyTokenHash } from "../security.js";
 import type { AccountSession } from "./auth-service.js";
+import { enqueueMediaSessionKicks } from "./media-session-outbox.js";
 
 interface RoomSessionRow {
   readonly id_hash: string;
@@ -723,20 +724,13 @@ export class RoomService {
         ) VALUES (?, ?, ?, ?, ?, ?, NULL)`,
       )
       .run(revocationId, roomId, memberId, memberId, reason, now);
-    this.database
-      .prepare(
-        `INSERT INTO service_outbox(
-          id, kind, dedupe_key, payload_json, state, attempts,
-          not_before, lease_until, last_error, created_at, completed_at
-        ) VALUES (?, 'mediamtx.kick-sessions', ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL)`,
-      )
-      .run(
-        uuidv7(),
-        `mediamtx-kick:${revocationId}`,
-        JSON.stringify({ roomId, memberId, sessionIds: mediaSessionIds }),
-        now,
-        now,
-      );
+    enqueueMediaSessionKicks(this.database, {
+      roomId,
+      memberId,
+      sessionIds: mediaSessionIds,
+      dedupeKey: `mediamtx-kick:${revocationId}`,
+      timestamp: now,
+    });
     this.database
       .prepare(
         `INSERT INTO service_outbox(
@@ -874,27 +868,13 @@ export class RoomService {
              WHERE room_id = ?`,
           )
           .run(now, roomId);
-        if (mediaSessionIds.length > 0) {
-          const eventId = uuidv7();
-          this.database
-            .prepare(
-              `INSERT INTO service_outbox(
-                id, kind, dedupe_key, payload_json, state, attempts,
-                not_before, lease_until, last_error, created_at, completed_at
-              ) VALUES (?, 'mediamtx.kick-sessions', ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL)`,
-            )
-            .run(
-              uuidv7(),
-              `mediamtx-force-close:${eventId}`,
-              JSON.stringify({
-                roomId,
-                memberId: "all",
-                sessionIds: mediaSessionIds,
-              }),
-              now,
-              now,
-            );
-        }
+        enqueueMediaSessionKicks(this.database, {
+          roomId,
+          memberId: "all",
+          sessionIds: mediaSessionIds,
+          dedupeKey: `mediamtx-force-close:${uuidv7()}`,
+          timestamp: now,
+        });
         for (const member of members) {
           const eventId = uuidv7();
           this.database
@@ -993,21 +973,13 @@ export class RoomService {
         (row) =>
           (row as { readonly mediamtx_session_id: string }).mediamtx_session_id,
       );
-    if (sessionIds.length === 0) return;
-    this.database
-      .prepare(
-        `INSERT INTO service_outbox(
-          id, kind, dedupe_key, payload_json, state, attempts,
-          not_before, lease_until, last_error, created_at, completed_at
-        ) VALUES (?, 'mediamtx.kick-sessions', ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL)`,
-      )
-      .run(
-        uuidv7(),
-        `mediamtx-takeover:${uuidv7()}`,
-        JSON.stringify({ roomId, memberId, sessionIds }),
-        timestamp,
-        timestamp,
-      );
+    enqueueMediaSessionKicks(this.database, {
+      roomId,
+      memberId,
+      sessionIds,
+      dedupeKey: `mediamtx-takeover:${uuidv7()}`,
+      timestamp,
+    });
   }
 
   public touch(identity: RoomIdentity): void {

@@ -1,14 +1,21 @@
 name: simplewatch-server
 
+x-service-logging: &service-logging
+  driver: local
+  options:
+    max-size: "20m"
+    max-file: "3"
+
 services:
   app:
     build:
       context: ../..
       args:
-        NODE_IMAGE: docker.m.daocloud.io/library/node:24.18.0-bookworm-slim
+        NODE_IMAGE: docker.m.daocloud.io/library/node@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
         APT_MIRROR: mirrors.aliyun.com
     image: simplewatch-app:${RELEASE_TAG}
     restart: unless-stopped
+    logging: *service-logging
     read_only: true
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
@@ -17,9 +24,7 @@ services:
     pids_limit: 128
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
-    command:
-      ["node", "apps/api/node_modules/tsx/dist/cli.mjs", "apps/api/src/main.ts"]
-    env_file: ../../.env.server
+    command: ["node", "dist/api.mjs"]
     environment:
       NODE_ENV: production
       HOST: 0.0.0.0
@@ -30,7 +35,19 @@ services:
       INBOX_ROOT: /inbox
       SUBTITLE_ROOT: /subtitles
       TRASH_ROOT: /trash
-      SFTP_INCOMING_ROOT: /sftp-incoming
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?PUBLIC_ORIGIN is required}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
+      PASSWORD_PEPPER: ${PASSWORD_PEPPER:?PASSWORD_PEPPER is required}
+      CONTENT_SIGNING_SECRET: ${CONTENT_SIGNING_SECRET:?CONTENT_SIGNING_SECRET is required}
+      TUS_ENDPOINT: ${TUS_ENDPOINT:?TUS_ENDPOINT is required}
+      INTERNAL_HOOK_TOKEN: ${INTERNAL_HOOK_TOKEN:?INTERNAL_HOOK_TOKEN is required}
+      MEDIA_JWT_SECRET: ${MEDIA_JWT_SECRET:?MEDIA_JWT_SECRET is required}
+      OBS_CREDENTIAL_ENCRYPTION_KEY: ${OBS_CREDENTIAL_ENCRYPTION_KEY:?OBS_CREDENTIAL_ENCRYPTION_KEY is required}
+      MEDIA_ORIGIN: ${MEDIA_ORIGIN:?MEDIA_ORIGIN is required}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?LIVEKIT_API_KEY is required}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?LIVEKIT_API_SECRET is required}
+      LIVEKIT_URL: ${LIVEKIT_URL:?LIVEKIT_URL is required}
+      MEDIAMTX_CONTROL_URL: http://mediamtx:9997
     volumes:
       - /srv/simplewatch/state:/state
       - /srv/simplewatch/media:/media
@@ -46,7 +63,7 @@ services:
           "CMD",
           "node",
           "-e",
-          "fetch('http://127.0.0.1:3000/health/ready').then(r=>{if(!r.ok)process.exit(1)})",
+          "fetch('http://127.0.0.1:3000/health/live').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
         ]
       interval: 5s
       timeout: 3s
@@ -56,6 +73,7 @@ services:
   worker:
     image: simplewatch-app:${RELEASE_TAG}
     restart: unless-stopped
+    logging: *service-logging
     group_add: ["12001"]
     read_only: true
     security_opt: [no-new-privileges:true]
@@ -65,16 +83,11 @@ services:
     pids_limit: 96
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
-    command:
-      [
-        "node",
-        "apps/worker/node_modules/tsx/dist/cli.mjs",
-        "apps/worker/src/main.ts",
-      ]
-    env_file: ../../.env.server
+    command: ["node", "dist/worker.mjs"]
     environment:
       API_ORIGIN: http://app:3000
       WORKER_ID: server-worker
+      INTERNAL_HOOK_TOKEN: ${INTERNAL_HOOK_TOKEN:?INTERNAL_HOOK_TOKEN is required}
       MEDIA_ROOT: /media
       UPLOAD_ROOT: /uploads
       INBOX_ROOT: /inbox
@@ -83,6 +96,8 @@ services:
       FFMPEG_PATH: /usr/bin/ffmpeg
       SFTP_INCOMING_ROOT: /sftp-incoming
       LIVEKIT_INTERNAL_URL: http://livekit:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?LIVEKIT_API_KEY is required}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?LIVEKIT_API_SECRET is required}
       MEDIAMTX_CONTROL_URL: http://mediamtx:9997
     volumes:
       - /srv/simplewatch/media:/media
@@ -94,10 +109,23 @@ services:
     depends_on:
       app:
         condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "const u=new URL('/api/v1/internal/worker/health','http://app:3000');u.searchParams.set('workerId',process.env.WORKER_ID);fetch(u,{headers:{'X-Internal-Token':process.env.INTERNAL_HOOK_TOKEN}}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
 
   caddy:
     image: docker.m.daocloud.io/library/caddy:2.11.4-alpine
     restart: unless-stopped
+    logging: *service-logging
     read_only: true
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
@@ -108,7 +136,8 @@ services:
     group_add: ["1000"]
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
-    env_file: ../../.env.server
+    environment:
+      INTERNAL_HOOK_TOKEN: ${INTERNAL_HOOK_TOKEN:?INTERNAL_HOOK_TOKEN is required}
     ports:
       - "80:8080"
       - "443:443"
@@ -140,6 +169,7 @@ services:
   tusd:
     image: docker.m.daocloud.io/tusproject/tusd:v2.9.2
     restart: unless-stopped
+    logging: *service-logging
     read_only: true
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
@@ -172,6 +202,7 @@ services:
         MEDIAMTX_ARCHIVE_SHA256: ${MEDIAMTX_ARCHIVE_SHA256}
     image: simplewatch-mediamtx:${RELEASE_TAG}
     restart: unless-stopped
+    logging: *service-logging
     read_only: true
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
@@ -196,6 +227,7 @@ services:
         LIVEKIT_ARCHIVE_SHA256: ${LIVEKIT_ARCHIVE_SHA256}
     image: simplewatch-livekit:${RELEASE_TAG}
     restart: unless-stopped
+    logging: *service-logging
     read_only: true
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]

@@ -23,6 +23,18 @@ import type { RoomService } from "./services/room-service.js";
 const mediaParamsSchema = z.object({ mediaId: z.string().uuid() });
 const uploadParamsSchema = z.object({ uploadId: z.string().uuid() });
 const jobParamsSchema = z.object({ jobId: z.string().uuid() });
+const workerQuerySchema = z.object({ workerId: z.string().min(1).max(128) });
+const workerHealthSchema = z.object({
+  health: z.enum(["healthy", "stale", "missing"]),
+  healthy: z.boolean(),
+  workerId: z.string().nullable(),
+  status: z.enum(["idle", "busy", "degraded"]).nullable(),
+  currentJobId: z.string().uuid().nullable(),
+  lastError: z.string().nullable(),
+  startedAt: z.iso.datetime().nullable(),
+  lastSeenAt: z.iso.datetime().nullable(),
+  ageMs: z.number().int().nonnegative().nullable(),
+});
 const uploadResponseSchema = z.object({
   id: z.string().uuid(),
   state: uploadStateSchema,
@@ -243,11 +255,46 @@ export function registerMediaRoutes(
   );
 
   app.post(
+    "/api/v1/internal/worker/heartbeat",
+    {
+      schema: {
+        body: z.object({
+          workerId: z.string().min(1).max(128),
+          currentJobId: z.string().uuid().nullable().optional(),
+          lastError: z.string().max(2048).nullable().optional(),
+        }),
+      },
+    },
+    (request, reply) => {
+      requireInternal(request, internalToken);
+      mediaService.recordWorkerHeartbeat(request.body);
+      return reply.status(204).send();
+    },
+  );
+
+  app.get(
+    "/api/v1/internal/worker/health",
+    {
+      schema: {
+        querystring: workerQuerySchema,
+        response: { 200: workerHealthSchema, 503: workerHealthSchema },
+      },
+    },
+    (request, reply) => {
+      requireInternal(request, internalToken);
+      const health = mediaService.getWorkerHealth(request.query.workerId);
+      if (!health.healthy) reply.status(503);
+      return health;
+    },
+  );
+
+  app.post(
     "/api/v1/internal/jobs/claim",
     { schema: { body: z.object({ workerId: z.string().min(1).max(128) }) } },
-    (request) => {
+    (request, reply) => {
       requireInternal(request, internalToken);
-      return mediaService.claimJob(request.body.workerId);
+      const job = mediaService.claimJob(request.body.workerId);
+      return job ? job : reply.status(204).send();
     },
   );
 
@@ -267,6 +314,40 @@ export function registerMediaRoutes(
         request.body.progress,
       );
       return reply.status(204).send();
+    },
+  );
+
+  app.post(
+    "/api/v1/internal/jobs/:jobId/fail",
+    {
+      schema: {
+        params: jobParamsSchema,
+        body: z.object({
+          leaseToken: z.string().min(1),
+          error: z.string().min(1).max(2048),
+          errorCode: z
+            .string()
+            .regex(/^[A-Z0-9_]{1,64}$/)
+            .optional(),
+        }),
+        response: {
+          200: z.object({
+            state: z.enum(["pending", "failed"]),
+            attempt: z.number().int().positive(),
+            maxAttempts: z.number().int().positive(),
+            retryAt: z.iso.datetime().nullable(),
+          }),
+        },
+      },
+    },
+    (request) => {
+      requireInternal(request, internalToken);
+      return mediaService.failJob(
+        request.params.jobId,
+        request.body.leaseToken,
+        request.body.error,
+        request.body.errorCode,
+      );
     },
   );
 

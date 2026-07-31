@@ -61,6 +61,15 @@ const sftpScanner = config.sftpIncomingRoot
   : null;
 let nextSftpScanAt = 0;
 let nextRtcReconciliationAt = 0;
+let activeJobId: string | null = null;
+let lastWorkerError: string | null = null;
+let workerHeartbeatInFlight: Promise<void> | null = null;
+
+await sendWorkerHeartbeat();
+const workerHeartbeatTimer = setInterval(() => {
+  void sendWorkerHeartbeat();
+}, 15_000);
+workerHeartbeatTimer.unref();
 
 while (true) {
   if (Date.now() >= nextRtcReconciliationAt) {
@@ -81,21 +90,25 @@ while (true) {
   }
   if (sftpScanner && Date.now() >= nextSftpScanAt) {
     nextSftpScanAt = Date.now() + 60_000;
-    sftpScanner.scan();
-    for (const candidate of sftpScanner.pendingImports()) {
-      try {
-        const imported = await callApi("/api/v1/internal/imports/sftp", {
-          method: "POST",
-          body: JSON.stringify(candidate),
-        });
-        if (!imported.ok) {
-          console.error(`SFTP 导入登记失败：HTTP ${imported.status}`);
+    try {
+      sftpScanner.scan();
+      for (const candidate of sftpScanner.pendingImports()) {
+        try {
+          const imported = await callApi("/api/v1/internal/imports/sftp", {
+            method: "POST",
+            body: JSON.stringify(candidate),
+          });
+          if (!imported.ok) {
+            console.error(`SFTP 导入登记失败：HTTP ${imported.status}`);
+          }
+        } catch (error) {
+          console.error("SFTP 导入登记服务暂不可用", error);
         }
-      } catch (error) {
-        // 文件已经原子移动到 inbox/sftp，后续扫描会重新登记；网络抖动
-        // 不能终止整个 Worker，否则普通上传任务也会停止处理。
-        console.error("SFTP 导入登记服务暂不可用", error);
       }
+    } catch (error) {
+      // 文件已经原子移动到 inbox/sftp，后续扫描会重新登记；网络抖动
+      // 或单个目录项异常不能终止整个 Worker。
+      console.error("SFTP 扫描或导入登记暂不可用", error);
     }
   }
   try {
@@ -152,45 +165,84 @@ while (true) {
     await delay(2000);
     continue;
   }
-  const job = (await response.json()) as {
+  let job: {
     id: string;
     kind: string;
     leaseToken: string;
     payload: unknown;
+    attempt?: number;
+    maxAttempts?: number;
   } | null;
+  try {
+    job = (await response.json()) as typeof job;
+  } catch (error) {
+    lastWorkerError = `任务响应解析失败：${errorMessage(error)}`;
+    console.error(lastWorkerError);
+    await sendWorkerHeartbeat();
+    await delay(2000);
+    continue;
+  }
   if (!job) {
     await delay(2000);
     continue;
   }
-  const isSubtitle = job.kind === "subtitle";
-  if (!isSubtitle && job.kind !== "probe") {
-    throw new Error(`不支持的任务类型：${job.kind}`);
+  activeJobId = job.id;
+  lastWorkerError = null;
+  await sendWorkerHeartbeat();
+  const stopLeaseHeartbeat = startLeaseHeartbeat(job);
+  try {
+    const isSubtitle = job.kind === "subtitle";
+    if (!isSubtitle && job.kind !== "probe") {
+      throw new Error(`不支持的任务类型：${job.kind}`);
+    }
+    const result = isSubtitle
+      ? processSubtitleJob(
+          subtitlePayloadSchema.parse(job.payload),
+          config.subtitleRoot,
+        )
+      : await processProbeJob(
+          probePayloadSchema.parse(job.payload),
+          {
+            uploadRoot: config.uploadRoot,
+            mediaRoot: config.mediaRoot,
+            inboxRoot: config.inboxRoot,
+            subtitleRoot: config.subtitleRoot,
+          },
+          config.ffprobePath,
+          config.ffmpegPath,
+        );
+    const resultPath = isSubtitle ? "subtitle-result" : "result";
+    const submitted = await callApi(
+      `/api/v1/internal/jobs/${job.id}/${resultPath}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ leaseToken: job.leaseToken, ...result }),
+      },
+    );
+    if (!submitted.ok)
+      throw new Error(`任务提交失败：HTTP ${submitted.status}`);
+  } catch (error) {
+    lastWorkerError = errorMessage(error);
+    console.error(`媒体任务 ${job.id} 失败`, error);
+    try {
+      const failed = await callApi(`/api/v1/internal/jobs/${job.id}/fail`, {
+        method: "POST",
+        body: JSON.stringify({
+          leaseToken: job.leaseToken,
+          error: lastWorkerError.slice(0, 2048),
+        }),
+      });
+      if (!failed.ok) {
+        console.error(`任务失败状态提交失败：HTTP ${failed.status}`);
+      }
+    } catch (submitError) {
+      console.error("任务失败状态暂时无法提交", submitError);
+    }
+  } finally {
+    await stopLeaseHeartbeat();
+    activeJobId = null;
+    await sendWorkerHeartbeat();
   }
-  const result = isSubtitle
-    ? processSubtitleJob(
-        subtitlePayloadSchema.parse(job.payload),
-        config.subtitleRoot,
-      )
-    : await processProbeJob(
-        probePayloadSchema.parse(job.payload),
-        {
-          uploadRoot: config.uploadRoot,
-          mediaRoot: config.mediaRoot,
-          inboxRoot: config.inboxRoot,
-          subtitleRoot: config.subtitleRoot,
-        },
-        config.ffprobePath,
-        config.ffmpegPath,
-      );
-  const resultPath = isSubtitle ? "subtitle-result" : "result";
-  const submitted = await callApi(
-    `/api/v1/internal/jobs/${job.id}/${resultPath}`,
-    {
-      method: "POST",
-      body: JSON.stringify({ leaseToken: job.leaseToken, ...result }),
-    },
-  );
-  if (!submitted.ok) throw new Error(`任务提交失败：HTTP ${submitted.status}`);
 }
 
 function callApi(path: string, init: RequestInit): Promise<Response> {
@@ -206,6 +258,73 @@ function callApi(path: string, init: RequestInit): Promise<Response> {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
+}
+
+function startLeaseHeartbeat(job: {
+  readonly id: string;
+  readonly leaseToken: string;
+  readonly kind: string;
+  readonly attempt?: number;
+}): () => Promise<void> {
+  let inFlight: Promise<void> | null = null;
+  const renew = async () => {
+    try {
+      const response = await callApi(
+        `/api/v1/internal/jobs/${job.id}/heartbeat`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            leaseToken: job.leaseToken,
+            progress: {
+              phase: "processing",
+              kind: job.kind,
+              attempt: job.attempt ?? null,
+            },
+          }),
+        },
+      );
+      if (!response.ok) {
+        console.error(`任务租约续期失败：HTTP ${response.status}`);
+      }
+    } catch (error) {
+      console.error("任务租约续期服务暂不可用", error);
+    }
+  };
+  const timer = setInterval(() => {
+    if (inFlight) return;
+    inFlight = renew().finally(() => {
+      inFlight = null;
+    });
+  }, 20_000);
+  timer.unref();
+  return async () => {
+    clearInterval(timer);
+    if (inFlight) await inFlight;
+  };
+}
+
+function sendWorkerHeartbeat(): Promise<void> {
+  if (workerHeartbeatInFlight) return workerHeartbeatInFlight;
+  workerHeartbeatInFlight = (async () => {
+    try {
+      const response = await callApi("/api/v1/internal/worker/heartbeat", {
+        method: "POST",
+        body: JSON.stringify({
+          workerId: config.workerId,
+          currentJobId: activeJobId,
+          lastError: lastWorkerError?.slice(0, 2048) ?? null,
+        }),
+      });
+      if (!response.ok) {
+        console.error(`Worker 心跳上报失败：HTTP ${response.status}`);
+      }
+    } catch (error) {
+      console.error("Worker 心跳服务暂不可用", error);
+    }
+  })().finally(() => {
+    workerHeartbeatInFlight = null;
+  });
+  return workerHeartbeatInFlight;
 }
 
 async function submitOutboxResult(

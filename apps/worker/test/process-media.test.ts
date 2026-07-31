@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   rmSync,
+  symlinkSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
 
@@ -113,6 +114,103 @@ describe("processProbeJob", () => {
     expect(existsSync(source)).toBe(false);
   });
 
+  it("idempotently recovers when a high-attempt job already moved its final media", async () => {
+    const repositoryRoot = resolve(import.meta.dirname, "../../..");
+    const root = mkdtempSync(
+      resolve(repositoryRoot, "tmp/final-recovery-test-"),
+    );
+    roots.push(root);
+    const uploadRoot = join(root, "uploads");
+    const mediaRoot = join(root, "media");
+    const inboxRoot = join(root, "inbox");
+    const subtitleRoot = join(root, "subtitles");
+    mkdirSync(join(mediaRoot, "recovered-storage-key"), { recursive: true });
+    mkdirSync(uploadRoot, { recursive: true });
+    const finalPath = join(mediaRoot, "recovered-storage-key", "content.mp4");
+    copyFileSync(
+      join(repositoryRoot, "test-data/generated/media-smoke.mp4"),
+      finalPath,
+    );
+
+    const result = await processProbeJob(
+      {
+        uploadId: "legacy-upload",
+        filePath: join(uploadRoot, "source-that-was-already-moved.mp4"),
+        storageKey: "recovered-storage-key",
+      },
+      { uploadRoot, mediaRoot, inboxRoot, subtitleRoot },
+    );
+
+    expect(result.compatible).toBe(true);
+    expect(result.finalPath).toBe(resolve(finalPath));
+    expect(result.sha256).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it("recovers an already-moved inbox artifact without trusting the missing source path", async () => {
+    const repositoryRoot = resolve(import.meta.dirname, "../../..");
+    const root = mkdtempSync(
+      resolve(repositoryRoot, "tmp/inbox-recovery-test-"),
+    );
+    roots.push(root);
+    const uploadRoot = join(root, "uploads");
+    const mediaRoot = join(root, "media");
+    const inboxRoot = join(root, "inbox");
+    const subtitleRoot = join(root, "subtitles");
+    mkdirSync(join(inboxRoot, "inbox-recovery-key"), { recursive: true });
+    mkdirSync(uploadRoot, { recursive: true });
+    const recoveredSource = join(
+      inboxRoot,
+      "inbox-recovery-key",
+      "missing-source.mp4",
+    );
+    copyFileSync(
+      join(repositoryRoot, "test-data/generated/media-smoke.mp4"),
+      recoveredSource,
+    );
+
+    const result = await processProbeJob(
+      {
+        filePath: join(uploadRoot, "missing-source.mp4"),
+        storageKey: "inbox-recovery-key",
+      },
+      { uploadRoot, mediaRoot, inboxRoot, subtitleRoot },
+    );
+
+    expect(result.compatible).toBe(true);
+    expect(result.finalPath).toBe(
+      resolve(mediaRoot, "inbox-recovery-key/content.mp4"),
+    );
+    expect(existsSync(recoveredSource)).toBe(false);
+  });
+
+  it("rejects a source symlink that resolves outside the allowed upload root", async () => {
+    const repositoryRoot = resolve(import.meta.dirname, "../../..");
+    const root = mkdtempSync(resolve(repositoryRoot, "tmp/path-safety-test-"));
+    roots.push(root);
+    const uploadRoot = join(root, "uploads");
+    const mediaRoot = join(root, "media");
+    const inboxRoot = join(root, "inbox");
+    const subtitleRoot = join(root, "subtitles");
+    mkdirSync(uploadRoot, { recursive: true });
+    const outside = join(root, "outside.mp4");
+    copyFileSync(
+      join(repositoryRoot, "test-data/generated/media-smoke.mp4"),
+      outside,
+    );
+    const linkedSource = join(uploadRoot, "linked.mp4");
+    symlinkSync(outside, linkedSource);
+
+    await expect(
+      processProbeJob(
+        {
+          filePath: linkedSource,
+          storageKey: "outside-link-key",
+        },
+        { uploadRoot, mediaRoot, inboxRoot, subtitleRoot },
+      ),
+    ).rejects.toThrow("文件路径超出上传目录");
+  });
+
   it("copy-remuxes H.265 to hvc1 without transcoding", async () => {
     const repositoryRoot = resolve(import.meta.dirname, "../../..");
     const root = mkdtempSync(resolve(repositoryRoot, "tmp/hevc-worker-test-"));
@@ -165,7 +263,7 @@ describe("processSubtitleJob", () => {
     expect(result.bytes).toBe(content.length);
     expect(result.sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(existsSync(result.finalPath)).toBe(true);
-    expect(() =>
+    expect(
       processSubtitleJob(
         {
           storageKey: "subtitle-storage-key",
@@ -173,6 +271,6 @@ describe("processSubtitleJob", () => {
         },
         root,
       ),
-    ).toThrow();
+    ).toEqual(result);
   });
 });

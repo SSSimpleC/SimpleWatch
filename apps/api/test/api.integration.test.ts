@@ -61,6 +61,235 @@ afterEach(async () => {
 });
 
 describe("SimpleWatch API", () => {
+  it("persists worker heartbeats and gates readiness on a fresh worker", async () => {
+    const missing = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/internal/worker/health?workerId=server-worker",
+      headers: { "x-internal-token": internalToken },
+    });
+    expect(missing.statusCode).toBe(503);
+    expect(missing.json()).toMatchObject({
+      health: "missing",
+      healthy: false,
+      workerId: "server-worker",
+    });
+    const initiallyNotReady = await built.app.inject({
+      method: "GET",
+      url: "/health/ready",
+    });
+    expect(initiallyNotReady.statusCode).toBe(503);
+
+    const heartbeat = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/internal/worker/heartbeat",
+      headers: { "x-internal-token": internalToken },
+      payload: { workerId: "server-worker" },
+    });
+    expect(heartbeat.statusCode).toBe(204);
+    const healthy = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/internal/worker/health?workerId=server-worker",
+      headers: { "x-internal-token": internalToken },
+    });
+    expect(healthy.statusCode).toBe(200);
+    expect(healthy.json()).toMatchObject({
+      health: "healthy",
+      healthy: true,
+      status: "idle",
+      ageMs: 0,
+    });
+    expect(
+      built.database
+        .prepare(
+          "SELECT worker_id, status, last_seen_at FROM worker_heartbeats WHERE worker_id = ?",
+        )
+        .get("server-worker"),
+    ).toEqual({
+      worker_id: "server-worker",
+      status: "idle",
+      last_seen_at: fixedNow,
+    });
+    const ready = await built.app.inject({
+      method: "GET",
+      url: "/health/ready",
+    });
+    expect(ready.statusCode).toBe(200);
+    expect(ready.json()).toMatchObject({
+      status: "ready",
+      database: "ok",
+      worker: { health: "healthy", workerId: "server-worker" },
+    });
+
+    currentNow += 60_001;
+    const stale = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/internal/worker/health?workerId=server-worker",
+      headers: { "x-internal-token": internalToken },
+    });
+    expect(stale.statusCode).toBe(503);
+    expect(stale.json()).toMatchObject({
+      health: "stale",
+      healthy: false,
+      ageMs: 60_001,
+    });
+    expect(
+      (await built.app.inject({ method: "GET", url: "/health/ready" }))
+        .statusCode,
+    ).toBe(503);
+  });
+
+  it("renews job leases and bounds failures without re-claiming exhausted pending jobs", async () => {
+    const inboxPath = join(testRoot, "inbox", "retry-movie.mp4");
+    writeFileSync(inboxPath, "test");
+    const imported = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/internal/imports/sftp",
+      headers: { "x-internal-token": internalToken },
+      payload: { filename: "retry-movie.mp4", filePath: inboxPath, bytes: 4 },
+    });
+    const { mediaId, jobId } = imported.json<{
+      mediaId: string;
+      jobId: string;
+    }>();
+
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const claimed = await built.app.inject({
+        method: "POST",
+        url: "/api/v1/internal/jobs/claim",
+        headers: { "x-internal-token": internalToken },
+        payload: { workerId: "retry-worker" },
+      });
+      expect(claimed.statusCode).toBe(200);
+      const job = claimed.json<{
+        id: string;
+        leaseToken: string;
+        attempt: number;
+        maxAttempts: number;
+      }>();
+      expect(job).toMatchObject({
+        id: jobId,
+        attempt,
+        maxAttempts: 5,
+      });
+      if (attempt === 1) {
+        currentNow += 30_000;
+        const renewed = await built.app.inject({
+          method: "POST",
+          url: `/api/v1/internal/jobs/${job.id}/heartbeat`,
+          headers: { "x-internal-token": internalToken },
+          payload: {
+            leaseToken: job.leaseToken,
+            progress: { phase: "probe" },
+          },
+        });
+        expect(renewed.statusCode).toBe(204);
+        expect(
+          (
+            built.database
+              .prepare("SELECT lease_until FROM media_jobs WHERE id = ?")
+              .get(job.id) as { lease_until: number }
+          ).lease_until,
+        ).toBe(currentNow + 60_000);
+      }
+      const failed = await built.app.inject({
+        method: "POST",
+        url: `/api/v1/internal/jobs/${job.id}/fail`,
+        headers: { "x-internal-token": internalToken },
+        payload: {
+          leaseToken: job.leaseToken,
+          error: `simulated failure ${attempt}`,
+        },
+      });
+      expect(failed.statusCode).toBe(200);
+      expect(failed.json()).toMatchObject({
+        state: attempt === 5 ? "failed" : "pending",
+        attempt,
+        maxAttempts: 5,
+      });
+      if (attempt < 5) {
+        built.database
+          .prepare("UPDATE media_jobs SET not_before = ? WHERE id = ?")
+          .run(currentNow, job.id);
+      }
+    }
+
+    expect(
+      built.database
+        .prepare("SELECT state, error_code FROM media_jobs WHERE id = ?")
+        .get(jobId),
+    ).toEqual({ state: "failed", error_code: "WORKER_ERROR" });
+    expect(
+      built.database
+        .prepare("SELECT state FROM media WHERE id = ?")
+        .get(mediaId),
+    ).toEqual({ state: "failed" });
+
+    built.database
+      .prepare(
+        `UPDATE media_jobs
+         SET state = 'pending', attempts = 5, not_before = ?, error_code = 'WORKER_ERROR'
+         WHERE id = ?`,
+      )
+      .run(currentNow, jobId);
+    const exhausted = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/internal/jobs/claim",
+      headers: { "x-internal-token": internalToken },
+      payload: { workerId: "retry-worker" },
+    });
+    expect(exhausted.statusCode).toBe(204);
+    expect(
+      built.database
+        .prepare("SELECT state, error_code FROM media_jobs WHERE id = ?")
+        .get(jobId),
+    ).toEqual({
+      state: "failed",
+      error_code: "MAX_ATTEMPTS_EXCEEDED",
+    });
+  });
+
+  it("grants one bounded claim to a legacy high-attempt lease with no recorded error", async () => {
+    const inboxPath = join(testRoot, "inbox", "legacy-recovery.mp4");
+    writeFileSync(inboxPath, "test");
+    const imported = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/internal/imports/sftp",
+      headers: { "x-internal-token": internalToken },
+      payload: {
+        filename: "legacy-recovery.mp4",
+        filePath: inboxPath,
+        bytes: 4,
+      },
+    });
+    const { jobId } = imported.json<{ jobId: string }>();
+    built.database
+      .prepare(
+        `UPDATE media_jobs
+         SET state = 'leased', attempts = 1157, lease_until = ?,
+             error_code = NULL, lease_token_hash = 'legacy-token'
+         WHERE id = ?`,
+      )
+      .run(currentNow - 1, jobId);
+
+    const reclaimed = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/internal/jobs/claim",
+      headers: { "x-internal-token": internalToken },
+      payload: { workerId: "recovery-worker" },
+    });
+    expect(reclaimed.statusCode).toBe(200);
+    expect(reclaimed.json()).toMatchObject({
+      id: jobId,
+      attempt: 1,
+      maxAttempts: 5,
+    });
+    expect(
+      built.database
+        .prepare("SELECT attempts, error_code FROM media_jobs WHERE id = ?")
+        .get(jobId),
+    ).toEqual({ attempts: 1, error_code: "LEGACY_RECOVERY" });
+  });
+
   it("verifies LiveKit webhooks and re-enqueues an inactive participant idempotently", async () => {
     // Arrange
     const roomId = uuidv7();

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run SimpleWatch database backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:20:00 Asia/Shanghai
+RandomizedDelaySec=20m
+Persistent=true
+AccuracySec=1m
+Unit=simplewatch-backup.service
+
+[Install]
+WantedBy=timers.target

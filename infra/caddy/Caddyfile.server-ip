@@ -30,6 +30,15 @@ http://:8081 {
 
 https://8.134.239.34 {
 	tls /etc/caddy/ip-cert/current/fullchain.pem /etc/caddy/ip-cert/current/privkey.pem
+	log {
+		output stdout
+		format filter {
+			request>headers>Authorization delete
+			request>headers>Cookie delete
+			request>headers>Upload-Token delete
+			request>headers>X-Internal-Token delete
+		}
+	}
 	header {
 		-Server
 		Content-Security-Policy "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; media-src 'self' blob:; worker-src 'self'"
@@ -45,9 +54,7 @@ https://8.134.239.34 {
 	route {
 		@public_health path /health/live /health/ready
 		handle @public_health {
-			header Content-Type "text/plain; charset=utf-8"
-			header Cache-Control "no-store"
-			respond "ready" 200
+			reverse_proxy app:3000
 		}
 		@media path /media-files/*
 		@media_bad_method {

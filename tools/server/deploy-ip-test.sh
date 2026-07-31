@@ -5,7 +5,13 @@ release_dir=${1:?release directory required}
 public_ip=${2:?public IP required}
 public_port=${3:-443}
 clear_existing_data=${4:-false}
-accounts_file=${5:?root-only fixed account JSON file required}
+accounts_input=${5:?root-only fixed account JSON file or --preserve-accounts required}
+preserve_accounts=false
+accounts_file=$accounts_input
+if [[ "$accounts_input" == "--preserve-accounts" ]]; then
+  preserve_accounts=true
+  accounts_file=""
+fi
 if [[ "$public_port" == "443" ]]; then
   public_origin="https://${public_ip}"
 else
@@ -37,7 +43,7 @@ restore_sysctl() {
 on_exit() {
   local status=$?
   trap - EXIT
-  if [[ -f "$accounts_file" ]]; then
+  if [[ -n "$accounts_file" && -f "$accounts_file" ]]; then
     if command -v shred >/dev/null 2>&1; then
       shred -u "$accounts_file"
     else
@@ -105,8 +111,10 @@ remove_env BOOTSTRAP_ADMIN_CODE
 remove_env BOOTSTRAP_ADMIN_USERNAME
 remove_env BOOTSTRAP_ADMIN_PASSWORD
 chmod 600 .env.server
-[[ -f "$accounts_file" ]]
-[[ "$(stat -c '%a' "$accounts_file")" == "600" ]]
+if [[ "$preserve_accounts" != "true" ]]; then
+  [[ -f "$accounts_file" ]]
+  [[ "$(stat -c '%a' "$accounts_file")" == "600" ]]
+fi
 
 set -a
 # `.env.server` 由本脚本在当前发布目录中生成或继承。
@@ -183,14 +191,17 @@ sysctl_changed=true
 # FRP, DERP and the unrelated MES stack untouched.
 "${compose[@]}" down --remove-orphans
 
-"${compose[@]}" run --rm -T \
-  -e ALLOW_ACCOUNT_PROVISION=fixed-account-replacement \
-  app node apps/api/node_modules/tsx/dist/cli.mjs \
-  apps/api/src/cli/admin-bootstrap.ts <"$accounts_file"
-if command -v shred >/dev/null 2>&1; then
-  shred -u "$accounts_file"
+if [[ "$preserve_accounts" == "true" ]]; then
+  printf '%s\n' '保留现有固定账户，跳过账户替换。'
 else
-  rm -f "$accounts_file"
+  "${compose[@]}" run --rm -T \
+    -e ALLOW_ACCOUNT_PROVISION=fixed-account-replacement \
+    app node dist/admin-bootstrap.mjs <"$accounts_file"
+  if command -v shred >/dev/null 2>&1; then
+    shred -u "$accounts_file"
+  else
+    rm -f "$accounts_file"
+  fi
 fi
 
 if [[ "$clear_existing_data" == "true" ]]; then
@@ -207,8 +218,7 @@ if [[ "$clear_existing_data" == "true" ]]; then
     -e TRASH_ROOT=/srv-data/trash \
     -e SFTP_INCOMING_ROOT=/srv-data/sftp/incoming \
     -v /srv/simplewatch:/srv-data \
-    app node apps/api/node_modules/tsx/dist/cli.mjs \
-    apps/api/src/cli/clear-library.ts
+    app node dist/clear-library.mjs
   printf '%s\n' "$quarantine_id" >/srv/simplewatch/last-library-quarantine
 fi
 
@@ -227,8 +237,16 @@ install -m 0644 infra/systemd/simplewatch-ip-cert.service \
   /etc/systemd/system/simplewatch-ip-cert.service
 install -m 0644 infra/systemd/simplewatch-ip-cert.timer \
   /etc/systemd/system/simplewatch-ip-cert.timer
+install -m 0755 tools/server/backup-database.sh \
+  /usr/local/sbin/simplewatch-backup
+install -m 0644 infra/systemd/simplewatch-backup.service \
+  /etc/systemd/system/simplewatch-backup.service
+install -m 0644 infra/systemd/simplewatch-backup.timer \
+  /etc/systemd/system/simplewatch-backup.timer
 systemctl daemon-reload
 systemctl enable --now simplewatch-ip-cert.timer
+systemctl enable --now simplewatch-backup.timer
+systemctl start simplewatch-backup.service
 
 curl --fail --silent --show-error --max-time 10 \
   "${public_origin}/health/ready" >/dev/null

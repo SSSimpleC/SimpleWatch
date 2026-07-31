@@ -12,6 +12,7 @@ import {
   verifyPassword,
   verifyTokenHash,
 } from "../security.js";
+import { enqueueMediaSessionKicks } from "./media-session-outbox.js";
 
 const IDLE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const ABSOLUTE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -334,27 +335,13 @@ export class AuthService {
               (item as { readonly mediamtx_session_id: string })
                 .mediamtx_session_id,
           );
-        if (sessionIds.length > 0) {
-          this.database
-            .prepare(
-              `INSERT INTO service_outbox(
-                id, kind, dedupe_key, payload_json, state, attempts,
-                not_before, lease_until, last_error, created_at, completed_at
-              ) VALUES (?, 'mediamtx.kick-sessions', ?, ?, 'pending', 0,
-                ?, NULL, NULL, ?, NULL)`,
-            )
-            .run(
-              uuidv7(),
-              `account-media-revoke:${uuidv7()}`,
-              JSON.stringify({
-                roomId: member.room_id,
-                memberId: member.member_id,
-                sessionIds,
-              }),
-              timestamp,
-              timestamp,
-            );
-        }
+        enqueueMediaSessionKicks(this.database, {
+          roomId: member.room_id,
+          memberId: member.member_id,
+          sessionIds,
+          dedupeKey: `account-media-revoke:${uuidv7()}`,
+          timestamp,
+        });
         this.database
           .prepare(
             `INSERT INTO service_outbox(

@@ -30,8 +30,10 @@ const rtcPayloadSchema = z.object({
 const mediaPayloadSchema = z.object({
   roomId: z.string().min(1),
   memberId: z.string().min(1),
-  sessionIds: z.array(z.string().min(1)).max(32),
+  sessionIds: z.array(z.string().min(1)).max(512),
 });
+
+const MEDIA_SESSION_KICK_BATCH_SIZE = 32;
 
 export async function processOutboxItem(
   item: OutboxItem,
@@ -60,19 +62,32 @@ export async function processOutboxItem(
   if (item.kind === "mediamtx.kick-sessions") {
     const payload = mediaPayloadSchema.parse(item.payload);
     const fetchImpl = dependencies.fetchImpl ?? fetch;
-    for (const sessionId of payload.sessionIds) {
-      const response = await fetchImpl(
-        new URL(
-          `/v3/webrtcsessions/kick/${encodeURIComponent(sessionId)}`,
-          dependencies.mediamtxControlUrl,
-        ),
-        { method: "POST" },
+    const sessionIds = [...new Set(payload.sessionIds)];
+    for (
+      let index = 0;
+      index < sessionIds.length;
+      index += MEDIA_SESSION_KICK_BATCH_SIZE
+    ) {
+      const chunk = sessionIds.slice(
+        index,
+        index + MEDIA_SESSION_KICK_BATCH_SIZE,
       );
-      if (!response.ok && response.status !== 404) {
-        throw new Error(
-          `MediaMTX 会话 ${sessionId} 踢出失败：HTTP ${response.status}`,
-        );
-      }
+      await Promise.all(
+        chunk.map(async (sessionId) => {
+          const response = await fetchImpl(
+            new URL(
+              `/v3/webrtcsessions/kick/${encodeURIComponent(sessionId)}`,
+              dependencies.mediamtxControlUrl,
+            ),
+            { method: "POST" },
+          );
+          if (!response.ok && response.status !== 404) {
+            throw new Error(
+              `MediaMTX 会话 ${sessionId} 踢出失败：HTTP ${response.status}`,
+            );
+          }
+        }),
+      );
     }
     return;
   }

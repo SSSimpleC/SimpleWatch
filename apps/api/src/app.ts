@@ -20,6 +20,7 @@ import {
   updateRoomRequestSchema,
 } from "@simplewatch/contracts";
 import Fastify, {
+  LogController,
   type FastifyInstance,
   type FastifyReply,
   type FastifyRequest,
@@ -159,6 +160,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
   });
   const app = Fastify({
     logger: options.logger ?? false,
+    logController: new LogController({ disableRequestLogging: true }),
     trustProxy: false,
     requestIdHeader: false,
   });
@@ -255,7 +257,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
     return sendError(reply, request, 500, "INTERNAL_ERROR", "服务器内部错误");
   });
 
-  registerHealthRoutes(app, database);
+  registerHealthRoutes(app, database, mediaService);
   registerUnifiedApiRoutes(
     app,
     authService,
@@ -313,7 +315,16 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
 function registerHealthRoutes(
   app: FastifyInstance,
   database: AppDatabase,
+  mediaService: MediaService,
 ): void {
+  const workerSchema = z.object({
+    health: z.enum(["healthy", "stale", "missing"]),
+    workerId: z.string().nullable(),
+    status: z.enum(["idle", "busy", "degraded"]).nullable(),
+    currentJobId: z.string().uuid().nullable(),
+    lastSeenAt: z.iso.datetime().nullable(),
+    ageMs: z.number().int().nonnegative().nullable(),
+  });
   app.get(
     "/health/live",
     { schema: { response: { 200: z.object({ status: z.literal("ok") }) } } },
@@ -327,13 +338,39 @@ function registerHealthRoutes(
           200: z.object({
             status: z.literal("ready"),
             database: z.literal("ok"),
+            worker: workerSchema,
+          }),
+          503: z.object({
+            status: z.literal("not-ready"),
+            database: z.literal("ok"),
+            worker: workerSchema,
           }),
         },
       },
     },
-    () => {
+    (_request, reply) => {
       database.prepare("SELECT 1").get();
-      return { status: "ready" as const, database: "ok" as const };
+      const health = mediaService.getWorkerHealth();
+      const worker = {
+        health: health.health,
+        workerId: health.workerId,
+        status: health.status,
+        currentJobId: health.currentJobId,
+        lastSeenAt: health.lastSeenAt,
+        ageMs: health.ageMs,
+      };
+      if (!health.healthy) {
+        return reply.status(503).send({
+          status: "not-ready" as const,
+          database: "ok" as const,
+          worker,
+        });
+      }
+      return reply.send({
+        status: "ready" as const,
+        database: "ok" as const,
+        worker,
+      });
     },
   );
 }

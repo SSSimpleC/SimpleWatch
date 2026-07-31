@@ -1,0 +1,33 @@
+[Unit]
+Description=SimpleWatch home Edge Agent
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+RequiresMountsFor=/srv/dev-disk-by-uuid-7E82064F82060C79/PLAYS/SimpleWatchLibrary
+BindsTo=srv-dev\x2ddisk\x2dby\x2duuid\x2d7E82064F82060C79.mount
+After=srv-dev\x2ddisk\x2dby\x2duuid\x2d7E82064F82060C79.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/simplewatch-edge-agent/current
+EnvironmentFile=/etc/simplewatch-edge-agent/edge-agent.env
+ExecStartPre=/usr/bin/test -d /srv/dev-disk-by-uuid-7E82064F82060C79/PLAYS/SimpleWatchLibrary
+ExecStartPre=/usr/bin/test -r /etc/simplewatch-edge-agent/agent-token
+ExecStart=/usr/bin/docker compose --env-file /etc/simplewatch-edge-agent/edge-agent.env -f /opt/simplewatch-edge-agent/current/infra/compose/compose.edge-agent.yaml up -d edge-agent
+ExecReload=/usr/bin/docker compose --env-file /etc/simplewatch-edge-agent/edge-agent.env -f /opt/simplewatch-edge-agent/current/infra/compose/compose.edge-agent.yaml up -d --no-deps edge-agent
+ExecStop=/usr/bin/docker compose --env-file /etc/simplewatch-edge-agent/edge-agent.env -f /opt/simplewatch-edge-agent/current/infra/compose/compose.edge-agent.yaml stop -t 30 edge-agent
+TimeoutStartSec=120
+TimeoutStopSec=60
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

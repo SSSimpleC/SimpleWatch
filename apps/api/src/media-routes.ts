@@ -413,8 +413,14 @@ export function registerMediaRoutes(
   app.get("/api/v1/internal/tus/authorize", (request, reply) => {
     requireInternal(request, internalToken);
     const uri = header(request, "x-forwarded-uri");
+    const method = header(request, "x-forwarded-method");
     if (!uri) throw unauthorized("缺少原始上传 URI");
-    mediaService.authorizeTusRequest(header(request, "upload-token"), uri);
+    if (!method) throw unauthorized("缺少原始上传方法");
+    mediaService.authorizeTusRequest(
+      header(request, "upload-token"),
+      uri,
+      method,
+    );
     return reply.status(204).send();
   });
 }

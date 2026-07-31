@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
 } from "node:fs";
@@ -211,6 +213,36 @@ describe("processProbeJob", () => {
     ).rejects.toThrow("文件路径超出上传目录");
   });
 
+  it("rejects an Edge source revision whose SHA-256 changed before ingest", async () => {
+    const repositoryRoot = resolve(import.meta.dirname, "../../..");
+    const root = mkdtempSync(resolve(repositoryRoot, "tmp/edge-sha-test-"));
+    roots.push(root);
+    const uploadRoot = join(root, "uploads");
+    const mediaRoot = join(root, "media");
+    const inboxRoot = join(root, "inbox");
+    const subtitleRoot = join(root, "subtitles");
+    mkdirSync(uploadRoot, { recursive: true });
+    const source = join(uploadRoot, "changed.mp4");
+    copyFileSync(
+      join(repositoryRoot, "test-data/generated/media-smoke.mp4"),
+      source,
+    );
+
+    await expect(
+      processProbeJob(
+        {
+          filePath: source,
+          storageKey: "changed-edge-source",
+          expectedSourceSha256: "0".repeat(64),
+          edgeJobId: "0197d0af-c352-7c19-91ed-069aa2785a55",
+        },
+        { uploadRoot, mediaRoot, inboxRoot, subtitleRoot },
+      ),
+    ).rejects.toThrow("上传源文件 SHA-256 与家庭目录版本不一致");
+    expect(existsSync(source)).toBe(true);
+    expect(existsSync(join(mediaRoot, "changed-edge-source"))).toBe(false);
+  });
+
   it("copy-remuxes H.265 to hvc1 without transcoding", async () => {
     const repositoryRoot = resolve(import.meta.dirname, "../../..");
     const root = mkdtempSync(resolve(repositoryRoot, "tmp/hevc-worker-test-"));
@@ -225,12 +257,15 @@ describe("processProbeJob", () => {
       join(repositoryRoot, "test-data/generated/media-smoke-hevc-hev1.mp4"),
       source,
     );
+    const sourceSha256 = hashFixture(source);
 
     const result = await processProbeJob(
       {
         uploadId: "upload-hevc",
         filePath: source,
         storageKey: "hevc-storage-key",
+        expectedSourceSha256: sourceSha256,
+        edgeJobId: "0197d0af-c352-7c19-91ed-069aa2785a55",
       },
       { uploadRoot, mediaRoot, inboxRoot, subtitleRoot },
     );
@@ -243,8 +278,27 @@ describe("processProbeJob", () => {
       fastStart: true,
       video: { codec: "hevc", codecTag: "hvc1" },
     });
+    expect(result.sourceSha256).toBe(sourceSha256);
+    expect(result.sha256).not.toBe(sourceSha256);
+
+    const recovered = await processProbeJob(
+      {
+        uploadId: "upload-hevc",
+        filePath: source,
+        storageKey: "hevc-storage-key",
+        expectedSourceSha256: sourceSha256,
+        edgeJobId: "0197d0af-c352-7c19-91ed-069aa2785a55",
+      },
+      { uploadRoot, mediaRoot, inboxRoot, subtitleRoot },
+    );
+    expect(recovered.sourceSha256).toBe(sourceSha256);
+    expect(recovered.sha256).toBe(result.sha256);
   });
 });
+
+function hashFixture(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
 
 describe("processSubtitleJob", () => {
   it("writes a bounded immutable WebVTT artifact", () => {

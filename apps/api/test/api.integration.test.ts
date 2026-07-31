@@ -659,6 +659,11 @@ describe("SimpleWatch API", () => {
       payload: { filename: "resume.mp4", bytes: 4, mime: "video/mp4" },
     });
     const upload = authorize.json<{ uploadId: string; uploadToken: string }>();
+    expect(
+      built.database
+        .prepare("SELECT reserved_bytes FROM uploads WHERE id = ?")
+        .get(upload.uploadId),
+    ).toEqual({ reserved_bytes: 8 });
     const hookHeaders = { "x-internal-token": internalToken };
     const hookEvent = (type: string, offset = 0) => ({
       Type: type,
@@ -691,9 +696,25 @@ describe("SimpleWatch API", () => {
         ...hookHeaders,
         "upload-token": upload.uploadToken,
         "x-forwarded-uri": `/files/${upload.uploadId}`,
+        "x-forwarded-method": "PATCH",
       },
     });
     expect(tusAllowed.statusCode).toBe(204);
+
+    const progress = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/internal/tus/hooks",
+      headers: hookHeaders,
+      payload: hookEvent("post-receive", 2),
+    });
+    expect(progress.statusCode).toBe(200);
+    expect(
+      built.database
+        .prepare(
+          "SELECT received_bytes, reserved_bytes FROM uploads WHERE id = ?",
+        )
+        .get(upload.uploadId),
+    ).toEqual({ received_bytes: 2, reserved_bytes: 6 });
 
     writeFileSync(join(testRoot, "uploads", upload.uploadId), "test");
     const finish = await built.app.inject({
@@ -703,6 +724,11 @@ describe("SimpleWatch API", () => {
       payload: hookEvent("post-finish", 4),
     });
     expect(finish.statusCode).toBe(200);
+    expect(
+      built.database
+        .prepare("SELECT state, reserved_bytes FROM uploads WHERE id = ?")
+        .get(upload.uploadId),
+    ).toEqual({ state: "received", reserved_bytes: 4 });
     const repeated = await built.app.inject({
       method: "POST",
       url: "/api/v1/internal/tus/hooks",
@@ -1571,6 +1597,35 @@ describe("SimpleWatch API", () => {
   it("atomically clears all rooms, uploads and library files while preserving the admin", async () => {
     await createRoom();
     const admin = await loginAdmin();
+    const enrolled = built.edgeAuthService.enroll({
+      displayName: "SimpleServer",
+      softwareVersion: "0.1.0",
+    });
+    const scan = built.edgeCatalogService.startScan(enrolled.agentId, 1);
+    built.edgeCatalogService.addPage(enrolled.agentId, scan.scanId, {
+      generation: 1,
+      pageIndex: 0,
+      entries: [
+        {
+          localId: "complete-library-file",
+          relativePath: "Series/Episode 01.mkv",
+          displayName: "Episode 01.mkv",
+          bytes: 4,
+          mtimeMs: fixedNow,
+        },
+      ],
+    });
+    built.edgeCatalogService.commitScan(enrolled.agentId, scan.scanId, 1, 1);
+    const host = built.database
+      .prepare("SELECT id FROM accounts WHERE username_folded = 'host'")
+      .get() as { id: string };
+    const version = built.database
+      .prepare(
+        "SELECT current_version_id AS id FROM edge_catalog_items LIMIT 1",
+      )
+      .get() as { id: string };
+    const queue = built.programService.getOrCreateActiveQueue(host.id);
+    built.programService.addItems(host.id, queue.revision, [version.id]);
     const upload = await built.app.inject({
       method: "POST",
       url: "/api/v1/uploads/authorize",
@@ -1622,6 +1677,20 @@ describe("SimpleWatch API", () => {
       "token_jti",
       "service_outbox",
       "audit_events",
+      "edge_eviction_jobs",
+      "program_watch_ranges",
+      "program_play_history",
+      "program_queue_items",
+      "program_queues",
+      "edge_upload_credentials",
+      "edge_cache_replicas",
+      "edge_transfer_jobs",
+      "edge_agent_tasks",
+      "edge_catalog_scan_entries",
+      "edge_catalog_scan_pages",
+      "edge_catalog_scans",
+      "edge_catalog_versions",
+      "edge_catalog_items",
     ]) {
       const row = built.database
         .prepare(`SELECT COUNT(*) AS count FROM ${table}`)
@@ -1632,6 +1701,20 @@ describe("SimpleWatch API", () => {
       (
         built.database
           .prepare("SELECT COUNT(*) AS count FROM admin_users")
+          .get() as { count: number }
+      ).count,
+    ).toBe(1);
+    expect(
+      (
+        built.database
+          .prepare("SELECT COUNT(*) AS count FROM edge_agents")
+          .get() as { count: number }
+      ).count,
+    ).toBe(1);
+    expect(
+      (
+        built.database
+          .prepare("SELECT COUNT(*) AS count FROM edge_agent_tokens")
           .get() as { count: number }
       ).count,
     ).toBe(1);

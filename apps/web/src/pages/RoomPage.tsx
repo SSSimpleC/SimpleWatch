@@ -1,4 +1,10 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import type {
+  EdgeTransfer,
+  ProgramQueue,
+  ProgramQueueItem,
+  RoomCommandRequest,
+} from "@simplewatch/contracts";
 import {
   decideDriftCorrection,
   estimateClock,
@@ -16,15 +22,30 @@ import {
   type MediaItem,
   type RoomSnapshot,
 } from "../api.js";
+import { adminQueryKeys, hasHostControls } from "../admin-data.js";
 import { decideProgramTrack, replaceRetryTimer } from "../live-program.js";
 import { averageBitrateMbps, isHighLoadVod } from "../media-performance.js";
 import { loadPreferences, savePreferences } from "../preferences.js";
+import {
+  buildPlaybackProgress,
+  buildProgramActivationCommand,
+  currentProgramItem,
+  departureCoverageRatio,
+  nextPlaybackSequence,
+  PendingProgramCommands,
+  shouldLoadHostProgram,
+  type DepartureDecision,
+  type PendingProgramActivation,
+} from "../room-program.js";
 import { useSession } from "../store.js";
+import { DepartureDecisionDialog } from "./room/DepartureDecisionDialog.js";
+import { HostProgramQueue } from "./room/HostProgramQueue.js";
 
 export function RoomPage() {
   const { roomId = "" } = useParams();
   const navigate = useNavigate();
-  const { adminCsrf, roomCsrf, setRoomCsrf, memberId, setMemberId } =
+  const queryClient = useQueryClient();
+  const { account, adminCsrf, roomCsrf, setRoomCsrf, memberId, setMemberId } =
     useSession();
   const [snapshot, setSnapshot] = useState<RoomSnapshot | null>(null);
   const [joined, setJoined] = useState(false);
@@ -54,6 +75,8 @@ export function RoomPage() {
   const excessiveDriftSinceRef = useRef<number | null>(null);
   const closingRoomRef = useRef(false);
   const latestSnapshotRef = useRef<RoomSnapshot | null>(null);
+  const latestProgramRef = useRef<ProgramQueue | null | undefined>(undefined);
+  const latestIsHostRef = useRef(false);
   const programEnabledRef = useRef(false);
   const [programEnabled, setProgramEnabled] = useState(false);
   const [playheadSec, setPlayheadSec] = useState(0);
@@ -77,16 +100,43 @@ export function RoomPage() {
     token: string;
   } | null>(null);
   const [publishConfigError, setPublishConfigError] = useState("");
-  const isHost = Boolean(snapshot && memberId === snapshot.hostMemberId);
+  const pendingProgramCommandsRef = useRef(new PendingProgramCommands());
+  const activationTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const progressSequenceRef = useRef(0);
+  const [pendingProgramItemId, setPendingProgramItemId] = useState<
+    string | null
+  >(null);
+  const [departurePrompt, setDeparturePrompt] = useState<{
+    activation: PendingProgramActivation;
+    coveredRatio: number | null;
+  } | null>(null);
+  const isHost = hasHostControls(
+    account?.role,
+    memberId,
+    snapshot?.hostMemberId,
+  );
   const media = useQuery({
     queryKey: ["room-media", snapshot?.media?.id],
     queryFn: () => api<MediaItem>(`/api/v1/media/${snapshot?.media?.id ?? ""}`),
     enabled: Boolean(snapshot?.media?.id),
   });
   const library = useQuery({
-    queryKey: ["media"],
+    queryKey: adminQueryKeys.media,
     queryFn: () => api<MediaItem[]>("/api/v1/media"),
     enabled: isHost && Boolean(adminCsrf),
+  });
+  const hostProgramEnabled = shouldLoadHostProgram(isHost, adminCsrf);
+  const program = useQuery({
+    queryKey: adminQueryKeys.program,
+    queryFn: () => api<ProgramQueue | null>("/api/v1/admin/program"),
+    enabled: hostProgramEnabled,
+    refetchInterval: hostProgramEnabled ? 5000 : false,
+  });
+  const edgeTransfers = useQuery({
+    queryKey: adminQueryKeys.edgeTransfers,
+    queryFn: () => api<EdgeTransfer[]>("/api/v1/admin/edge/transfers"),
+    enabled: hostProgramEnabled,
+    refetchInterval: hostProgramEnabled ? 5000 : false,
   });
   const liveStatus = useQuery({
     queryKey: ["live-status", roomId],
@@ -106,8 +156,15 @@ export function RoomPage() {
     snapshot?.members.filter((member) => member.online).length ?? 0;
   const aggregateBitrateMbps = bitrateMbps * onlinePlaybackEndpoints;
   const highLoadVod = isHighLoadVod(media.data);
+  const programMediaIds = new Set(
+    program.data?.items.flatMap((item) =>
+      item.mediaId ? [item.mediaId] : [],
+    ) ?? [],
+  );
 
   latestSnapshotRef.current = snapshot;
+  latestProgramRef.current = program.data;
+  latestIsHostRef.current = isHost;
   programEnabledRef.current = programEnabled;
 
   useEffect(() => {
@@ -187,6 +244,41 @@ export function RoomPage() {
       }),
     );
   }, [connected, roomId, snapshot?.revision, voiceState]);
+
+  useEffect(() => {
+    progressSequenceRef.current = 0;
+    pendingProgramCommandsRef.current.clear();
+    setPendingProgramItemId(null);
+    setDeparturePrompt(null);
+  }, [roomId]);
+
+  useEffect(() => {
+    if (isHost) return;
+    pendingProgramCommandsRef.current.clear();
+    setPendingProgramItemId(null);
+    setDeparturePrompt(null);
+  }, [isHost]);
+
+  useEffect(() => {
+    if (!hostProgramEnabled) return;
+    const timer = window.setInterval(() => {
+      sendPlaybackProgress();
+    }, 5000);
+    const reportBeforeLeave = () => {
+      sendPlaybackProgress();
+    };
+    const reportWhenHidden = () => {
+      if (document.visibilityState === "hidden") sendPlaybackProgress();
+    };
+    addEventListener("pagehide", reportBeforeLeave);
+    document.addEventListener("visibilitychange", reportWhenHidden);
+    return () => {
+      sendPlaybackProgress();
+      window.clearInterval(timer);
+      removeEventListener("pagehide", reportBeforeLeave);
+      document.removeEventListener("visibilitychange", reportWhenHidden);
+    };
+  }, [hostProgramEnabled, roomId]);
 
   useEffect(() => {
     setSeekDraftSec(null);
@@ -272,6 +364,18 @@ export function RoomPage() {
         ) {
           const next = message.payload as RoomSnapshot;
           setSnapshot(next);
+          if (pendingProgramCommandsRef.current.resolveSnapshot(next)) {
+            setPendingProgramItemId(null);
+            setDeparturePrompt(null);
+            void Promise.all([
+              queryClient.invalidateQueries({
+                queryKey: adminQueryKeys.program,
+              }),
+              queryClient.invalidateQueries({
+                queryKey: adminQueryKeys.edgeTransfers,
+              }),
+            ]);
+          }
           if (clockOffsetMsRef.current === null)
             clockOffsetMsRef.current = next.serverNowMs - Date.now();
         }
@@ -295,8 +399,34 @@ export function RoomPage() {
             setClockRttMs(Math.round(stable.roundTripMs));
           }
         }
-        if (message.type === "room.command.rejected")
-          setError("操作未生效，状态已刷新");
+        if (message.type === "room.command.rejected") {
+          const rejection = message.payload as {
+            commandId?: string | null;
+            code?: string;
+            message?: string;
+            details?: unknown;
+          };
+          const pending = pendingProgramCommandsRef.current.take(
+            rejection.commandId,
+          );
+          if (pending) {
+            setPendingProgramItemId(null);
+            if (rejection.code === "PROGRAM_DEPARTURE_DECISION_REQUIRED") {
+              setDeparturePrompt({
+                activation: pending,
+                coveredRatio: departureCoverageRatio(rejection.details),
+              });
+            } else {
+              setError(rejection.message ?? "节目切换未生效");
+              restoreActivationFocus();
+            }
+            void queryClient.invalidateQueries({
+              queryKey: adminQueryKeys.program,
+            });
+          } else if (rejection.code !== "PLAYBACK_PROGRESS_STALE") {
+            setError(rejection.message ?? "操作未生效，状态已刷新");
+          }
+        }
       });
     };
 
@@ -323,7 +453,7 @@ export function RoomPage() {
       socketRef.current?.close(1000, "page leave");
       socketRef.current = null;
     };
-  }, [joined, navigate, roomId]);
+  }, [joined, navigate, queryClient, roomId]);
 
   useEffect(() => {
     reconcileVod("snapshot");
@@ -377,18 +507,130 @@ export function RoomPage() {
     [],
   );
 
-  function command(commandPayload: Record<string, unknown>) {
-    if (!snapshot || socketRef.current?.readyState !== WebSocket.OPEN) return;
+  function command(
+    commandPayload: RoomCommandRequest["command"],
+  ): string | null {
+    if (!snapshot || socketRef.current?.readyState !== WebSocket.OPEN)
+      return null;
+    const commandId = uuidv7();
     socketRef.current.send(
       JSON.stringify(
         envelope(roomId, "room.command", {
-          commandId: uuidv7(),
+          commandId,
           expectedRevision: snapshot.revision,
           effectiveAtServerMs: Date.now() + 750,
           command: commandPayload,
         }),
       ),
     );
+    return commandId;
+  }
+
+  function sendPlaybackProgress(playingOverride?: boolean): boolean {
+    const socket = socketRef.current;
+    const currentSnapshot = latestSnapshotRef.current;
+    const currentProgram = latestProgramRef.current;
+    if (
+      socket?.readyState !== WebSocket.OPEN ||
+      !latestIsHostRef.current ||
+      !currentProgramItem(currentProgram, currentSnapshot?.media?.id)
+    ) {
+      return false;
+    }
+    const sequence = nextPlaybackSequence(
+      roomId,
+      progressSequenceRef.current,
+      window.sessionStorage,
+    );
+    const videoPosition = videoRef.current?.currentTime;
+    const progress = buildPlaybackProgress({
+      isHost: latestIsHostRef.current,
+      queue: currentProgram,
+      snapshot: currentSnapshot,
+      sequence,
+      positionSec:
+        typeof videoPosition === "number" && Number.isFinite(videoPosition)
+          ? videoPosition
+          : (currentSnapshot?.transport?.positionSec ?? 0),
+      sampledAtClientMs: Date.now(),
+      ...(playingOverride === undefined ? {} : { playingOverride }),
+    });
+    if (!progress) return false;
+    progressSequenceRef.current = sequence;
+    socket.send(
+      JSON.stringify(envelope(roomId, "playback.progress", progress)),
+    );
+    return true;
+  }
+
+  function activateProgramItem(
+    item: ProgramQueueItem,
+    trigger: HTMLButtonElement,
+  ): void {
+    const currentProgram = latestProgramRef.current;
+    const currentSnapshot = latestSnapshotRef.current;
+    if (
+      !currentProgram ||
+      !currentSnapshot ||
+      !item.mediaId ||
+      item.preparationState !== "ready"
+    ) {
+      return;
+    }
+    activationTriggerRef.current = trigger;
+    sendPlaybackProgress(false);
+    sendProgramActivation(
+      {
+        programQueueId: currentProgram.id,
+        programItemId: item.id,
+        mediaId: item.mediaId,
+        displayName: item.displayName,
+        expectedRoomRevision: currentSnapshot.revision,
+      },
+      undefined,
+    );
+  }
+
+  function sendProgramActivation(
+    activation: PendingProgramActivation,
+    decision: DepartureDecision | undefined,
+  ): void {
+    const currentSnapshot = latestSnapshotRef.current;
+    const commandId = command(
+      buildProgramActivationCommand(
+        { id: activation.programQueueId },
+        { id: activation.programItemId },
+        decision,
+      ),
+    );
+    if (!commandId || !currentSnapshot) {
+      setError("同步连接尚未恢复，暂时不能切换节目");
+      restoreActivationFocus();
+      return;
+    }
+    const tracked = {
+      ...activation,
+      expectedRoomRevision: currentSnapshot.revision,
+    };
+    pendingProgramCommandsRef.current.track(commandId, tracked);
+    setPendingProgramItemId(activation.programItemId);
+    setError("");
+  }
+
+  function decideDeparture(decision: DepartureDecision): void {
+    if (!departurePrompt) return;
+    const activation = departurePrompt.activation;
+    setDeparturePrompt(null);
+    sendPlaybackProgress(false);
+    sendProgramActivation(activation, decision);
+  }
+
+  function cancelDeparture(): void {
+    setDeparturePrompt(null);
+  }
+
+  function restoreActivationFocus(): void {
+    window.requestAnimationFrame(() => activationTriggerRef.current?.focus());
   }
 
   function scheduleClockBurst(socket: WebSocket, sampleCount = 7) {
@@ -761,6 +1003,7 @@ export function RoomPage() {
   async function toggleVodPlayback() {
     if (!isHost || !snapshot?.transport) return;
     if (!programEnabled) await enableProgramSound();
+    if (snapshot.transport.state === "playing") sendPlaybackProgress(false);
     command({
       kind: snapshot.transport.state === "playing" ? "pause" : "play",
     });
@@ -1094,6 +1337,14 @@ export function RoomPage() {
                 updateProgramMetrics(event.currentTarget, "playing");
                 reconcileVod("playing");
               }}
+              onPause={(event) => {
+                updateProgramMetrics(event.currentTarget, "pause");
+                sendPlaybackProgress(false);
+              }}
+              onEnded={(event) => {
+                updateProgramMetrics(event.currentTarget, "ended");
+                sendPlaybackProgress(false);
+              }}
               onWaiting={(event) => {
                 stallCountRef.current += 1;
                 updateProgramMetrics(event.currentTarget, "waiting");
@@ -1309,6 +1560,16 @@ export function RoomPage() {
             </label>
           </div>
           {isHost && (
+            <HostProgramQueue
+              program={program.data}
+              transfers={edgeTransfers.data ?? []}
+              loading={program.isLoading}
+              error={program.error ?? edgeTransfers.error}
+              pendingItemId={pendingProgramItemId}
+              onActivate={activateProgramItem}
+            />
+          )}
+          {isHost && (
             <section className="host-controls">
               <strong>主持控制</strong>
               <select
@@ -1321,7 +1582,11 @@ export function RoomPage() {
               >
                 <option value="">选择片库影片</option>
                 {library.data
-                  ?.filter((item) => item.state === "published")
+                  ?.filter(
+                    (item) =>
+                      item.state === "published" &&
+                      !programMediaIds.has(item.id),
+                  )
                   .map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.displayName}
@@ -1471,6 +1736,15 @@ export function RoomPage() {
           {error && <output className="room-error">{error}</output>}
         </aside>
       </div>
+      <DepartureDecisionDialog
+        open={Boolean(departurePrompt)}
+        currentTitle={snapshot?.media?.title ?? ""}
+        targetTitle={departurePrompt?.activation.displayName ?? ""}
+        coveredRatio={departurePrompt?.coveredRatio ?? null}
+        returnFocus={activationTriggerRef.current}
+        onDecision={decideDeparture}
+        onCancel={cancelDeparture}
+      />
       <footer className="room-footer">
         <span>CSRF {roomCsrf ? "ARMED" : "MISSING"}</span>
         <span>同步锚点 {snapshot?.transport?.anchoredAtServerMs ?? "—"}</span>

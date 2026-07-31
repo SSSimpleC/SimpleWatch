@@ -114,8 +114,21 @@ importers:
         specifier: 4.21.0
         version: 4.21.0
 
+  apps/edge-agent:
+    dependencies:
+      "@simplewatch/contracts":
+        specifier: workspace:*
+        version: link:../../packages/contracts
+    devDependencies:
+      tsx:
+        specifier: 4.21.0
+        version: 4.21.0
+
   apps/web:
     dependencies:
+      "@simplewatch/contracts":
+        specifier: workspace:*
+        version: link:../../packages/contracts
       "@simplewatch/sync":
         specifier: workspace:*
         version: link:../../packages/sync

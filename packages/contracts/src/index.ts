@@ -1,5 +1,10 @@
 import { z } from "zod";
 
+import { activateProgramQueueItemCommandSchema } from "./program.js";
+
+export * from "./edge.js";
+export * from "./program.js";
+
 export const roomModeSchema = z.enum(["idle", "vod", "live"]);
 export type RoomMode = z.infer<typeof roomModeSchema>;
 
@@ -158,6 +163,10 @@ export const workerResultSchema = z.object({
   probe: z.record(z.string(), z.unknown()),
   reasons: z.array(z.string()),
   sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  sourceSha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
   bytes: z.number().int().nonnegative(),
   durationMs: z.number().int().nonnegative().nullable(),
   finalPath: z.string().min(1),
@@ -246,6 +255,7 @@ export const roomCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("pause") }),
   z.object({ kind: z.literal("seek"), positionSec: z.number().nonnegative() }),
   z.object({ kind: z.literal("set-rate"), rate: playbackRateSchema }),
+  activateProgramQueueItemCommandSchema,
 ]);
 
 export const roomCommandRequestSchema = z.object({

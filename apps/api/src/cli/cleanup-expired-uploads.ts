@@ -48,6 +48,7 @@ try {
       `SELECT id, owner_admin_id
        FROM uploads
        WHERE state IN ('authorized', 'uploading') AND expires_at <= ?
+         AND edge_job_id IS NULL
        ORDER BY created_at, id`,
     )
     .all(now) as ExpiredUploadRow[];

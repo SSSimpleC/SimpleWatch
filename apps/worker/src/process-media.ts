@@ -24,6 +24,8 @@ export interface ProbeJobPayload {
   readonly filePath: string;
   readonly storageKey: string;
   readonly source?: "sftp" | undefined;
+  readonly expectedSourceSha256?: string | undefined;
+  readonly edgeJobId?: string | undefined;
 }
 
 export interface MediaWorkerRoots {
@@ -42,6 +44,9 @@ export async function processProbeJob(
   const sourceRoot =
     payload.source === "sftp" ? roots.inboxRoot : roots.uploadRoot;
   const storageKey = requireStorageKey(payload.storageKey);
+  const expectedSourceSha256 = requireOptionalSha256(
+    payload.expectedSourceSha256,
+  );
   const requestedSource = requireLexicalPathWithin(
     payload.filePath,
     sourceRoot,
@@ -55,7 +60,15 @@ export async function processProbeJob(
     if (!inspected.compatibility.compatible) {
       throw new Error("最终媒体目录中的影片已不满足兼容性要求");
     }
-    return inspected.result;
+    const sourceSha256 = recoverSourceSha256(
+      join(roots.mediaRoot, storageKey),
+      expectedSourceSha256,
+      inspected.result.sha256,
+    );
+    return {
+      ...inspected.result,
+      ...(sourceSha256 ? { sourceSha256 } : {}),
+    };
   }
   const inboxPath = join(
     roots.inboxRoot,
@@ -67,6 +80,10 @@ export async function processProbeJob(
     : requireExistingFileWithin(requestedSource, sourceRoot);
   const before = statSync(source);
   if (!before.isFile()) throw new Error("上传结果不是普通文件");
+  const sourceSha256 = await hashFile(source);
+  if (expectedSourceSha256 && sourceSha256 !== expectedSourceSha256) {
+    throw new Error("上传源文件 SHA-256 与家庭目录版本不一致");
+  }
 
   let { probe, compatibility } = await probeFile(source, ffprobePath);
   const destinationRoot = compatibility.compatible
@@ -104,6 +121,12 @@ export async function processProbeJob(
       }
       probe = verified.probe;
       compatibility = verified.compatibility;
+      const remuxSha256 = await hashFile(temporary);
+      writeIngestSidecar(destinationDirectory, {
+        expectedSourceSha256,
+        sourceSha256,
+        finalSha256: remuxSha256,
+      });
       renameSync(temporary, finalPath);
       unlinkSync(source);
     } catch (error) {
@@ -111,16 +134,30 @@ export async function processProbeJob(
       throw error;
     }
   } else {
+    writeIngestSidecar(destinationDirectory, {
+      expectedSourceSha256,
+      sourceSha256,
+      finalSha256: sourceSha256,
+    });
     moveFile(source, finalPath);
   }
   const finalStat = statSync(finalPath);
   const sha256 = await hashFile(finalPath);
+
+  if (resolve(source) === resolve(finalPath)) {
+    writeIngestSidecar(destinationDirectory, {
+      expectedSourceSha256,
+      sourceSha256,
+      finalSha256: sha256,
+    });
+  }
 
   return {
     compatible: compatibility.compatible,
     probe,
     reasons: compatibility.reasons,
     sha256,
+    sourceSha256,
     bytes: finalStat.size,
     durationMs: compatibility.durationMs,
     finalPath: resolve(finalPath),
@@ -203,6 +240,83 @@ async function hashFile(path: string): Promise<string> {
   for await (const chunk of createReadStream(path))
     hash.update(chunk as Buffer);
   return hash.digest("hex");
+}
+
+interface IngestSidecar {
+  readonly version: 1;
+  readonly expectedSourceSha256: string | null;
+  readonly sourceSha256: string;
+  readonly finalSha256: string;
+}
+
+const INGEST_SIDECAR_FILENAME = ".simplewatch-ingest.json";
+
+function writeIngestSidecar(
+  directory: string,
+  hashes: Omit<IngestSidecar, "version" | "expectedSourceSha256"> & {
+    readonly expectedSourceSha256: string | undefined;
+  },
+): void {
+  const finalPath = join(directory, INGEST_SIDECAR_FILENAME);
+  const temporaryPath = `${finalPath}.${randomUUID()}.tmp`;
+  const sidecar: IngestSidecar = {
+    version: 1,
+    expectedSourceSha256: hashes.expectedSourceSha256 ?? null,
+    sourceSha256: hashes.sourceSha256,
+    finalSha256: hashes.finalSha256,
+  };
+  try {
+    writeFileSync(temporaryPath, `${JSON.stringify(sidecar)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    renameSync(temporaryPath, finalPath);
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
+}
+
+function recoverSourceSha256(
+  directory: string,
+  expectedSourceSha256: string | undefined,
+  finalSha256: string,
+): string | undefined {
+  const sidecarPath = join(directory, INGEST_SIDECAR_FILENAME);
+  if (!existsSync(sidecarPath)) {
+    if (expectedSourceSha256) {
+      throw new Error("缺少 Edge 源文件校验记录，拒绝恢复任务");
+    }
+    return undefined;
+  }
+  let sidecar: IngestSidecar;
+  try {
+    sidecar = JSON.parse(readFileSync(sidecarPath, "utf8")) as IngestSidecar;
+  } catch {
+    throw new Error("Edge 源文件校验记录损坏");
+  }
+  if (
+    sidecar.version !== 1 ||
+    !isSha256(sidecar.sourceSha256) ||
+    !isSha256(sidecar.finalSha256) ||
+    sidecar.finalSha256 !== finalSha256
+  ) {
+    throw new Error("Edge 源文件校验记录与发布文件不一致");
+  }
+  if (expectedSourceSha256 && sidecar.sourceSha256 !== expectedSourceSha256) {
+    throw new Error("Edge 源文件校验记录与任务版本不一致");
+  }
+  return sidecar.sourceSha256;
+}
+
+function requireOptionalSha256(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if (!isSha256(value)) throw new Error("预期源文件 SHA-256 无效");
+  return value;
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
 async function inspectProbeArtifact(path: string, ffprobePath: string) {

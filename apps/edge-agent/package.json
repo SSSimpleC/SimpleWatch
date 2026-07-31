@@ -1,0 +1,19 @@
+{
+  "name": "@simplewatch/edge-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "node --import tsx src/main.ts",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run test"
+  },
+  "dependencies": {
+    "@simplewatch/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "tsx": "4.21.0"
+  }
+}

@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 
 import YAML from "yaml";
 
@@ -8,6 +8,7 @@ const pinnedNodeImage =
 const files = [
   "infra/compose/compose.local.yaml",
   "infra/compose/compose.server-ip.yaml",
+  "infra/compose/compose.edge-agent.yaml",
 ];
 const docker = spawnSync("docker", ["compose", "version"], {
   stdio: "ignore",
@@ -30,6 +31,8 @@ if (docker.status === 0) {
     LIVEKIT_URL: "wss://127.0.0.1",
     LIVEKIT_ARCHIVE_SHA256: "a".repeat(64),
     MEDIAMTX_ARCHIVE_SHA256: "b".repeat(64),
+    EDGE_API_ORIGIN: "https://127.0.0.1",
+    EDGE_AGENT_ARTIFACT_SHA256: "e".repeat(64),
   };
   for (const file of files) {
     const result = spawnSync(
@@ -52,6 +55,7 @@ for (const file of files) {
 }
 
 const server = YAML.parse(readFileSync(files[1], "utf8"));
+const edge = YAML.parse(readFileSync(files[2], "utf8"));
 const productionServices = [
   "app",
   "worker",
@@ -83,6 +87,98 @@ for (const required of productionServices) {
   if (service.env_file !== undefined) {
     throw new Error(`${required}不得通过env_file注入整份生产密钥`);
   }
+}
+
+const edgeAgent = edge.services?.["edge-agent"];
+if (!edgeAgent) throw new Error("家庭Compose缺少edge-agent");
+if (edgeAgent.privileged === true)
+  throw new Error("edge-agent不得使用privileged");
+if (!(edgeAgent.security_opt ?? []).includes("no-new-privileges:true")) {
+  throw new Error("edge-agent缺少no-new-privileges");
+}
+if (edgeAgent.read_only !== true)
+  throw new Error("edge-agent根文件系统必须只读");
+if (!edgeAgent.mem_limit || !edgeAgent.cpus || !edgeAgent.pids_limit) {
+  throw new Error("edge-agent缺少资源与进程上限");
+}
+if ((edgeAgent.ports ?? []).length > 0)
+  throw new Error("edge-agent不得开放入站端口");
+if ((edgeAgent.expose ?? []).length > 0 || edgeAgent.network_mode === "host") {
+  throw new Error("edge-agent不得暴露端口或使用host网络");
+}
+if ("EDGE_AGENT_TOKEN" in (edgeAgent.environment ?? {})) {
+  throw new Error("edge-agent令牌不得直接放入环境变量");
+}
+const edgeVolumes = edgeAgent.volumes ?? [];
+if (edgeVolumes.length !== 3) {
+  throw new Error("edge-agent只允许Library、状态与令牌三项固定挂载");
+}
+const libraryVolume = edgeVolumes.find(
+  (volume) => typeof volume === "object" && volume.target === "/library",
+);
+if (
+  !libraryVolume ||
+  libraryVolume.type !== "bind" ||
+  libraryVolume.source !==
+    "/srv/dev-disk-by-uuid-7E82064F82060C79/PLAYS/SimpleWatchLibrary" ||
+  libraryVolume.read_only !== true ||
+  libraryVolume.bind?.create_host_path !== false
+) {
+  throw new Error("edge-agent必须以只读方式挂载专用Library");
+}
+const stateVolume = edgeVolumes.find(
+  (volume) => typeof volume === "object" && volume.target === "/state",
+);
+if (
+  !stateVolume ||
+  stateVolume.type !== "bind" ||
+  stateVolume.source !== "/srv/simplewatch-edge-agent/state" ||
+  stateVolume.read_only === true ||
+  stateVolume.bind?.create_host_path !== false
+) {
+  throw new Error("edge-agent状态目录必须是唯一固定的可写持久挂载");
+}
+const tokenVolume = edgeVolumes.find(
+  (volume) =>
+    typeof volume === "object" &&
+    volume.target === "/run/secrets/edge_agent_token",
+);
+if (
+  !tokenVolume ||
+  tokenVolume.type !== "bind" ||
+  tokenVolume.source !== "/etc/simplewatch-edge-agent/agent-token" ||
+  tokenVolume.read_only !== true ||
+  tokenVolume.bind?.create_host_path !== false
+) {
+  throw new Error("edge-agent令牌必须从固定0400文件只读挂载");
+}
+const serializedEdgeVolumes = JSON.stringify(edgeVolumes);
+if (serializedEdgeVolumes.includes("docker.sock")) {
+  throw new Error("edge-agent不得挂载Docker socket");
+}
+if (
+  edgeAgent.environment?.LIBRARY_ROOT !== "/library" ||
+  edgeAgent.environment?.EDGE_AGENT_TOKEN_FILE !==
+    "/run/secrets/edge_agent_token"
+) {
+  throw new Error("edge-agent容器路径必须绑定固定Library与令牌挂载点");
+}
+if (
+  edgeAgent.user !== "10001:10001" ||
+  JSON.stringify(edgeAgent.cap_drop) !== JSON.stringify(["ALL"])
+) {
+  throw new Error("edge-agent必须以10001身份运行并移除全部Linux capabilities");
+}
+if (edgeAgent.environment?.EDGE_HEARTBEAT_INTERVAL_MS !== "15000") {
+  throw new Error("edge-agent心跳必须小于60秒租约的三分之一");
+}
+if (
+  edgeAgent.build?.args?.EDGE_AGENT_RELEASE_TAG !==
+    "${RELEASE_TAG:?RELEASE_TAG is required}" ||
+  edgeAgent.build?.args?.EDGE_AGENT_ARTIFACT_SHA256 !==
+    "${EDGE_AGENT_ARTIFACT_SHA256:?EDGE_AGENT_ARTIFACT_SHA256 is required}"
+) {
+  throw new Error("edge-agent镜像必须绑定发布标签与构建产物SHA-256");
 }
 
 const app = server.services.app;
@@ -129,8 +225,31 @@ if (
 }
 
 const dockerfile = readFileSync("Dockerfile", "utf8");
+const edgeDockerfile = readFileSync(
+  "infra/images/edge-agent/Dockerfile",
+  "utf8",
+);
 if (!dockerfile.includes(`ARG NODE_IMAGE=${pinnedNodeImage}`)) {
   throw new Error("Dockerfile未固定Node基础镜像digest");
+}
+if (!edgeDockerfile.includes(`ARG NODE_IMAGE=${pinnedNodeImage}`)) {
+  throw new Error("Edge Agent Dockerfile未固定Node基础镜像digest");
+}
+if (edgeDockerfile.includes("ffmpeg") || edgeDockerfile.includes("apt-get")) {
+  throw new Error("Edge Agent镜像不得继承云端媒体处理依赖");
+}
+if (!edgeDockerfile.includes('CMD ["node", "main.mjs"]')) {
+  throw new Error("Edge Agent镜像必须直接运行打包后的JavaScript");
+}
+for (const requiredFragment of [
+  "ARG EDGE_AGENT_RELEASE_TAG",
+  "ARG EDGE_AGENT_ARTIFACT_SHA256",
+  'org.opencontainers.image.version="${EDGE_AGENT_RELEASE_TAG}"',
+  'io.simplewatch.edge-agent.artifact-sha256="${EDGE_AGENT_ARTIFACT_SHA256}"',
+]) {
+  if (!edgeDockerfile.includes(requiredFragment)) {
+    throw new Error(`Edge Agent镜像缺少发布产物绑定：${requiredFragment}`);
+  }
 }
 for (const requiredFragment of [
   "pnpm build:production",
@@ -168,6 +287,87 @@ for (const requiredFragment of [
 ]) {
   if (!deploymentScript.includes(requiredFragment)) {
     throw new Error(`生产发布脚本缺少运行约束：${requiredFragment}`);
+  }
+}
+
+const edgeDeploymentScripts = [
+  "tools/server/install-edge-agent-token.sh",
+  "tools/server/deploy-edge-agent.sh",
+];
+for (const script of edgeDeploymentScripts) {
+  if ((statSync(script).mode & 0o111) === 0) {
+    throw new Error(`${script}缺少可执行位`);
+  }
+  const syntax = spawnSync("bash", ["-n", script], { stdio: "inherit" });
+  if (syntax.status !== 0) throw new Error(`${script}未通过bash -n`);
+}
+const tokenInstaller = readFileSync(edgeDeploymentScripts[0], "utf8");
+for (const requiredFragment of [
+  "umask 077",
+  "chown 10001:10001",
+  "chmod 0400",
+  "10001:10001:400",
+]) {
+  if (!tokenInstaller.includes(requiredFragment)) {
+    throw new Error(`令牌安装脚本缺少约束：${requiredFragment}`);
+  }
+}
+const tokenOutputLines = tokenInstaller
+  .split("\n")
+  .filter((line) => /(?:printf|echo).*\$token/.test(line));
+if (tokenOutputLines.some((line) => !line.includes('>"$temporary"'))) {
+  throw new Error("令牌安装脚本不得回显机器令牌");
+}
+const edgeDeployment = readFileSync(edgeDeploymentScripts[1], "utf8");
+for (const requiredFragment of [
+  "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+  "EDGE_AGENT_DEPLOY_ROLLED_BACK",
+  'rm -f -- "$current_link"',
+  'cp -a "$backup_dir/state/." "$state_root/"',
+  '"$library_mount" != "$approved_library|false"',
+  '"$token_mount" != "$token_path|false"',
+  "{{len .HostConfig.PortBindings}}",
+  "verification_timeout_seconds=600",
+  'sha256sum "$release_dir/dist/edge-agent/main.mjs"',
+  "EDGE_AGENT_ARTIFACT_SHA256",
+  "io.simplewatch.edge-agent.artifact-sha256",
+  'readFileSync("/opt/simplewatch-edge-agent/main.mjs")',
+  '"message":"Agent 已连接控制面"',
+  '"message":"家庭媒体目录已同步"',
+  "EDGE_AGENT_DEPLOY_VERIFY_FAILED",
+  "edge-agent-deployment-verification.txt",
+  'docker image rm "$image_ref"',
+  "heartbeat=verified",
+  "catalog_commit=verified",
+]) {
+  if (!edgeDeployment.includes(requiredFragment)) {
+    throw new Error(`Edge部署脚本缺少安全约束：${requiredFragment}`);
+  }
+}
+if (/logs --tail|docker logs[^\n]*>&2/.test(edgeDeployment)) {
+  throw new Error("Edge部署失败不得向终端倾倒可能含家庭路径的原始容器日志");
+}
+const edgeAgentSource = readFileSync("apps/edge-agent/src/agent.ts", "utf8");
+for (const safeSuccessEvent of [
+  'this.#logger.info("Agent 已连接控制面");',
+  'this.#logger.info("家庭媒体目录已同步", {',
+]) {
+  if (!edgeAgentSource.includes(safeSuccessEvent)) {
+    throw new Error(`Edge Agent缺少脱敏发布验证事件：${safeSuccessEvent}`);
+  }
+}
+const edgeUnit = readFileSync(
+  "infra/systemd/simplewatch-edge-agent.service",
+  "utf8",
+);
+for (const requiredFragment of [
+  "RequiresMountsFor=/srv/dev-disk-by-uuid-7E82064F82060C79/PLAYS/SimpleWatchLibrary",
+  "BindsTo=srv-dev\\x2ddisk\\x2dby\\x2duuid\\x2d7E82064F82060C79.mount",
+  "NoNewPrivileges=yes",
+  "ProtectSystem=strict",
+]) {
+  if (!edgeUnit.includes(requiredFragment)) {
+    throw new Error(`Edge systemd单元缺少约束：${requiredFragment}`);
   }
 }
 if (/node_modules\/tsx|apps\/api\/src\/cli/.test(deploymentScript)) {

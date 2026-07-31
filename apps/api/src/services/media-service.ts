@@ -11,7 +11,10 @@ import { join, sep } from "node:path";
 
 import { v7 as uuidv7 } from "uuid";
 
-import type { UploadAuthorizeRequest } from "@simplewatch/contracts";
+import type {
+  EdgeTusCredential,
+  UploadAuthorizeRequest,
+} from "@simplewatch/contracts";
 import {
   evaluateCompatibility,
   moveFile,
@@ -64,6 +67,7 @@ interface UploadRow {
   readonly declared_bytes: number;
   readonly received_bytes: number;
   readonly expires_at: number;
+  readonly edge_job_id: string | null;
 }
 
 interface JobRow {
@@ -86,6 +90,7 @@ interface WorkerHeartbeatRow {
 const JOB_LEASE_MILLISECONDS = 60_000;
 const WORKER_FRESHNESS_MILLISECONDS = 60_000;
 const MAX_JOB_ATTEMPTS = 5;
+const STORAGE_SAFETY_FLOOR_BYTES = 12 * 1024 * 1024 * 1024;
 
 export interface MediaServiceOptions {
   readonly mediaRoot: string;
@@ -465,13 +470,16 @@ export class MediaService {
         const reserved = this.database
           .prepare(
             `SELECT COALESCE(SUM(reserved_bytes), 0) AS total FROM uploads
-           WHERE state IN ('authorized', 'uploading', 'received', 'scanning') AND expires_at > ?`,
+             WHERE reserved_bytes > 0`,
           )
-          .get(createdAt) as { readonly total: number };
+          .get() as { readonly total: number };
         const disk = statfsSync(this.options.uploadRoot);
         const availableBytes = disk.bavail * disk.bsize;
-        const requiredReserve = input.bytes + 12 * 1024 * 1024 * 1024;
-        if (availableBytes - reserved.total < requiredReserve) {
+        const requiredReserve = input.bytes * 2;
+        if (
+          availableBytes - reserved.total - requiredReserve <
+          STORAGE_SAFETY_FLOOR_BYTES
+        ) {
           throw new AppError(507, "INSUFFICIENT_STORAGE", "磁盘空间不足");
         }
         this.database
@@ -486,7 +494,7 @@ export class MediaService {
             id,
             adminId,
             input.bytes,
-            input.bytes,
+            requiredReserve,
             expiresAt,
             createdAt,
             filename,
@@ -523,6 +531,170 @@ export class MediaService {
     return serializeUpload(row);
   }
 
+  public authorizeEdgeUpload(input: {
+    readonly edgeTransferId: string;
+    readonly agentId: string;
+    readonly taskId: string;
+    readonly taskAttempt: number;
+    readonly ownerAccountId: string;
+    readonly filename: string;
+    readonly bytes: number;
+    readonly mime: string;
+    readonly sourceSha256?: string;
+  }): EdgeTusCredential {
+    const filename = sanitizeDisplayName(input.filename);
+    const timestamp = this.now();
+    const credentialExpiresAt = timestamp + 20 * 60 * 1000;
+    const refreshAfter = timestamp + 10 * 60 * 1000;
+    const token = `swupload_v1_${createOpaqueToken(32)}`;
+    let uploadId = "";
+    let existingUpload = false;
+    this.database.transaction(() => {
+      const transfer = this.database
+        .prepare(
+          `SELECT t.id, t.agent_id, t.declared_bytes, t.upload_id, t.state,
+                  t.expected_sha256, u.tus_id, a.enabled AS agent_enabled,
+                  a.revoked_at AS agent_revoked_at, task.state AS task_state,
+                  task.attempts AS task_attempt, task.lease_until AS task_lease_until
+           FROM edge_transfer_jobs t
+           LEFT JOIN uploads u ON u.id = t.upload_id
+           JOIN edge_agents a ON a.id = t.agent_id
+           JOIN edge_agent_tasks task ON task.id = ? AND task.agent_id = t.agent_id
+           WHERE t.id = ?`,
+        )
+        .get(input.taskId, input.edgeTransferId) as
+        | {
+            readonly id: string;
+            readonly agent_id: string | null;
+            readonly declared_bytes: number;
+            readonly upload_id: string | null;
+            readonly state: string;
+            readonly expected_sha256: string | null;
+            readonly tus_id: string | null;
+            readonly agent_enabled: number;
+            readonly agent_revoked_at: number | null;
+            readonly task_state: string;
+            readonly task_attempt: number;
+            readonly task_lease_until: number | null;
+          }
+        | undefined;
+      if (!transfer || transfer.agent_id !== input.agentId) {
+        throw notFound("Edge 传输任务不存在");
+      }
+      if (
+        transfer.agent_enabled !== 1 ||
+        transfer.agent_revoked_at !== null ||
+        transfer.task_state !== "leased" ||
+        transfer.task_attempt !== input.taskAttempt ||
+        transfer.task_lease_until === null ||
+        transfer.task_lease_until <= timestamp
+      ) {
+        throw conflict("EDGE_TASK_LEASE_EXPIRED", "Edge任务租约已失效");
+      }
+      if (transfer.declared_bytes !== input.bytes) {
+        throw conflict("EDGE_SOURCE_CHANGED", "家庭源文件大小已经改变");
+      }
+      if (
+        new Set([
+          "ready",
+          "cancel_requested",
+          "cancelled",
+          "incompatible",
+          "failed",
+          "evicted",
+        ]).has(transfer.state)
+      ) {
+        throw conflict("EDGE_TRANSFER_TERMINAL", "Edge 传输任务已经结束");
+      }
+      uploadId = transfer.upload_id ?? uuidv7();
+      existingUpload = transfer.tus_id !== null;
+      if (
+        input.sourceSha256 &&
+        transfer.expected_sha256 &&
+        input.sourceSha256 !== transfer.expected_sha256
+      ) {
+        throw conflict("EDGE_SOURCE_CHANGED", "家庭源文件摘要已经改变");
+      }
+      if (!transfer.upload_id) {
+        const requiredReserve = input.bytes * 2;
+        this.requireStorageReservation(requiredReserve);
+        this.database
+          .prepare(
+            `INSERT INTO uploads(
+               id, owner_admin_id, state, declared_bytes, reserved_bytes,
+               received_bytes, tus_id, source, expires_at, error_code,
+               created_at, finished_at, filename, mime, upload_token_hash,
+               edge_job_id
+             ) VALUES (?, ?, 'authorized', ?, ?, 0, NULL, 'tus', ?, NULL,
+                       ?, NULL, ?, ?, NULL, ?)`,
+          )
+          .run(
+            uploadId,
+            input.ownerAccountId,
+            input.bytes,
+            requiredReserve,
+            timestamp + 2 * 60 * 60 * 1000,
+            timestamp,
+            filename,
+            input.mime,
+            input.edgeTransferId,
+          );
+        this.database
+          .prepare(
+            `UPDATE edge_transfer_jobs
+             SET upload_id = ?, state = 'validating',
+                 expected_sha256 = COALESCE(?, expected_sha256),
+                 updated_at = ? WHERE id = ?`,
+          )
+          .run(
+            uploadId,
+            input.sourceSha256 ?? null,
+            timestamp,
+            input.edgeTransferId,
+          );
+      } else {
+        this.database
+          .prepare(
+            `UPDATE edge_upload_credentials
+             SET expires_at = MIN(expires_at, ?), overlap_until = ?
+             WHERE edge_job_id = ? AND revoked_at IS NULL`,
+          )
+          .run(
+            timestamp + 5 * 60 * 1000,
+            timestamp + 5 * 60 * 1000,
+            input.edgeTransferId,
+          );
+      }
+      this.database
+        .prepare(
+          `INSERT INTO edge_upload_credentials(
+             id_hash, edge_job_id, agent_id, task_id, task_attempt,
+             upload_id, expires_at, overlap_until, last_used_at,
+             created_at, revoked_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL)`,
+        )
+        .run(
+          hashToken(token),
+          input.edgeTransferId,
+          input.agentId,
+          input.taskId,
+          input.taskAttempt,
+          uploadId,
+          credentialExpiresAt,
+          timestamp,
+        );
+    })();
+    return {
+      edgeTransferId: input.edgeTransferId,
+      uploadId,
+      tusUrl: this.edgeTusUrl(uploadId, existingUpload),
+      token,
+      expiresAt: new Date(credentialExpiresAt).toISOString(),
+      refreshAfter: new Date(refreshAfter).toISOString(),
+      chunkBytes: 16 * 1024 * 1024,
+    };
+  }
+
   public cancelUpload(adminId: string, uploadId: string): void {
     const row = this.database
       .prepare("SELECT state FROM uploads WHERE id = ? AND owner_admin_id = ?")
@@ -551,17 +723,26 @@ export class MediaService {
     rmSync(join(this.options.uploadRoot, `${uploadId}.info`), { force: true });
   }
 
-  public validateUploadToken(uploadId: string, token: string): UploadRow {
+  public removeCancelledEdgeUploadFiles(edgeTransferId: string): void {
     const row = this.database
       .prepare(
-        `SELECT id, owner_admin_id, state, filename, mime, declared_bytes,
-                received_bytes, expires_at
-         FROM uploads
-         WHERE id = ? AND upload_token_hash = ? AND expires_at > ?
-           AND state IN ('authorized', 'uploading')`,
+        `SELECT id FROM uploads
+         WHERE edge_job_id = ? AND state = 'cancelled'`,
       )
-      .get(uploadId, hashToken(token), this.now()) as UploadRow | undefined;
-    if (!row) throw unauthorized("Upload Token 无效或已过期");
+      .get(edgeTransferId) as { readonly id: string } | undefined;
+    if (!row) return;
+    rmSync(join(this.options.uploadRoot, row.id), { force: true });
+    rmSync(join(this.options.uploadRoot, `${row.id}.info`), { force: true });
+  }
+
+  public validateUploadToken(uploadId: string, token: string): UploadRow {
+    const row = this.findUploadByToken(token);
+    if (
+      row.id !== uploadId ||
+      !new Set(["authorized", "uploading"]).has(row.state)
+    ) {
+      throw unauthorized("Upload Token 无效或已过期");
+    }
     return row;
   }
 
@@ -604,12 +785,15 @@ export class MediaService {
 
     if (input.type === "post-receive") {
       const received = Math.min(input.offset ?? 0, upload.declared_bytes);
+      const reserved =
+        Math.max(0, upload.declared_bytes - received) + upload.declared_bytes;
       this.database
         .prepare(
-          `UPDATE uploads SET state = 'uploading', received_bytes = ?
+          `UPDATE uploads
+           SET state = 'uploading', received_bytes = ?, reserved_bytes = ?
            WHERE id = ? AND state IN ('authorized', 'uploading')`,
         )
-        .run(received, upload.id);
+        .run(received, reserved, upload.id);
       return {};
     }
 
@@ -642,10 +826,14 @@ export class MediaService {
   public authorizeTusRequest(
     token: string | undefined,
     originalUri: string,
+    originalMethod: string,
   ): void {
     if (!token) throw unauthorized("缺少 Upload-Token");
     const upload = this.findUploadByToken(token);
-    if (!new Set(["authorized", "uploading"]).has(upload.state)) {
+    const method = originalMethod.toUpperCase();
+    const active = new Set(["authorized", "uploading"]).has(upload.state);
+    const completedHead = upload.state === "received" && method === "HEAD";
+    if (!active && !completedHead) {
       throw unauthorized("上传已结束或已撤销");
     }
     const pathname = new URL(originalUri, "https://internal.invalid").pathname;
@@ -672,10 +860,21 @@ export class MediaService {
     const now = this.now();
 
     this.database.transaction(() => {
+      const edgeTransfer = upload.edge_job_id
+        ? (this.database
+            .prepare(
+              `SELECT expected_sha256 FROM edge_transfer_jobs WHERE id = ?`,
+            )
+            .get(upload.edge_job_id) as
+            | { readonly expected_sha256: string | null }
+            | undefined)
+        : undefined;
+      const jobNotBefore = upload.edge_job_id ? now + 24 * 60 * 60 * 1000 : now;
       this.database
         .prepare(
           `UPDATE uploads
-           SET state = 'received', received_bytes = ?, reserved_bytes = 0, finished_at = ?
+           SET state = 'received', received_bytes = ?, reserved_bytes = declared_bytes,
+               finished_at = ?
            WHERE id = ?`,
         )
         .run(receivedBytes, now, uploadId);
@@ -704,16 +903,41 @@ export class MediaService {
         .run(
           jobId,
           mediaId,
+          jobNotBefore,
           now,
           now,
-          now,
-          JSON.stringify({ uploadId, filePath: safePath, storageKey }),
+          JSON.stringify({
+            uploadId,
+            filePath: safePath,
+            storageKey,
+            ...(upload.edge_job_id ? { edgeJobId: upload.edge_job_id } : {}),
+            ...(edgeTransfer?.expected_sha256
+              ? { expectedSourceSha256: edgeTransfer.expected_sha256 }
+              : {}),
+          }),
         );
       this.database
         .prepare(
           "UPDATE token_jti SET revoked_at = ? WHERE kind = 'upload' AND subject_id = ?",
         )
         .run(now, uploadId);
+      if (upload.edge_job_id) {
+        this.database
+          .prepare(
+            `UPDATE edge_transfer_jobs
+             SET state = 'received', upload_id = ?, media_id = ?,
+                 transferred_bytes = declared_bytes, last_progress_at = ?,
+                 updated_at = ? WHERE id = ?`,
+          )
+          .run(uploadId, mediaId, now, now, upload.edge_job_id);
+        this.database
+          .prepare(
+            `UPDATE edge_upload_credentials
+             SET expires_at = MIN(expires_at, ?), overlap_until = ?
+             WHERE edge_job_id = ? AND revoked_at IS NULL`,
+          )
+          .run(now + 5 * 60 * 1000, now + 5 * 60 * 1000, upload.edge_job_id);
+      }
     })();
 
     return { mediaId, jobId };
@@ -996,6 +1220,9 @@ export class MediaService {
       // 终态失败仍需可记录；损坏的历史 payload 不应阻止队列继续领取。
     }
     if (uploadId) {
+      const edgeUpload = this.database
+        .prepare("SELECT edge_job_id FROM uploads WHERE id = ?")
+        .get(uploadId) as { readonly edge_job_id: string | null } | undefined;
       this.database
         .prepare(
           `UPDATE uploads
@@ -1004,6 +1231,34 @@ export class MediaService {
            WHERE id = ?`,
         )
         .run(errorCode, now, uploadId);
+      if (edgeUpload?.edge_job_id) {
+        this.database
+          .prepare(
+            `UPDATE edge_transfer_jobs
+             SET state = 'failed', error_code = ?, error_message = ?,
+                 updated_at = ?, finished_at = ?
+             WHERE id = ? AND state NOT IN ('ready', 'incompatible', 'evicted')`,
+          )
+          .run(errorCode, errorMessage, now, now, edgeUpload.edge_job_id);
+        this.database
+          .prepare(
+            `UPDATE edge_upload_credentials
+             SET revoked_at = COALESCE(revoked_at, ?)
+             WHERE edge_job_id = ?`,
+          )
+          .run(now, edgeUpload.edge_job_id);
+        this.database
+          .prepare(
+            `UPDATE program_queue_items
+             SET preparation_state = 'failed', updated_at = ?
+             WHERE transfer_job_id = ? AND preparation_state != 'ready'`,
+          )
+          .run(now, edgeUpload.edge_job_id);
+        rmSync(join(this.options.uploadRoot, uploadId), { force: true });
+        rmSync(join(this.options.uploadRoot, `${uploadId}.info`), {
+          force: true,
+        });
+      }
     }
   }
 
@@ -1015,6 +1270,7 @@ export class MediaService {
       readonly probe: unknown;
       readonly reasons: readonly string[];
       readonly sha256: string;
+      readonly sourceSha256?: string | undefined;
       readonly bytes: number;
       readonly durationMs: number | null;
       readonly finalPath: string;
@@ -1024,13 +1280,30 @@ export class MediaService {
     this.database.transaction(() => {
       const job = this.database
         .prepare(
-          `SELECT id, media_id FROM media_jobs
+          `SELECT id, media_id, payload_json FROM media_jobs
            WHERE id = ? AND state = 'leased' AND lease_token_hash = ? AND lease_until > ?`,
         )
         .get(jobId, hashToken(leaseToken), now) as
-        | { readonly id: string; readonly media_id: string }
+        | {
+            readonly id: string;
+            readonly media_id: string;
+            readonly payload_json: string;
+          }
         | undefined;
       if (!job) throw conflict("JOB_LEASE_EXPIRED", "任务租约已失效");
+      const payload = JSON.parse(job.payload_json) as {
+        readonly expectedSourceSha256?: unknown;
+        readonly edgeJobId?: unknown;
+      };
+      if (
+        typeof payload.expectedSourceSha256 === "string" &&
+        result.sourceSha256 !== payload.expectedSourceSha256
+      ) {
+        throw conflict(
+          "EDGE_SOURCE_MISMATCH",
+          "云端收到的文件与家庭目录版本不一致",
+        );
+      }
       const compatibility = evaluateCompatibility(result.probe);
       const compatible = result.compatible && compatibility.compatible;
       requirePathWithin(
@@ -1054,6 +1327,9 @@ export class MediaService {
             probe: result.probe,
             reasons: result.reasons,
             finalPath: result.finalPath,
+            ...(result.sourceSha256
+              ? { sourceSha256: result.sourceSha256 }
+              : {}),
           }),
           result.durationMs,
           compatibility.video.codec,
@@ -1075,10 +1351,76 @@ export class MediaService {
         .run(now, now, jobId);
       this.database
         .prepare(
-          `UPDATE uploads SET state = ?, finished_at = ?
+          `UPDATE uploads SET state = ?, reserved_bytes = 0, finished_at = ?
            WHERE id = json_extract((SELECT payload_json FROM media_jobs WHERE id = ?), '$.uploadId')`,
         )
         .run(state, now, jobId);
+      if (typeof payload.edgeJobId === "string") {
+        this.database
+          .prepare(
+            `UPDATE edge_transfer_jobs
+             SET state = ?, media_id = ?, expected_sha256 = ?,
+                 transferred_bytes = declared_bytes, updated_at = ?,
+                 ready_at = CASE WHEN ? = 'ready' THEN ? ELSE ready_at END,
+                 finished_at = ?
+             WHERE id = ?`,
+          )
+          .run(
+            compatible ? "ready" : "incompatible",
+            job.media_id,
+            result.sourceSha256 ?? null,
+            now,
+            compatible ? "ready" : "incompatible",
+            now,
+            now,
+            payload.edgeJobId,
+          );
+        if (compatible) {
+          const transfer = this.database
+            .prepare(
+              `SELECT agent_id, catalog_version_id FROM edge_transfer_jobs
+               WHERE id = ?`,
+            )
+            .get(payload.edgeJobId) as
+            | {
+                readonly agent_id: string | null;
+                readonly catalog_version_id: string | null;
+              }
+            | undefined;
+          this.database
+            .prepare(
+              `INSERT INTO edge_cache_replicas(
+                 id, agent_id, catalog_version_id, transfer_job_id, media_id,
+                 state, pinned, generation, row_version, source_sha256,
+                 source_verified_at, protected_reason, created_at, updated_at,
+                 evicted_at
+               ) VALUES (?, ?, ?, ?, ?, 'ready', 0, 1, 0, ?, ?, NULL, ?, ?, NULL)`,
+            )
+            .run(
+              uuidv7(),
+              transfer?.agent_id ?? null,
+              transfer?.catalog_version_id ?? null,
+              payload.edgeJobId,
+              job.media_id,
+              result.sourceSha256 ?? null,
+              now,
+              now,
+              now,
+            );
+        }
+        this.database
+          .prepare(
+            `UPDATE program_queue_items
+             SET media_id = ?, preparation_state = ?, updated_at = ?
+             WHERE transfer_job_id = ?`,
+          )
+          .run(
+            compatible ? job.media_id : null,
+            compatible ? "ready" : "failed",
+            now,
+            payload.edgeJobId,
+          );
+      }
     })();
   }
 
@@ -1156,17 +1498,67 @@ export class MediaService {
   }
 
   private findUploadByToken(token: string): UploadRow {
-    const row = this.database
+    const tokenHash = hashToken(token);
+    let row = this.database
       .prepare(
         `SELECT id, owner_admin_id, state, filename, mime, declared_bytes,
-                received_bytes, expires_at
+                received_bytes, expires_at, edge_job_id
          FROM uploads WHERE upload_token_hash = ? AND expires_at > ?`,
       )
-      .get(hashToken(token), this.now()) as UploadRow | undefined;
+      .get(tokenHash, this.now()) as UploadRow | undefined;
+    if (!row) {
+      row = this.database
+        .prepare(
+          `SELECT u.id, u.owner_admin_id, u.state, u.filename, u.mime,
+                  u.declared_bytes, u.received_bytes, u.expires_at,
+                  u.edge_job_id
+           FROM edge_upload_credentials c
+           JOIN uploads u ON u.id = c.upload_id
+           JOIN edge_agents a ON a.id = c.agent_id
+           JOIN edge_agent_tasks t ON t.id = c.task_id
+           WHERE c.id_hash = ? AND c.revoked_at IS NULL
+             AND c.expires_at > ? AND a.enabled = 1 AND a.revoked_at IS NULL
+             AND t.agent_id = c.agent_id AND t.state = 'leased'
+             AND t.attempts = c.task_attempt AND t.lease_until > ?`,
+        )
+        .get(tokenHash, this.now(), this.now()) as UploadRow | undefined;
+      if (row) {
+        this.database
+          .prepare(
+            "UPDATE edge_upload_credentials SET last_used_at = ? WHERE id_hash = ?",
+          )
+          .run(this.now(), tokenHash);
+      }
+    }
     if (!row || row.state === "cancelled") {
       throw unauthorized("Upload Token 无效或已过期");
     }
     return row;
+  }
+
+  private requireStorageReservation(requiredReserve: number): void {
+    const reserved = this.database
+      .prepare(
+        `SELECT COALESCE(SUM(reserved_bytes), 0) AS total FROM uploads
+         WHERE reserved_bytes > 0`,
+      )
+      .get() as { readonly total: number };
+    const disk = statfsSync(this.options.uploadRoot);
+    const availableBytes = disk.bavail * disk.bsize;
+    if (
+      availableBytes - reserved.total - requiredReserve <
+      STORAGE_SAFETY_FLOOR_BYTES
+    ) {
+      throw new AppError(507, "INSUFFICIENT_STORAGE", "磁盘空间不足");
+    }
+  }
+
+  private edgeTusUrl(uploadId: string, existingUpload: boolean): string {
+    if (!existingUpload) return this.options.tusEndpoint;
+    const base = this.options.tusEndpoint.endsWith("/")
+      ? this.options.tusEndpoint
+      : `${this.options.tusEndpoint}/`;
+    return new URL(encodeURIComponent(uploadId), base).toString();
   }
 
   private requireMediaAccess(identity: ContentIdentity, mediaId: string): void {

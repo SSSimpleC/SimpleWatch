@@ -8,6 +8,7 @@ import { HomePage } from "./pages/HomePage.js";
 import { DiagnosticsPage } from "./pages/DiagnosticsPage.js";
 import { RoomPage } from "./pages/RoomPage.js";
 import { SettingsPage } from "./pages/SettingsPage.js";
+import { AdminDataBoundary } from "./admin-data.js";
 import "./styles.css";
 
 const queryClient = new QueryClient({
@@ -17,6 +18,7 @@ const queryClient = new QueryClient({
 createRoot(document.querySelector("#root")!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
+      <AdminDataBoundary />
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<HomePage />} />

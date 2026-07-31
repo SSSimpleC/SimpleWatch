@@ -14,6 +14,7 @@ import {
   authLoginRequestSchema,
   envelopeSchema,
   kickMemberRequestSchema,
+  playbackProgressSchema,
   activeRoomSummarySchema,
   roomCommandRequestSchema,
   roomSnapshotSchema,
@@ -35,14 +36,25 @@ import {
 import type { RawData, WebSocket } from "ws";
 
 import { openDatabase, type AppDatabase } from "./database.js";
+import { AdminEventHub } from "./admin-event-hub.js";
+import { registerEdgeAdminRoutes } from "./edge-admin-routes.js";
 import { AppError, forbidden } from "./errors.js";
+import { registerEdgeAgentRoutes } from "./edge-agent-routes.js";
+import { registerEdgeInternalRoutes } from "./edge-internal-routes.js";
 import { registerMediaRoutes } from "./media-routes.js";
 import { registerOutboxRoutes } from "./outbox-routes.js";
 import { PublicRateLimiter } from "./public-rate-limiter.js";
 import { RoomHub } from "./room-hub.js";
 import { AuthService } from "./services/auth-service.js";
+import { EdgeAuthService } from "./services/edge-auth-service.js";
+import { EdgeAdminService } from "./services/edge-admin-service.js";
+import { EdgeCatalogService } from "./services/edge-catalog-service.js";
+import { EdgeTaskService } from "./services/edge-task-service.js";
+import { EdgeTransferLifecycleService } from "./services/edge-transfer-lifecycle-service.js";
+import { EdgeEvictionService } from "./services/edge-eviction-service.js";
 import { MediaService } from "./services/media-service.js";
 import { OutboxService } from "./services/outbox-service.js";
+import { ProgramService } from "./services/program-service.js";
 import {
   RoomService,
   type AccountRoomEntry,
@@ -78,6 +90,7 @@ const clockPingEnvelopeSchema = envelopeSchema(
   z.object({ clientSentAtMs: z.number().int().nonnegative() }),
 );
 const commandEnvelopeSchema = envelopeSchema(roomCommandRequestSchema);
+const playbackProgressEnvelopeSchema = envelopeSchema(playbackProgressSchema);
 
 export interface BuildAppOptions {
   readonly databasePath: string;
@@ -113,6 +126,12 @@ export interface BuiltApp {
   readonly mediaService: MediaService;
   readonly transportService: TransportService;
   readonly outboxService: OutboxService;
+  readonly edgeAuthService: EdgeAuthService;
+  readonly edgeCatalogService: EdgeCatalogService;
+  readonly edgeTaskService: EdgeTaskService;
+  readonly programService: ProgramService;
+  readonly edgeAdminService: EdgeAdminService;
+  readonly edgeEvictionService: EdgeEvictionService;
 }
 
 export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
@@ -130,7 +149,15 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
     options.passwordPepper ?? "test-password-pepper-not-for-production",
     options.authFailureDelay,
   );
-  const roomService = new RoomService(database, now);
+  const edgeLifecycle = new EdgeTransferLifecycleService(
+    database,
+    options.uploadRoot ?? "tmp/uploads",
+  );
+  const edgeAuthService = new EdgeAuthService(database, now, edgeLifecycle);
+  const edgeCatalogService = new EdgeCatalogService(database, now);
+  const edgeTaskService = new EdgeTaskService(database, now, edgeLifecycle);
+  const programService = new ProgramService(database, edgeTaskService, now);
+  const roomService = new RoomService(database, programService, now);
   const mediaService = new MediaService(database, {
     mediaRoot: options.mediaRoot ?? "tmp/media",
     uploadRoot: options.uploadRoot ?? "tmp/uploads",
@@ -142,7 +169,20 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
       options.contentSigningSecret ?? "test-content-signing-secret-32-bytes",
     now,
   });
+  const edgeEvictionService = new EdgeEvictionService(
+    database,
+    edgeTaskService,
+    options.mediaRoot ?? "tmp/media",
+    options.trashRoot ?? "tmp/trash",
+    now,
+  );
   const hub = new RoomHub();
+  const adminEvents = new AdminEventHub(now);
+  const edgeAdminService = new EdgeAdminService(
+    database,
+    options.uploadRoot ?? "tmp/uploads",
+    now,
+  );
   const outboxService = new OutboxService(database, now);
   const transportService = new TransportService(database, {
     mediaJwtSecret:
@@ -190,6 +230,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
       ["POST", "PATCH", "PUT", "DELETE"].includes(request.method) &&
       request.url.startsWith("/api/v1/") &&
       !request.url.startsWith("/api/v1/internal/") &&
+      !request.url.startsWith("/api/v1/edge/v1/") &&
       request.headers.origin !== options.publicOrigin
     ) {
       done(forbidden("Origin 不受信任"));
@@ -258,6 +299,32 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
   });
 
   registerHealthRoutes(app, database, mediaService);
+  registerEdgeAgentRoutes(
+    app,
+    edgeAuthService,
+    edgeCatalogService,
+    edgeTaskService,
+    mediaService,
+    adminEvents,
+  );
+  registerEdgeAdminRoutes(
+    app,
+    authService,
+    edgeAdminService,
+    edgeCatalogService,
+    edgeTaskService,
+    programService,
+    edgeEvictionService,
+    adminEvents,
+  );
+  registerEdgeInternalRoutes(
+    app,
+    programService,
+    edgeEvictionService,
+    edgeCatalogService,
+    adminEvents,
+    options.internalHookToken ?? "test-internal-service-token-32-bytes",
+  );
   registerUnifiedApiRoutes(
     app,
     authService,
@@ -280,7 +347,14 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
     outboxService,
     options.internalHookToken ?? "test-internal-service-token-32-bytes",
   );
-  registerWebSocketRoute(app, roomService, hub, options.publicOrigin, now);
+  registerWebSocketRoute(
+    app,
+    roomService,
+    programService,
+    hub,
+    options.publicOrigin,
+    now,
+  );
 
   const webRoot = resolve(options.webRoot ?? "dist/web");
   if (existsSync(webRoot)) {
@@ -309,6 +383,12 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
     mediaService,
     transportService,
     outboxService,
+    edgeAuthService,
+    edgeCatalogService,
+    edgeTaskService,
+    programService,
+    edgeAdminService,
+    edgeEvictionService,
   };
 }
 
@@ -829,6 +909,7 @@ function registerUnifiedApiRoutes(
 function registerWebSocketRoute(
   app: FastifyInstance,
   roomService: RoomService,
+  programService: ProgramService,
   hub: RoomHub,
   publicOrigin: string,
   now: () => number,
@@ -880,6 +961,7 @@ function registerWebSocketRoute(
         remove();
       });
       socket.on("message", (data: RawData) => {
+        let rejectedCommandId: string | undefined;
         const receivedAtMs = now();
         roomService.touch(identity);
         if (receivedAtMs - windowStartedAt >= 1000) {
@@ -924,6 +1006,7 @@ function registerWebSocketRoute(
             commandMessage.success &&
             commandMessage.data.type === "room.command"
           ) {
+            rejectedCommandId = commandMessage.data.payload.commandId;
             const snapshot = roomService.applyCommand(
               identity,
               commandMessage.data.payload,
@@ -931,6 +1014,21 @@ function registerWebSocketRoute(
             hub.broadcast(
               identity.roomId,
               createEnvelope(identity.roomId, "room.snapshot", snapshot, now),
+            );
+            return;
+          }
+
+          const progressMessage = playbackProgressEnvelopeSchema.safeParse(raw);
+          if (
+            progressMessage.success &&
+            progressMessage.data.type === "playback.progress"
+          ) {
+            if (identity.role !== "host") {
+              throw forbidden("只有主持人可以上报播放进度");
+            }
+            programService.recordProgress(
+              identity.roomId,
+              progressMessage.data.payload,
             );
             return;
           }
@@ -950,6 +1048,7 @@ function registerWebSocketRoute(
             identity.roomId,
             "room.command.rejected",
             {
+              commandId: rejectedCommandId,
               code: appError.code,
               message: appError.message,
               details: appError.details,

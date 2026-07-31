@@ -29,6 +29,11 @@ const probePayloadSchema = z.object({
   filePath: z.string(),
   storageKey: z.string(),
   source: z.literal("sftp").optional(),
+  expectedSourceSha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
+  edgeJobId: z.string().uuid().optional(),
 });
 const subtitlePayloadSchema = z.object({
   storageKey: z.string(),
@@ -61,6 +66,7 @@ const sftpScanner = config.sftpIncomingRoot
   : null;
 let nextSftpScanAt = 0;
 let nextRtcReconciliationAt = 0;
+let nextEdgeReconciliationAt = 0;
 let activeJobId: string | null = null;
 let lastWorkerError: string | null = null;
 let workerHeartbeatInFlight: Promise<void> | null = null;
@@ -72,6 +78,18 @@ const workerHeartbeatTimer = setInterval(() => {
 workerHeartbeatTimer.unref();
 
 while (true) {
+  if (Date.now() >= nextEdgeReconciliationAt) {
+    nextEdgeReconciliationAt = Date.now() + 30_000;
+    try {
+      const response = await callApi("/api/v1/internal/edge/reconcile", {
+        method: "POST",
+        body: "{}",
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      console.error("Edge缓存与节目单对账暂不可用", error);
+    }
+  }
   if (Date.now() >= nextRtcReconciliationAt) {
     nextRtcReconciliationAt = Date.now() + 15_000;
     try {

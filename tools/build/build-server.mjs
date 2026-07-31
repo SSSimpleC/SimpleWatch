@@ -5,6 +5,7 @@ import { build } from "esbuild";
 
 const repositoryRoot = resolve(import.meta.dirname, "../..");
 const outputRoot = resolve(repositoryRoot, "dist/server");
+const edgeAgentOutputRoot = resolve(repositoryRoot, "dist/edge-agent");
 
 const apiDependencies = await productionDependencies("apps/api/package.json");
 const workerDependencies = await productionDependencies(
@@ -20,7 +21,9 @@ for (const dependency of Object.keys(workerDependencies)) {
 }
 
 await rm(outputRoot, { recursive: true, force: true });
+await rm(edgeAgentOutputRoot, { recursive: true, force: true });
 await mkdir(outputRoot, { recursive: true });
+await mkdir(edgeAgentOutputRoot, { recursive: true });
 
 const shared = {
   absWorkingDir: repositoryRoot,
@@ -41,6 +44,7 @@ await build({
     api: "apps/api/src/main.ts",
     "admin-bootstrap": "apps/api/src/cli/admin-bootstrap.ts",
     "account-manage": "apps/api/src/cli/account-manage.ts",
+    "edge-agent-manage": "apps/api/src/cli/edge-agent-manage.ts",
     "clear-library": "apps/api/src/cli/clear-library.ts",
     "cleanup-expired-uploads": "apps/api/src/cli/cleanup-expired-uploads.ts",
   },
@@ -64,4 +68,13 @@ await build({
   entryPoints: { worker: "apps/worker/src/main.ts" },
   external: Object.keys(workerDependencies),
   outdir: outputRoot,
+});
+
+// The home Edge Agent only uses Node built-ins (including node:sqlite), so it
+// is bundled as a separate dependency-free artifact and shipped in a minimal
+// image without the cloud worker's ffmpeg/runtime dependency tree.
+await build({
+  ...shared,
+  entryPoints: { main: "apps/edge-agent/src/main.ts" },
+  outdir: edgeAgentOutputRoot,
 });

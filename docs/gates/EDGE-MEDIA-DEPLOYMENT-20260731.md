@@ -64,7 +64,10 @@ UID 0 的 `edge-agent-manage.mjs` 因而使用一次性
 - Library 只读绑定到 `/library`；仅 `/state` 可写；机器令牌只读绑定；没有
   Docker socket，也没有发布任何端口。
 - 令牌文件权限为 `0400`、所有者 `10001:10001`；环境文件为 `0600 root:root`。
-- Agent 结构化日志中没有 warn/error；控制面连接与目录提交事件均已出现。
+- 初次发布验收时 Agent 结构化日志中没有 warn/error；控制面连接与目录提交事件
+  均已出现。最终公网回归期间两次受控停止云端 App，Agent 相应记录 1 次心跳和
+  8 次长轮询暂时失败；App 恢复后最后事件为“Agent 已连接控制面”，云端确认
+  心跳新鲜，容器没有重启。
 - qBittorrent 服务部署前后始终 active；10TB 备份盘没有挂载给 Agent；家庭系统
   失败单元为 0。
 
@@ -87,6 +90,42 @@ UID 0 的 `edge-agent-manage.mjs` 因而使用一次性
   `Content-Type: video/mp4`。
 - 灰度后 UI 显示 1 个 ready/upcoming 节目项、1 个受保护缓存和 1 条 ready 传输；
   “安全回收”在节目单保护期内禁用。
+
+## 公网旧业务回归与最终收口
+
+发布后的真实公网 Playwright 回归完整执行且未跳过 RTC，最终 2/2 通过：
+
+- Host 与 Viewer 固定账户登录、会话恢复和权限隔离；
+- H.264/H.265 上传、Worker 处理、字幕、房间创建和 VOD 播放；
+- 浏览器使用确定性虚拟视频文件发布 H.264 + Opus WHIP，服务端识别音视频轨与
+  实际码率；Viewer 经 WHEP 收到音视频；
+- Host 与 Viewer 的 LiveKit 双人语音、管理监控、关闭房间和凭据撤销；
+- 48 MiB 上传速度显示、主动中止和临时数据清理。
+
+第一次执行在发起 WHIP 前发现本机 Edge 只有虚拟音轨、没有虚拟视频轨。生产
+服务尚未收到推流；测试配置随后恢复固定
+`test-data/generated/whip-test.y4m` 的 `--use-file-for-fake-video-capture` 参数，
+重跑后上述媒体与 RTC 链路全部通过。这是测试设备配置修正，不是生产业务修复。
+
+验收期间还检测到另一个并发浏览器会话对发布前 3 个正式媒体发出了删除请求。
+删除接口为 24 小时软删除，因此文件与记录仍可恢复。恢复过程仅接受备份中的精确
+媒体 ID、storage key、删除时间和实体文件 SHA-256 四重一致；三份哈希全部匹配后，
+短暂停止 App/Worker，把文件移回各自原目录并只清空对应 3 条 `trashed_at`。恢复后
+再次计算三份完整文件 SHA-256，均与维护基线相同。两次测试产生的媒体、任务、
+字幕、上传历史和小型文件则按精确 ID 清除，测试媒体与测试上传最终均为 0。
+
+最终一致性备份为
+`/srv/simplewatch/state/backups/daily/simplewatch-20260731T165135Z.sqlite3`；备份
+SHA-256、`quick_check=ok` 和外键违规 0。最终生产状态为：
+
+- schema 012、6 个启用账户、4 个可见 published 媒体；活动房间、未闭合媒体
+  会话和未完成 Outbox 均为 0；
+- 1 个新鲜在线 Agent、16 个 present/0 missing 目录条目；1 条 ready 传输、
+  1 个 protected 缓存、1 个 ready/upcoming 节目项，current 为 0；
+- 6 个云端容器均运行且重启计数 0；App、Worker、Caddy healthy；FRPS、DERP、
+  备份和证书定时器 active，失败 systemd 单元 0；
+- 家庭 Edge Agent 与 qBittorrent active，Library 仍为 16 个文件；Agent 容器
+  只读根、无入站端口，Library 与令牌只读挂载，10TB 备份盘未挂载进容器。
 
 ## 当前生产状态与后续观察
 

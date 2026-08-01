@@ -127,6 +127,11 @@ mkdir -p \
   /srv/simplewatch/sftp/incoming
 chown 1000:1000 /srv/simplewatch/{state,media,uploads,inbox,subtitles,trash,quarantine}
 chmod 0750 /srv/simplewatch/{state,media,uploads,inbox,subtitles,trash,quarantine}
+# App and Worker run as UID/GID 1000. A root-operated maintenance step must
+# never leave a nested runtime media directory unwritable to those containers:
+# otherwise cross-mount moves can copy a file into /trash but fail to unlink
+# its source, leaving both the old media and an orphaned recycle copy behind.
+find /srv/simplewatch/{media,uploads,inbox,subtitles,trash,quarantine} -xdev -exec chown 1000:1000 {} +
 chown root:root /srv/simplewatch/acme-webroot
 chmod 0755 /srv/simplewatch/acme-webroot
 SIMPLEWATCH_RELEASE_DIR="$release_dir" \

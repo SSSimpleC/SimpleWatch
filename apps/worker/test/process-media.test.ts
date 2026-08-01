@@ -85,6 +85,36 @@ describe("processProbeJob", () => {
     expect(calls[3]).toBe("unlink:/uploads/source");
   });
 
+  it("removes a copied destination when source unlink fails", () => {
+    const calls: string[] = [];
+    let renameCount = 0;
+
+    expect(() =>
+      moveFile("/uploads/source", "/media/content.mp4", {
+        rename: (source, destination) => {
+          calls.push(`rename:${source}:${destination}`);
+          if (renameCount++ === 0)
+            throw Object.assign(new Error("cross-device move"), {
+              code: "EXDEV",
+            });
+        },
+        copy: (source, destination) =>
+          calls.push(`copy:${source}:${destination}`),
+        unlink: (path) => {
+          calls.push(`unlink:${path}`);
+          throw Object.assign(new Error("source directory is not writable"), {
+            code: "EACCES",
+          });
+        },
+        remove: (path) => calls.push(`remove:${path}`),
+      }),
+    ).toThrow("source directory is not writable");
+
+    expect(calls).toHaveLength(6);
+    expect(calls[4]).toMatch(/^remove:\/media\/content\.mp4\..+\.tmp$/);
+    expect(calls[5]).toBe("remove:/media/content.mp4");
+  });
+
   it("accepts a registered SFTP inbox file as a probe source", async () => {
     const repositoryRoot = resolve(import.meta.dirname, "../../..");
     const root = mkdtempSync(resolve(repositoryRoot, "tmp/sftp-probe-test-"));

@@ -619,6 +619,50 @@ describe("Edge failure fencing and lifecycle", () => {
     );
   });
 
+  it("returns a successfully verified cache to eligible before queuing eviction", async () => {
+    const fixture = provisionVerifyingEviction();
+    const claimed = await claim(fixture.authorization);
+    const completed = await complete(
+      fixture.authorization,
+      claimed,
+      sourceProof("test"),
+    );
+
+    expect(completed.statusCode).toBe(204);
+    expect(
+      built.database
+        .prepare(
+          `SELECT state, generation, row_version FROM edge_cache_replicas
+           WHERE id = ?`,
+        )
+        .get(fixture.replicaId),
+    ).toEqual({ state: "eligible", generation: 2, row_version: 2 });
+    expect(
+      built.database
+        .prepare(
+          `SELECT state, expected_generation, expected_row_version
+           FROM edge_eviction_jobs WHERE id = ?`,
+        )
+        .get(fixture.evictionId),
+    ).toEqual({
+      state: "queued",
+      expected_generation: 2,
+      expected_row_version: 2,
+    });
+
+    built.edgeEvictionService.reconcile();
+    expect(
+      built.database
+        .prepare("SELECT state FROM edge_eviction_jobs WHERE id = ?")
+        .get(fixture.evictionId),
+    ).toEqual({ state: "completed" });
+    expect(
+      built.database
+        .prepare("SELECT state, media_id FROM edge_cache_replicas WHERE id = ?")
+        .get(fixture.replicaId),
+    ).toEqual({ state: "evicted", media_id: null });
+  });
+
   it("terminalizes an exhausted source-verification lease instead of stranding eviction", async () => {
     const fixture = provisionVerifyingEviction();
     built.database

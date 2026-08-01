@@ -48,12 +48,19 @@ export function moveFile(
   }
 
   const temporary = `${destination}.${randomUUID()}.tmp`;
+  let destinationPublished = false;
   try {
     operations.copy(source, temporary);
     operations.rename(temporary, destination);
+    destinationPublished = true;
     operations.unlink(source);
   } catch (error) {
     operations.remove(temporary);
+    // The copy fallback has already made the final destination visible when
+    // unlinking the source fails (for example, after a runtime ownership
+    // regression). Leaving it behind would duplicate a supposedly moved media
+    // file in the recycle area while the database transaction is rolled back.
+    if (destinationPublished) operations.remove(destination);
     throw error;
   }
 }

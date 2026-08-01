@@ -761,7 +761,8 @@ export class EdgeTaskService {
           this.database
             .prepare(
               `UPDATE edge_cache_replicas
-               SET source_sha256 = ?, source_verified_at = ?,
+               SET source_sha256 = ?, source_verified_at = ?, state = 'eligible',
+                   protected_reason = NULL,
                    generation = generation + 1, row_version = row_version + 1,
                    updated_at = ?
                WHERE id = ?`,

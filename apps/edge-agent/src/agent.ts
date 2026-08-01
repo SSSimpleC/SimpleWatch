@@ -41,6 +41,10 @@ export type EdgeControlPlane = Pick<
 
 export type EdgeTusUploader = Pick<TusUploadClient, "upload">;
 
+const CLOUD_RECEIPT_INITIAL_DELAY_MILLISECONDS = 250;
+const CLOUD_RECEIPT_MAX_DELAY_MILLISECONDS = 2_000;
+const CLOUD_RECEIPT_MAX_ATTEMPTS = 8;
+
 export class EdgeAgent {
   readonly #config: EdgeAgentConfig;
   readonly #state: AgentState;
@@ -366,9 +370,8 @@ export class EdgeAgent {
         { offset: result.offset, totalBytes: result.totalBytes },
         taskController.signal,
       );
-      await this.#api.completeJob(
-        task.id,
-        task.leaseToken,
+      await this.#completeUploadedTask(
+        task,
         {
           bytes: result.totalBytes,
           mtimeMs: result.mtimeMs,
@@ -434,6 +437,40 @@ export class EdgeAgent {
         jobId: task.id,
         error: safeErrorName(reportError),
       });
+    }
+  }
+
+  async #completeUploadedTask(
+    task: EdgeTask,
+    source: {
+      readonly bytes: number;
+      readonly mtimeMs: number;
+      readonly sha256: string;
+    },
+    signal?: AbortSignal,
+  ): Promise<void> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await this.#api.completeJob(task.id, task.leaseToken, source, signal);
+        return;
+      } catch (error) {
+        if (
+          !isCloudReceiptPending(error) ||
+          attempt >= CLOUD_RECEIPT_MAX_ATTEMPTS - 1
+        ) {
+          throw error;
+        }
+        const delayMilliseconds = Math.min(
+          CLOUD_RECEIPT_MAX_DELAY_MILLISECONDS,
+          CLOUD_RECEIPT_INITIAL_DELAY_MILLISECONDS * 2 ** attempt,
+        );
+        this.#logger.info("等待云端确认最终上传分块", {
+          jobId: task.id,
+          attempt: attempt + 1,
+          delayMilliseconds,
+        });
+        await delay(delayMilliseconds, signal);
+      }
     }
   }
 
@@ -676,6 +713,13 @@ function classifyFailure(error: unknown): {
         retryable: false,
       };
     }
+    if (error.code === "EDGE_UPLOAD_NOT_RECEIVED") {
+      return {
+        code: "NETWORK_ERROR",
+        message: "云端仍在确认最终上传分块",
+        retryable: true,
+      };
+    }
     return {
       code: error.retryable ? "NETWORK_ERROR" : "INTERNAL_ERROR",
       message: "云端任务接口暂时不可用",
@@ -708,6 +752,14 @@ function classifyFailure(error: unknown): {
     message: "家庭 Agent 处理任务时发生内部错误",
     retryable: true,
   };
+}
+
+function isCloudReceiptPending(error: unknown): boolean {
+  return (
+    error instanceof EdgeApiError &&
+    error.status === 409 &&
+    error.code === "EDGE_UPLOAD_NOT_RECEIVED"
+  );
 }
 
 function safeErrorName(error: unknown): string {

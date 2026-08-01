@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,8 @@ import {
 } from "../src/agent.js";
 import type { EdgeAgentConfig } from "../src/config.js";
 import { AgentState } from "../src/state.js";
+import { scanLibrary } from "../src/catalog.js";
+import { EdgeApiError } from "../src/api-client.js";
 
 const logger: AgentLogger = {
   info: () => undefined,
@@ -20,6 +23,86 @@ const logger: AgentLogger = {
 };
 
 describe("Edge Agent 编排", () => {
+  it("等待异步 tus 完成钩子确认后再提交上传任务", async () => {
+    const root = await mkdtemp(join(tmpdir(), "simplewatch-agent-upload-"));
+    const stateRoot = await mkdtemp(
+      join(tmpdir(), "simplewatch-agent-upload-state-"),
+    );
+    const contents = "complete-video";
+    await writeFile(join(root, "Episode 01.mkv"), contents);
+    const entry = (await scanLibrary(root)).entries[0];
+    expect(entry).toBeDefined();
+    if (!entry) throw new Error("测试媒体未被扫描到");
+    using state = new AgentState(join(stateRoot, "agent.sqlite3"));
+    state.replaceCatalog(1, [entry]);
+    const expectedSha256 = createHash("sha256").update(contents).digest("hex");
+    const completeJob = vi
+      .fn<EdgeControlPlane["completeJob"]>()
+      .mockRejectedValueOnce(
+        new EdgeApiError(
+          "云端尚未完整接收该上传",
+          409,
+          false,
+          "EDGE_UPLOAD_NOT_RECEIVED",
+        ),
+      )
+      .mockResolvedValue(undefined);
+    const api = createControlPlane({
+      requestUpload: vi.fn(() =>
+        Promise.resolve({
+          edgeTransferId: "019fbba2-e1e0-7748-8103-b7aa6751c08d",
+          uploadId: "019fbba3-b437-7339-90bb-dfe74756e2b3",
+          tusUrl:
+            "https://example.test/files/019fbba3-b437-7339-90bb-dfe74756e2b3",
+          token: "x".repeat(32),
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          refreshAfter: new Date(Date.now() + 30_000).toISOString(),
+          chunkBytes: 16,
+        }),
+      ),
+      completeJob,
+    });
+    const upload = vi.fn<EdgeTusUploader["upload"]>((options) => {
+      options.onProgress?.({ offset: entry.bytes, totalBytes: entry.bytes });
+      return Promise.resolve({
+        offset: entry.bytes,
+        totalBytes: entry.bytes,
+        mtimeMs: entry.mtimeMs,
+        sha256: expectedSha256,
+      });
+    });
+    const agent = new EdgeAgent(
+      createConfig(root, join(stateRoot, "agent.sqlite3")),
+      state,
+      api,
+      { upload },
+      logger,
+    );
+    const task = {
+      id: "019fbba2-e1e0-7748-8103-b7aa6751c08d",
+      leaseToken: "y".repeat(32),
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      attempts: 1,
+      maxAttempts: 3,
+      payload: {
+        kind: "upload" as const,
+        edgeTransferId: "019fbba2-e1e0-7748-8103-b7aa6751c08d",
+        catalogItemId: "019fbba2-e1e1-7521-96a1-99b913deaaa1",
+        catalogVersionId: "019fbba2-e1e2-76bd-b35d-34430d4fbeef",
+        localId: entry.localId,
+        expectedBytes: entry.bytes,
+        expectedMtimeMs: entry.mtimeMs,
+        expectedSha256,
+      },
+    };
+
+    await agent.processTask(task);
+
+    expect(completeJob).toHaveBeenCalledTimes(2);
+    expect(api.failJob).not.toHaveBeenCalled();
+    expect(state.getUpload(task.id)).toBeUndefined();
+  });
+
   it("第一次发现的新文件不提交云端，第二次size+mtime相同时才原子发布", async () => {
     const root = await mkdtemp(join(tmpdir(), "simplewatch-agent-library-"));
     const stateRoot = await mkdtemp(join(tmpdir(), "simplewatch-agent-state-"));

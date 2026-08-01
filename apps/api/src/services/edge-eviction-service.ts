@@ -1,11 +1,12 @@
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   renameSync,
   rmSync,
   statfsSync,
-  statSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
 
 import { v7 as uuidv7 } from "uuid";
@@ -16,6 +17,61 @@ import type { EdgeTaskService } from "./edge-task-service.js";
 
 const SOURCE_PROOF_FRESH_MS = 60 * 60 * 1000;
 const STORAGE_SAFETY_FLOOR_BYTES = 12 * 1024 * 1024 * 1024;
+
+export interface DirectoryMoveOperations {
+  rename(source: string, destination: string): void;
+  copy(source: string, destination: string): void;
+  remove(path: string): void;
+}
+
+const defaultDirectoryMoveOperations: DirectoryMoveOperations = {
+  rename: renameSync,
+  copy: (source, destination) =>
+    cpSync(source, destination, {
+      recursive: true,
+      force: false,
+      errorOnExist: true,
+    }),
+  remove: (path) => rmSync(path, { recursive: true, force: true }),
+};
+
+/**
+ * Move a cache directory into the eviction quarantine without making a
+ * partially copied directory visible. Docker bind mounts can point at the
+ * same host filesystem while still returning EXDEV for rename(2).
+ *
+ * If source deletion fails after the complete quarantine copy has been
+ * published, preserve that copy. It is a recovery artifact and prevents a
+ * partial source cleanup from turning into data loss.
+ */
+export function moveDirectoryToQuarantine(
+  source: string,
+  destination: string,
+  operations: DirectoryMoveOperations = defaultDirectoryMoveOperations,
+): void {
+  try {
+    operations.rename(source, destination);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+  }
+
+  const temporary = `${destination}.${randomUUID()}.tmp`;
+  let destinationPublished = false;
+  try {
+    operations.copy(source, temporary);
+    operations.rename(temporary, destination);
+    destinationPublished = true;
+    operations.remove(source);
+  } catch (error) {
+    operations.remove(temporary);
+    // Do not delete a fully copied quarantine directory after source cleanup
+    // fails: it is the only complete recovery copy if the source was removed
+    // only partially before the filesystem reported the error.
+    if (!destinationPublished) operations.remove(destination);
+    throw error;
+  }
+}
 
 interface ReplicaRow {
   readonly id: string;
@@ -343,16 +399,6 @@ export class EdgeEvictionService {
       }
     }
     mkdirSync(join(this.trashRoot, "edge-quarantine"), { recursive: true });
-    if (statSync(this.mediaRoot).dev !== statSync(this.trashRoot).dev) {
-      this.fail(
-        evictionId,
-        String(row.cache_replica_id),
-        "EDGE_CROSS_DEVICE",
-        "媒体与隔离区不在同一文件系统",
-        timestamp,
-      );
-      return;
-    }
     const source = join(this.mediaRoot, String(row.storage_key));
     const quarantine = join(
       this.trashRoot,
@@ -363,7 +409,7 @@ export class EdgeEvictionService {
       if (existsSync(source) && existsSync(quarantine)) {
         throw new Error("源目录与隔离目录同时存在");
       }
-      if (existsSync(source)) renameSync(source, quarantine);
+      if (existsSync(source)) moveDirectoryToQuarantine(source, quarantine);
       if (existsSync(quarantine))
         rmSync(quarantine, { recursive: true, force: true });
       this.database.transaction(() => {

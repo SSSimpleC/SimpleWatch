@@ -9,6 +9,11 @@
     "pnpm": ">=10 <11"
   },
   "pnpm": {
+    "overrides": {
+      "brace-expansion@5": "5.0.9",
+      "fast-uri@3": "3.1.5",
+      "fast-uri@4": "4.1.2"
+    },
     "onlyBuiltDependencies": [
       "argon2",
       "better-sqlite3",

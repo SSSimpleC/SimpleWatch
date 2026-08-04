@@ -1,0 +1,39 @@
+[Unit]
+Description=Tailscale DERP Server
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=derper
+Group=derper
+ExecStart=/usr/local/derp/bin/derper -c /var/lib/derper/derper.key -certmode=manual -certdir=/usr/local/derp -hostname=8.134.239.34 -a :33331 --verify-clients=false -http-port=33332
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+StateDirectory=derper
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

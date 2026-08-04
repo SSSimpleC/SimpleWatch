@@ -17,6 +17,8 @@ import {
 } from "../errors.js";
 import { createOpaqueToken, hashToken, verifyTokenHash } from "../security.js";
 import type { AccountSession } from "./auth-service.js";
+import { enqueueMediaSessionKicks } from "./media-session-outbox.js";
+import type { ProgramService } from "./program-service.js";
 
 interface RoomSessionRow {
   readonly id_hash: string;
@@ -36,6 +38,8 @@ interface RoomStateRow {
   readonly live_path: string | null;
   readonly transport_json: string | null;
   readonly host_member_id: string;
+  readonly program_queue_id: string | null;
+  readonly current_program_item_id: string | null;
 }
 
 interface MediaRow {
@@ -87,6 +91,7 @@ export type AccountRoomEntry =
 export class RoomService {
   public constructor(
     private readonly database: AppDatabase,
+    private readonly programService: ProgramService,
     private readonly now: () => number = Date.now,
   ) {}
 
@@ -554,7 +559,14 @@ export class RoomService {
         });
       }
 
-      const next = applyRoomCommand(this.database, state, request, effectiveAt);
+      const next =
+        request.command.kind === "activate-queue-item"
+          ? this.programService.activateWithinRoomTransaction(
+              identity.roomId,
+              request.command,
+              effectiveAt,
+            )
+          : applyRoomCommand(this.database, state, request, effectiveAt);
       const revision = state.revision + 1;
       this.database
         .prepare("DELETE FROM room_commands WHERE expires_at <= ?")
@@ -562,7 +574,8 @@ export class RoomService {
       this.database
         .prepare(
           `UPDATE room_state
-           SET revision = ?, mode = ?, media_id = ?, transport_json = ?, updated_at = ?
+           SET revision = ?, mode = ?, media_id = ?, transport_json = ?,
+               program_queue_id = ?, current_program_item_id = ?, updated_at = ?
            WHERE room_id = ?`,
         )
         .run(
@@ -570,6 +583,8 @@ export class RoomService {
           next.mode,
           next.mediaId,
           next.transport ? JSON.stringify(next.transport) : null,
+          next.programQueueId,
+          next.programItemId,
           now,
           identity.roomId,
         );
@@ -588,6 +603,13 @@ export class RoomService {
           now + 10 * 60 * 1000,
         );
     })();
+
+    if (request.command.kind === "activate-queue-item") {
+      this.programService.reconcilePrefetch(
+        request.command.programQueueId,
+        identity.accountId,
+      );
+    }
 
     if (!result) throw new Error("房间命令未产生结果");
     return result;
@@ -723,20 +745,13 @@ export class RoomService {
         ) VALUES (?, ?, ?, ?, ?, ?, NULL)`,
       )
       .run(revocationId, roomId, memberId, memberId, reason, now);
-    this.database
-      .prepare(
-        `INSERT INTO service_outbox(
-          id, kind, dedupe_key, payload_json, state, attempts,
-          not_before, lease_until, last_error, created_at, completed_at
-        ) VALUES (?, 'mediamtx.kick-sessions', ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL)`,
-      )
-      .run(
-        uuidv7(),
-        `mediamtx-kick:${revocationId}`,
-        JSON.stringify({ roomId, memberId, sessionIds: mediaSessionIds }),
-        now,
-        now,
-      );
+    enqueueMediaSessionKicks(this.database, {
+      roomId,
+      memberId,
+      sessionIds: mediaSessionIds,
+      dedupeKey: `mediamtx-kick:${revocationId}`,
+      timestamp: now,
+    });
     this.database
       .prepare(
         `INSERT INTO service_outbox(
@@ -874,27 +889,13 @@ export class RoomService {
              WHERE room_id = ?`,
           )
           .run(now, roomId);
-        if (mediaSessionIds.length > 0) {
-          const eventId = uuidv7();
-          this.database
-            .prepare(
-              `INSERT INTO service_outbox(
-                id, kind, dedupe_key, payload_json, state, attempts,
-                not_before, lease_until, last_error, created_at, completed_at
-              ) VALUES (?, 'mediamtx.kick-sessions', ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL)`,
-            )
-            .run(
-              uuidv7(),
-              `mediamtx-force-close:${eventId}`,
-              JSON.stringify({
-                roomId,
-                memberId: "all",
-                sessionIds: mediaSessionIds,
-              }),
-              now,
-              now,
-            );
-        }
+        enqueueMediaSessionKicks(this.database, {
+          roomId,
+          memberId: "all",
+          sessionIds: mediaSessionIds,
+          dedupeKey: `mediamtx-force-close:${uuidv7()}`,
+          timestamp: now,
+        });
         for (const member of members) {
           const eventId = uuidv7();
           this.database
@@ -993,21 +994,13 @@ export class RoomService {
         (row) =>
           (row as { readonly mediamtx_session_id: string }).mediamtx_session_id,
       );
-    if (sessionIds.length === 0) return;
-    this.database
-      .prepare(
-        `INSERT INTO service_outbox(
-          id, kind, dedupe_key, payload_json, state, attempts,
-          not_before, lease_until, last_error, created_at, completed_at
-        ) VALUES (?, 'mediamtx.kick-sessions', ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL)`,
-      )
-      .run(
-        uuidv7(),
-        `mediamtx-takeover:${uuidv7()}`,
-        JSON.stringify({ roomId, memberId, sessionIds }),
-        timestamp,
-        timestamp,
-      );
+    enqueueMediaSessionKicks(this.database, {
+      roomId,
+      memberId,
+      sessionIds,
+      dedupeKey: `mediamtx-takeover:${uuidv7()}`,
+      timestamp,
+    });
   }
 
   public touch(identity: RoomIdentity): void {
@@ -1042,8 +1035,13 @@ function applyRoomCommand(
   readonly mode: "idle" | "vod" | "live";
   readonly mediaId: string | null;
   readonly transport: TransportAnchor | null;
+  readonly programQueueId: string | null;
+  readonly programItemId: string | null;
 } {
   const command = request.command;
+  if (command.kind === "activate-queue-item") {
+    throw new Error("节目单切换命令必须由 ProgramService 处理");
+  }
   if (command.kind === "select-vod") {
     const media = database
       .prepare(
@@ -1060,6 +1058,8 @@ function applyRoomCommand(
         rate: 1,
         anchoredAtServerMs: effectiveAt,
       },
+      programQueueId: null,
+      programItemId: null,
     };
   }
   if (command.kind === "select-live") {
@@ -1075,6 +1075,8 @@ function applyRoomCommand(
             anchoredAtServerMs: effectiveAt,
           }
         : null,
+      programQueueId: null,
+      programItemId: null,
     };
   }
   if (command.kind === "restore-vod") {
@@ -1098,6 +1100,8 @@ function applyRoomCommand(
             rate: 1,
             anchoredAtServerMs: effectiveAt,
           },
+      programQueueId: null,
+      programItemId: null,
     };
   }
   if (state.mode !== "vod") {
@@ -1119,6 +1123,8 @@ function applyRoomCommand(
           positionSec: projected,
           anchoredAtServerMs: effectiveAt,
         },
+        programQueueId: state.program_queue_id,
+        programItemId: state.current_program_item_id,
       };
     case "pause":
       return {
@@ -1130,6 +1136,8 @@ function applyRoomCommand(
           positionSec: projected,
           anchoredAtServerMs: effectiveAt,
         },
+        programQueueId: state.program_queue_id,
+        programItemId: state.current_program_item_id,
       };
     case "seek": {
       const mediaDuration = state.media_id
@@ -1153,6 +1161,8 @@ function applyRoomCommand(
               : command.positionSec,
           anchoredAtServerMs: effectiveAt,
         },
+        programQueueId: state.program_queue_id,
+        programItemId: state.current_program_item_id,
       };
     }
     case "set-rate":
@@ -1165,6 +1175,8 @@ function applyRoomCommand(
           rate: command.rate,
           anchoredAtServerMs: effectiveAt,
         },
+        programQueueId: state.program_queue_id,
+        programItemId: state.current_program_item_id,
       };
   }
 }

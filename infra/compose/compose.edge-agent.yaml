@@ -1,0 +1,58 @@
+name: simplewatch-edge-agent
+
+x-service-logging: &service-logging
+  driver: local
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+  edge-agent:
+    build:
+      context: ../..
+      dockerfile: infra/images/edge-agent/Dockerfile
+      args:
+        NODE_IMAGE: docker.1ms.run/library/node@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
+        EDGE_AGENT_RELEASE_TAG: ${RELEASE_TAG:?RELEASE_TAG is required}
+        EDGE_AGENT_ARTIFACT_SHA256: ${EDGE_AGENT_ARTIFACT_SHA256:?EDGE_AGENT_ARTIFACT_SHA256 is required}
+    image: simplewatch-edge-agent:${RELEASE_TAG:?RELEASE_TAG is required}
+    restart: unless-stopped
+    user: "10001:10001"
+    init: true
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cpus: 0.75
+    mem_limit: 256m
+    pids_limit: 128
+    logging: *service-logging
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=10001,gid=10001,mode=0700
+    environment:
+      EDGE_API_ORIGIN: ${EDGE_API_ORIGIN:?EDGE_API_ORIGIN is required}
+      EDGE_AGENT_TOKEN_FILE: /run/secrets/edge_agent_token
+      LIBRARY_ROOT: /library
+      EDGE_STATE_PATH: /state/edge-agent.sqlite3
+      EDGE_SCAN_INTERVAL_MS: "300000"
+      EDGE_STABILITY_OBSERVATION_MS: "120000"
+      EDGE_CLAIM_WAIT_SECONDS: "25"
+      EDGE_HEARTBEAT_INTERVAL_MS: "15000"
+      EDGE_UPLOAD_CHUNK_BYTES: "16777216"
+    volumes:
+      - type: bind
+        source: /srv/dev-disk-by-uuid-7E82064F82060C79/PLAYS/SimpleWatchLibrary
+        target: /library
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/simplewatch-edge-agent/state
+        target: /state
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /etc/simplewatch-edge-agent/agent-token
+        target: /run/secrets/edge_agent_token
+        read_only: true
+        bind:
+          create_host_path: false

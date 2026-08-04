@@ -1,15 +1,28 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import type { EdgeAdminEvent } from "@simplewatch/contracts";
 import * as tus from "tus-js-client";
 import { type FormEvent, useEffect, useRef, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router";
 
+import {
+  adminQueryKeys,
+  adminQueryKeysForEvent,
+  purgeAdminQueries,
+} from "../admin-data.js";
 import {
   api,
   ApiError,
+  type AccountSession,
   type ActiveRoomSummary,
   type MediaItem,
 } from "../api.js";
 import { useSession } from "../store.js";
+import {
+  AdminEdgeView,
+  adminViewFromSearch,
+  adminViews,
+  ProgramQueuePanel,
+} from "./admin/AdminEdgeViews.js";
 
 interface UploadProgress {
   id: string;
@@ -22,7 +35,14 @@ interface UploadProgress {
 }
 
 export function AdminPage() {
-  const { adminCsrf, setAdminCsrf, setRoomCsrf, setMemberId } = useSession();
+  const {
+    account,
+    adminCsrf,
+    setAccount,
+    setAdminCsrf,
+    setRoomCsrf,
+    setMemberId,
+  } = useSession();
   const [message, setMessage] = useState("");
   const [selectedMedia, setSelectedMedia] = useState<string[]>([]);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(
@@ -32,33 +52,88 @@ export function AdminPage() {
   const speedRef = useRef({ at: 0, bytes: 0, smoothed: 0 });
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const location = useLocation();
+  const view = adminViewFromSearch(location.search);
+  const isAdmin = account?.role === "host" && Boolean(adminCsrf);
 
   useEffect(() => {
-    if (adminCsrf) return;
-    void api<{
-      account: { role: "host" | "viewer" };
-      csrfToken: string;
-    }>("/api/v1/auth/session")
+    if (account?.role === "viewer") {
+      purgeAdminQueries(queryClient);
+      void navigate("/", { replace: true });
+      return;
+    }
+    if (account?.role === "host" && adminCsrf) return;
+    void api<AccountSession>("/api/v1/auth/session")
       .then((session) => {
         if (session.account.role !== "host") {
+          purgeAdminQueries(queryClient);
           void navigate("/", { replace: true });
           return;
         }
+        setAccount(session.account);
         setAdminCsrf(session.csrfToken);
       })
-      .catch(() => void navigate("/", { replace: true }));
-  }, [adminCsrf, navigate, setAdminCsrf]);
+      .catch(() => {
+        purgeAdminQueries(queryClient);
+        void navigate("/", { replace: true });
+      });
+  }, [
+    account?.role,
+    adminCsrf,
+    navigate,
+    queryClient,
+    setAccount,
+    setAdminCsrf,
+  ]);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    const source = new EventSource("/api/v1/admin/events");
+    let disconnected = false;
+    const eventTypes: EdgeAdminEvent["type"][] = [
+      "edge.agent.changed",
+      "edge.catalog.changed",
+      "edge.transfer.changed",
+      "edge.cache.changed",
+      "program.queue.changed",
+      "storage.changed",
+    ];
+    const listeners = eventTypes.map((type) => {
+      const listener = () => {
+        for (const queryKey of adminQueryKeysForEvent(type)) {
+          void queryClient.invalidateQueries({ queryKey });
+        }
+      };
+      source.addEventListener(type, listener);
+      return { type, listener };
+    });
+    source.onopen = () => {
+      if (disconnected) {
+        void queryClient.invalidateQueries({ queryKey: adminQueryKeys.root });
+      }
+      disconnected = false;
+    };
+    source.onerror = () => {
+      disconnected = true;
+    };
+    return () => {
+      for (const { type, listener } of listeners) {
+        source.removeEventListener(type, listener);
+      }
+      source.close();
+    };
+  }, [isAdmin, queryClient]);
 
   const media = useQuery({
-    queryKey: ["media"],
+    queryKey: adminQueryKeys.media,
     queryFn: () => api<MediaItem[]>("/api/v1/media"),
-    enabled: Boolean(adminCsrf),
+    enabled: isAdmin && view === "screening",
     refetchInterval: 3000,
   });
   const activeRoom = useQuery({
-    queryKey: ["admin-active-room"],
+    queryKey: adminQueryKeys.activeRoom,
     queryFn: () => api<ActiveRoomSummary | null>("/api/v1/admin/active-room"),
-    enabled: Boolean(adminCsrf),
+    enabled: isAdmin && view === "screening",
     refetchInterval: 2000,
   });
 
@@ -78,7 +153,9 @@ export function AdminPage() {
       setRoomCsrf(result.csrfToken);
       setMemberId(result.member.id);
       setMessage("放映室已开放，已登录好友会自动入场");
-      await queryClient.invalidateQueries({ queryKey: ["admin-active-room"] });
+      await queryClient.invalidateQueries({
+        queryKey: adminQueryKeys.activeRoom,
+      });
     } catch (error) {
       setMessage(error instanceof ApiError ? error.message : "无法开启放映室");
     }
@@ -116,7 +193,9 @@ export function AdminPage() {
       setRoomCsrf(null);
       setMemberId(null);
       setMessage("房间已强制关闭，所有成员凭据均已撤销");
-      await queryClient.invalidateQueries({ queryKey: ["admin-active-room"] });
+      await queryClient.invalidateQueries({
+        queryKey: adminQueryKeys.activeRoom,
+      });
     } catch (error) {
       setMessage(error instanceof ApiError ? error.message : "强制关闭失败");
     }
@@ -203,7 +282,7 @@ export function AdminPage() {
               }
             : null,
         );
-        void queryClient.invalidateQueries({ queryKey: ["media"] });
+        void queryClient.invalidateQueries({ queryKey: adminQueryKeys.media });
       },
     });
     uploadRef.current = upload;
@@ -258,7 +337,7 @@ export function AdminPage() {
       }),
     });
     setMessage(`字幕 ${file.name} 已进入处理队列`);
-    await queryClient.invalidateQueries({ queryKey: ["media"] });
+    await queryClient.invalidateQueries({ queryKey: adminQueryKeys.media });
   }
 
   async function deleteMedia(ids: string[]) {
@@ -288,7 +367,7 @@ export function AdminPage() {
             .map((item) => item.message)
             .join("；")}`,
     );
-    await queryClient.invalidateQueries({ queryKey: ["media"] });
+    await queryClient.invalidateQueries({ queryKey: adminQueryKeys.media });
   }
 
   async function rescanMedia(mediaId: string) {
@@ -298,7 +377,7 @@ export function AdminPage() {
       headers: { "x-csrf-token": adminCsrf },
     });
     setMessage("已重新送检；服务器将按新的兼容规则重封装并入库");
-    await queryClient.invalidateQueries({ queryKey: ["media"] });
+    await queryClient.invalidateQueries({ queryKey: adminQueryKeys.media });
   }
 
   async function logout() {
@@ -308,11 +387,12 @@ export function AdminPage() {
       headers: { "x-csrf-token": adminCsrf },
       body: "{}",
     });
+    purgeAdminQueries(queryClient);
     useSession.getState().clear();
     void navigate("/", { replace: true });
   }
 
-  if (!adminCsrf) {
+  if (!isAdmin) {
     return (
       <main className="console-shell login-shell">
         <Link to="/" className="brand-mark">
@@ -340,7 +420,7 @@ export function AdminPage() {
       : null;
 
   return (
-    <main className="console-shell">
+    <main className="console-shell admin-console-shell">
       <header className="console-header">
         <div>
           <span className="brand-mark">SIMPLEWATCH</span>
@@ -359,217 +439,261 @@ export function AdminPage() {
           </button>
         </div>
       </header>
-      <div className="console-grid">
-        <section className="panel room-panel">
-          <div className="panel-title">
-            <span>01</span>
-            <h2>放映控制模块</h2>
-          </div>
-          {activeRoom.data ? (
-            <div className="room-monitor">
-              <div className="monitor-primary">
-                <strong>
-                  {activeRoom.data.content?.title ?? "等待选择观看内容"}
-                </strong>
-                <span>{modeLabel(activeRoom.data.mode)}</span>
-              </div>
-              <dl>
-                <div>
-                  <dt>主持人</dt>
-                  <dd>{activeRoom.data.host?.nickname ?? "—"}</dd>
-                </div>
-                <div>
-                  <dt>在场</dt>
-                  <dd>
-                    {activeRoom.data.memberCount} / {activeRoom.data.maxMembers}
-                  </dd>
-                </div>
-                <div>
-                  <dt>在线</dt>
-                  <dd>{activeRoom.data.onlineCount}</dd>
-                </div>
-                <div>
-                  <dt>OBS</dt>
-                  <dd>{liveLabel(activeRoom.data.live.state)}</dd>
-                </div>
-              </dl>
-              <p className="muted-copy">
-                固定账户会自动发现本房间，无需复制或更新好友链接。
-              </p>
-              <div className="room-actions">
-                <button type="button" onClick={() => void enterHostRoom()}>
-                  进入主持房间
-                </button>
-                <button
-                  type="button"
-                  className="danger-button"
-                  onClick={() => void forceCloseRoom()}
-                >
-                  强制关闭房间
-                </button>
-              </div>
-            </div>
-          ) : (
-            <form onSubmit={createRoom} className="stack-form">
-              <p className="muted-copy">
-                系统同时只开放一间放映室。Host
-                固定为主持席；好友登录后会自动入场。
-              </p>
-              <button type="submit">开启放映室 →</button>
-            </form>
-          )}
-        </section>
-
-        <section className="panel upload-panel">
-          <div className="panel-title">
-            <span>02</span>
-            <h2>送片入库</h2>
-          </div>
-          <label
-            className={`drop-zone ${uploadProgress?.state === "uploading" ? "disabled" : ""}`}
-          >
-            <input
-              type="file"
-              accept="video/*,.mp4,.mkv,.mov,.m4v,.webm,.avi,.ts,.mts"
-              disabled={
-                uploadProgress?.state === "uploading" ||
-                uploadProgress?.state === "cancelling"
-              }
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                event.currentTarget.value = "";
-                if (file) void uploadFile(file);
-              }}
-            />
-            <strong>选择影片</strong>
-            <small>
-              可选择 MP4、MKV、MOV
-              等常见视频；服务器只重封装和必要的音频转换，不重编码视频
-            </small>
-          </label>
-          {uploadProgress && (
-            <div className="upload-progress" aria-live="polite">
-              <div className="upload-progress-head">
-                <strong>{uploadProgress.filename}</strong>
-                <span>{progressPercent.toFixed(1)}%</span>
-              </div>
-              <progress max={100} value={progressPercent} />
-              <div className="upload-metrics">
-                <span>
-                  {formatBytes(uploadProgress.uploaded)} /{" "}
-                  {formatBytes(uploadProgress.total)}
-                </span>
-                <span>{formatSpeed(uploadProgress.bytesPerSecond)}</span>
-                <span>
-                  {remainingSeconds === null
-                    ? "剩余时间计算中"
-                    : `约 ${formatEta(remainingSeconds)}`}
-                </span>
-              </div>
-              {uploadProgress.message && <p>{uploadProgress.message}</p>}
-              {uploadProgress.state === "uploading" && (
-                <button
-                  type="button"
-                  className="danger-button"
-                  onClick={() => void cancelUpload()}
-                >
-                  终止本条上传
-                </button>
-              )}
-            </div>
-          )}
-          <output className="upload-status" aria-live="polite">
-            {message}
-          </output>
-        </section>
-
-        <section className="panel media-panel">
-          <div className="panel-title">
-            <span>03</span>
-            <h2>片库</h2>
-            <b>{media.data?.length ?? 0} REELS</b>
-            {selectedMedia.length > 0 && (
-              <button
-                type="button"
-                className="danger-button"
-                onClick={() => void deleteMedia(selectedMedia)}
+      <div className="admin-console-frame">
+        <aside className="admin-rail">
+          <p>PROJECTION BOOTH</p>
+          <nav aria-label="管理控制台分区">
+            {adminViews.map((item) => (
+              <Link
+                key={item.id}
+                to={
+                  item.id === "screening" ? "/admin" : `/admin?view=${item.id}`
+                }
+                className={view === item.id ? "active" : ""}
+                aria-current={view === item.id ? "page" : undefined}
               >
-                删除选中（{selectedMedia.length}）
-              </button>
-            )}
+                <span>{item.index}</span>
+                <strong>{item.label}</strong>
+                <small>{item.caption}</small>
+              </Link>
+            ))}
+          </nav>
+          <div className="admin-rail-foot">
+            <i aria-hidden="true" />
+            <span>PRIVATE CIRCUIT</span>
           </div>
-          <div className="media-list">
-            {media.data?.map((item, index) => (
-              <article key={item.id} className="media-row">
-                <input
-                  aria-label={`选择 ${item.displayName}`}
-                  type="checkbox"
-                  checked={selectedMedia.includes(item.id)}
-                  onChange={(event) =>
-                    setSelectedMedia((previous) =>
-                      event.target.checked
-                        ? [...previous, item.id]
-                        : previous.filter((id) => id !== item.id),
-                    )
-                  }
-                />
-                <span className="reel-number">
-                  {String(index + 1).padStart(2, "0")}
-                </span>
-                <div>
-                  <h3>{item.displayName}</h3>
-                  <p>
-                    {formatBytes(item.bytes)} ·{" "}
-                    {item.durationMs
-                      ? formatDuration(item.durationMs)
-                      : "检查中"}{" "}
-                    · {codecLabel(item)}
-                  </p>
-                </div>
-                <span className={`media-state state-${item.state}`}>
-                  {stateLabel(item.state)}
-                </span>
-                {item.compatibilityReasons.length > 0 && (
-                  <small className="media-reason">
-                    {item.compatibilityReasons.join("；")}
-                  </small>
-                )}
-                {item.state === "incompatible" && (
-                  <button
-                    type="button"
-                    onClick={() => void rescanMedia(item.id)}
+        </aside>
+        <div className="admin-console-content">
+          {view === "screening" ? (
+            <>
+              <ProgramQueuePanel />
+              <div className="console-grid">
+                <section className="panel room-panel">
+                  <div className="panel-title">
+                    <span>01</span>
+                    <h2>放映控制模块</h2>
+                  </div>
+                  {activeRoom.data ? (
+                    <div className="room-monitor">
+                      <div className="monitor-primary">
+                        <strong>
+                          {activeRoom.data.content?.title ?? "等待选择观看内容"}
+                        </strong>
+                        <span>{modeLabel(activeRoom.data.mode)}</span>
+                      </div>
+                      <dl>
+                        <div>
+                          <dt>主持人</dt>
+                          <dd>{activeRoom.data.host?.nickname ?? "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>在场</dt>
+                          <dd>
+                            {activeRoom.data.memberCount} /{" "}
+                            {activeRoom.data.maxMembers}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>在线</dt>
+                          <dd>{activeRoom.data.onlineCount}</dd>
+                        </div>
+                        <div>
+                          <dt>OBS</dt>
+                          <dd>{liveLabel(activeRoom.data.live.state)}</dd>
+                        </div>
+                      </dl>
+                      <p className="muted-copy">
+                        固定账户会自动发现本房间，无需复制或更新好友链接。
+                      </p>
+                      <div className="room-actions">
+                        <button
+                          type="button"
+                          onClick={() => void enterHostRoom()}
+                        >
+                          进入主持房间
+                        </button>
+                        <button
+                          type="button"
+                          className="danger-button"
+                          onClick={() => void forceCloseRoom()}
+                        >
+                          强制关闭房间
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <form onSubmit={createRoom} className="stack-form">
+                      <p className="muted-copy">
+                        系统同时只开放一间放映室。Host
+                        固定为主持席；好友登录后会自动入场。
+                      </p>
+                      <button type="submit">开启放映室 →</button>
+                    </form>
+                  )}
+                </section>
+
+                <section className="panel upload-panel">
+                  <div className="panel-title">
+                    <span>02</span>
+                    <h2>送片入库</h2>
+                  </div>
+                  <label
+                    className={`drop-zone ${uploadProgress?.state === "uploading" ? "disabled" : ""}`}
                   >
-                    按新规则重检
-                  </button>
-                )}
-                {item.state === "published" && (
-                  <label className="subtitle-upload">
-                    添加 WebVTT 字幕
                     <input
-                      aria-label={`为 ${item.displayName} 添加字幕`}
                       type="file"
-                      accept=".vtt,text/vtt"
+                      accept="video/*,.mp4,.mkv,.mov,.m4v,.webm,.avi,.ts,.mts"
+                      disabled={
+                        uploadProgress?.state === "uploading" ||
+                        uploadProgress?.state === "cancelling"
+                      }
                       onChange={(event) => {
                         const file = event.target.files?.[0];
-                        if (file) void uploadSubtitle(item.id, file);
+                        event.currentTarget.value = "";
+                        if (file) void uploadFile(file);
                       }}
                     />
+                    <strong>选择影片</strong>
+                    <small>
+                      可选择 MP4、MKV、MOV
+                      等常见视频；服务器只重封装和必要的音频转换，不重编码视频
+                    </small>
                   </label>
-                )}
-                <button
-                  type="button"
-                  className="text-button danger"
-                  onClick={() => void deleteMedia([item.id])}
-                >
-                  删除
-                </button>
-              </article>
-            ))}
-            {!media.data?.length && (
-              <p className="empty-state">片库为空。选择一条影片开始入库。</p>
-            )}
-          </div>
-        </section>
+                  {uploadProgress && (
+                    <div className="upload-progress" aria-live="polite">
+                      <div className="upload-progress-head">
+                        <strong>{uploadProgress.filename}</strong>
+                        <span>{progressPercent.toFixed(1)}%</span>
+                      </div>
+                      <progress max={100} value={progressPercent} />
+                      <div className="upload-metrics">
+                        <span>
+                          {formatBytes(uploadProgress.uploaded)} /{" "}
+                          {formatBytes(uploadProgress.total)}
+                        </span>
+                        <span>
+                          {formatSpeed(uploadProgress.bytesPerSecond)}
+                        </span>
+                        <span>
+                          {remainingSeconds === null
+                            ? "剩余时间计算中"
+                            : `约 ${formatEta(remainingSeconds)}`}
+                        </span>
+                      </div>
+                      {uploadProgress.message && (
+                        <p>{uploadProgress.message}</p>
+                      )}
+                      {uploadProgress.state === "uploading" && (
+                        <button
+                          type="button"
+                          className="danger-button"
+                          onClick={() => void cancelUpload()}
+                        >
+                          终止本条上传
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  <output className="upload-status" aria-live="polite">
+                    {message}
+                  </output>
+                </section>
+
+                <section className="panel media-panel">
+                  <div className="panel-title">
+                    <span>03</span>
+                    <h2>片库</h2>
+                    <b>{media.data?.length ?? 0} REELS</b>
+                    {selectedMedia.length > 0 && (
+                      <button
+                        type="button"
+                        className="danger-button"
+                        onClick={() => void deleteMedia(selectedMedia)}
+                      >
+                        删除选中（{selectedMedia.length}）
+                      </button>
+                    )}
+                  </div>
+                  <div className="media-list">
+                    {media.data?.map((item, index) => (
+                      <article key={item.id} className="media-row">
+                        <input
+                          aria-label={`选择 ${item.displayName}`}
+                          type="checkbox"
+                          checked={selectedMedia.includes(item.id)}
+                          onChange={(event) =>
+                            setSelectedMedia((previous) =>
+                              event.target.checked
+                                ? [...previous, item.id]
+                                : previous.filter((id) => id !== item.id),
+                            )
+                          }
+                        />
+                        <span className="reel-number">
+                          {String(index + 1).padStart(2, "0")}
+                        </span>
+                        <div>
+                          <h3>{item.displayName}</h3>
+                          <p>
+                            {formatBytes(item.bytes)} ·{" "}
+                            {item.durationMs
+                              ? formatDuration(item.durationMs)
+                              : "检查中"}{" "}
+                            · {codecLabel(item)}
+                          </p>
+                        </div>
+                        <span className={`media-state state-${item.state}`}>
+                          {stateLabel(item.state)}
+                        </span>
+                        {item.compatibilityReasons.length > 0 && (
+                          <small className="media-reason">
+                            {item.compatibilityReasons.join("；")}
+                          </small>
+                        )}
+                        {item.state === "incompatible" && (
+                          <button
+                            type="button"
+                            onClick={() => void rescanMedia(item.id)}
+                          >
+                            按新规则重检
+                          </button>
+                        )}
+                        {item.state === "published" && (
+                          <label className="subtitle-upload">
+                            添加 WebVTT 字幕
+                            <input
+                              aria-label={`为 ${item.displayName} 添加字幕`}
+                              type="file"
+                              accept=".vtt,text/vtt"
+                              onChange={(event) => {
+                                const file = event.target.files?.[0];
+                                if (file) void uploadSubtitle(item.id, file);
+                              }}
+                            />
+                          </label>
+                        )}
+                        <button
+                          type="button"
+                          className="text-button danger"
+                          onClick={() => void deleteMedia([item.id])}
+                        >
+                          删除
+                        </button>
+                      </article>
+                    ))}
+                    {!media.data?.length && (
+                      <p className="empty-state">
+                        片库为空。选择一条影片开始入库。
+                      </p>
+                    )}
+                  </div>
+                </section>
+              </div>
+            </>
+          ) : (
+            <AdminEdgeView view={view} />
+          )}
+        </div>
       </div>
     </main>
   );

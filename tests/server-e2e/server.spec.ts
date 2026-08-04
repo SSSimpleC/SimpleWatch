@@ -33,6 +33,7 @@ test("public server supports upload, room admission and two-party voice", async 
   await expect(
     page.getByRole("heading", { name: "放映控制", exact: true }),
   ).toBeVisible();
+  await ensureNoActiveRoom(page, adminCsrfToken);
 
   const mediaName = `server-h264-${Date.now()}.mp4`;
   const hevcName = `server-h265-${Date.now()}.mp4`;
@@ -298,6 +299,33 @@ async function uploadMp4(page: Page, name: string, path: string) {
   const row = page.locator(".media-row").filter({ hasText: name });
   await expect(row).toBeVisible({ timeout: 30_000 });
   await expect(row).toContainText("可放映", { timeout: 30_000 });
+}
+
+async function ensureNoActiveRoom(page: Page, csrfToken: string) {
+  const closed = await page.evaluate(async (token) => {
+    const current = await fetch("/api/v1/admin/active-room", {
+      credentials: "same-origin",
+    });
+    if (!current.ok) throw new Error(`读取活动房间失败：${current.status}`);
+    if ((await current.json()) === null) return false;
+
+    const response = await fetch("/api/v1/admin/active-room", {
+      method: "DELETE",
+      credentials: "same-origin",
+      headers: { "x-csrf-token": token },
+    });
+    if (!response.ok)
+      throw new Error(`关闭维护前活动房间失败：${response.status}`);
+    return true;
+  }, csrfToken);
+
+  if (closed) await page.reload();
+  await expect(
+    page.getByRole("heading", { name: "放映控制", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: /开启放映室/ })).toBeVisible({
+    timeout: 15_000,
+  });
 }
 
 async function cleanupMediaRows(

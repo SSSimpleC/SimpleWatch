@@ -81,7 +81,11 @@ describe("processOutboxItem", () => {
       {
         id: "outbox-2",
         kind: "mediamtx.kick-sessions",
-        payload: { roomId, memberId, sessionIds: ["session/a", "gone"] },
+        payload: {
+          roomId,
+          memberId,
+          sessionIds: ["session/a", "gone", "session/a"],
+        },
         leaseToken: "lease",
       },
       {
@@ -96,6 +100,51 @@ describe("processOutboxItem", () => {
       "http://127.0.0.1:9997/v3/webrtcsessions/kick/session%2Fa",
       "http://127.0.0.1:9997/v3/webrtcsessions/kick/gone",
     ]);
+  });
+
+  it("accepts a legacy 512-session payload while limiting each concurrent batch to 32", async () => {
+    // Arrange
+    const sessionIds = Array.from(
+      { length: 512 },
+      (_, index) => `legacy-session-${index}`,
+    );
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const requests: string[] = [];
+    const fetchImpl = vi.fn(async (input: URL | RequestInfo) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      requests.push(
+        input instanceof URL
+          ? input.toString()
+          : typeof input === "string"
+            ? input
+            : input.url,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      inFlight -= 1;
+      return new Response(null, { status: 204 });
+    }) as unknown as typeof fetch;
+
+    // Act
+    await processOutboxItem(
+      {
+        id: "legacy-outbox",
+        kind: "mediamtx.kick-sessions",
+        payload: { roomId, memberId, sessionIds },
+        leaseToken: "lease",
+      },
+      {
+        livekit: { removeParticipant: vi.fn(() => Promise.resolve()) },
+        mediamtxControlUrl: "http://127.0.0.1:9997",
+        fetchImpl,
+      },
+    );
+
+    // Assert
+    expect(requests).toHaveLength(512);
+    expect(new Set(requests).size).toBe(512);
+    expect(maxInFlight).toBe(32);
   });
 
   it("fails the lease attempt when MediaMTX rejects a kick", async () => {

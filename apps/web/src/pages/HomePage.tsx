@@ -1,5 +1,6 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 
 import {
   api,
@@ -7,10 +8,12 @@ import {
   type AccountDestination,
   type AccountSession,
 } from "../api.js";
+import { purgeAdminQueries } from "../admin-data.js";
 import { useSession } from "../store.js";
 
 export function HomePage() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const { account, setAccount, setAdminCsrf, setMemberId, clear } =
     useSession();
   const [destination, setDestination] = useState<AccountDestination | null>(
@@ -22,6 +25,7 @@ export function HomePage() {
   const sourceRef = useRef<EventSource | null>(null);
 
   function acceptSession(session: AccountSession) {
+    if (session.account.role !== "host") purgeAdminQueries(queryClient);
     setAccount(session.account);
     setAdminCsrf(session.csrfToken);
     setDestination(session.destination);
@@ -127,6 +131,7 @@ export function HomePage() {
       }).catch(() => undefined);
     }
     clear();
+    purgeAdminQueries(queryClient);
     setDestination(null);
   }
 

@@ -44,6 +44,26 @@ export async function clearLibraryData(
           "UPDATE admin_sessions SET revoked_at = ? WHERE revoked_at IS NULL",
         )
         .run(now);
+      // Edge Agent 的登记与机器凭据属于部署身份，不随片库内容清理。
+      // 其余 Edge/节目单账本必须先于 legacy media/uploads 删除，避免
+      // 清理后留下指向已移除媒体的任务或缓存状态。
+      database.prepare("DELETE FROM edge_eviction_jobs").run();
+      database.prepare("DELETE FROM program_watch_ranges").run();
+      database.prepare("DELETE FROM program_play_history").run();
+      database.prepare("DELETE FROM program_queue_items").run();
+      database.prepare("DELETE FROM program_queues").run();
+      database.prepare("DELETE FROM edge_upload_credentials").run();
+      database.prepare("DELETE FROM edge_cache_replicas").run();
+      database.prepare("DELETE FROM edge_transfer_jobs").run();
+      database.prepare("DELETE FROM edge_agent_tasks").run();
+      database.prepare("DELETE FROM edge_catalog_scan_entries").run();
+      database.prepare("DELETE FROM edge_catalog_scan_pages").run();
+      database.prepare("DELETE FROM edge_catalog_scans").run();
+      database
+        .prepare("UPDATE edge_catalog_items SET current_version_id = NULL")
+        .run();
+      database.prepare("DELETE FROM edge_catalog_versions").run();
+      database.prepare("DELETE FROM edge_catalog_items").run();
       database.prepare("DELETE FROM media_transport_sessions").run();
       database.prepare("DELETE FROM rtc_revocations").run();
       database.prepare("DELETE FROM token_jti").run();

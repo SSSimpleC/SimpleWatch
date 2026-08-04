@@ -254,6 +254,104 @@ describe("OWASP security regression", () => {
     expect(viewerCreate.statusCode).toBe(403);
   });
 
+  it("isolates Edge machine, Host management, Viewer and internal trust domains", async () => {
+    const enrollment = built.edgeAuthService.enroll({
+      displayName: "SimpleServer",
+      softwareVersion: "0.1.0",
+    });
+    const machineAuthorization = `Bearer ${enrollment.token}`;
+    const viewer = await login("Simple", viewerPassword);
+    const host = await login("Host", hostPassword);
+
+    for (const url of [
+      "/api/v1/admin/edge/summary",
+      "/api/v1/admin/edge/catalog",
+      "/api/v1/admin/edge/transfers",
+      "/api/v1/admin/edge/cache",
+      "/api/v1/admin/program",
+      "/api/v1/admin/events",
+    ]) {
+      const response = await built.app.inject({
+        method: "GET",
+        url,
+        headers: { cookie: viewer.cookie, origin },
+      });
+      expect(response.statusCode, url).toBe(403);
+    }
+
+    const hostWithoutCsrf = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/admin/program",
+      headers: { cookie: host.cookie, origin },
+      payload: {},
+    });
+    expect(hostWithoutCsrf.statusCode).toBe(401);
+    const refreshUrl = `/api/v1/admin/edge/agents/${enrollment.agentId}/catalog/refresh`;
+    const viewerRefresh = await built.app.inject({
+      method: "POST",
+      url: refreshUrl,
+      headers: {
+        cookie: viewer.cookie,
+        origin,
+        "x-csrf-token": viewer.csrfToken,
+      },
+      payload: {},
+    });
+    const crossOriginRefresh = await built.app.inject({
+      method: "POST",
+      url: refreshUrl,
+      headers: {
+        cookie: host.cookie,
+        origin: "https://evil.example",
+        "x-csrf-token": host.csrfToken,
+      },
+      payload: {},
+    });
+    const missingCsrfRefresh = await built.app.inject({
+      method: "POST",
+      url: refreshUrl,
+      headers: { cookie: host.cookie, origin },
+      payload: {},
+    });
+    expect(viewerRefresh.statusCode).toBe(403);
+    expect(crossOriginRefresh.statusCode).toBe(403);
+    expect(missingCsrfRefresh.statusCode).toBe(401);
+    const cookieCannotActAsMachine = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/edge/v1/heartbeat",
+      headers: { cookie: host.cookie, origin },
+      payload: {},
+    });
+    expect(cookieCannotActAsMachine.statusCode).toBe(401);
+    const machineCanUseOnlyMachineRoute = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/edge/v1/heartbeat",
+      headers: {
+        authorization: machineAuthorization,
+        origin: "https://untrusted-machine-origin.example",
+      },
+      payload: {
+        protocolVersion: 1,
+        softwareVersion: "0.1.0",
+        capabilities: {},
+      },
+    });
+    expect(machineCanUseOnlyMachineRoute.statusCode).toBe(204);
+    const machineCannotUseHostRoute = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/admin/edge/summary",
+      headers: { authorization: machineAuthorization },
+    });
+    expect(machineCannotUseHostRoute.statusCode).toBe(401);
+    const machineCannotUseInternalRoute = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/internal/edge/reconcile",
+      headers: { authorization: machineAuthorization },
+      payload: {},
+    });
+    expect(machineCannotUseInternalRoute.statusCode).toBe(401);
+  });
+
   it("retires legacy auth and emits a password-manager compatible cookie", async () => {
     const legacy = await built.app.inject({
       method: "POST",

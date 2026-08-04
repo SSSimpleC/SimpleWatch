@@ -61,6 +61,235 @@ afterEach(async () => {
 });
 
 describe("SimpleWatch API", () => {
+  it("persists worker heartbeats and gates readiness on a fresh worker", async () => {
+    const missing = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/internal/worker/health?workerId=server-worker",
+      headers: { "x-internal-token": internalToken },
+    });
+    expect(missing.statusCode).toBe(503);
+    expect(missing.json()).toMatchObject({
+      health: "missing",
+      healthy: false,
+      workerId: "server-worker",
+    });
+    const initiallyNotReady = await built.app.inject({
+      method: "GET",
+      url: "/health/ready",
+    });
+    expect(initiallyNotReady.statusCode).toBe(503);
+
+    const heartbeat = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/internal/worker/heartbeat",
+      headers: { "x-internal-token": internalToken },
+      payload: { workerId: "server-worker" },
+    });
+    expect(heartbeat.statusCode).toBe(204);
+    const healthy = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/internal/worker/health?workerId=server-worker",
+      headers: { "x-internal-token": internalToken },
+    });
+    expect(healthy.statusCode).toBe(200);
+    expect(healthy.json()).toMatchObject({
+      health: "healthy",
+      healthy: true,
+      status: "idle",
+      ageMs: 0,
+    });
+    expect(
+      built.database
+        .prepare(
+          "SELECT worker_id, status, last_seen_at FROM worker_heartbeats WHERE worker_id = ?",
+        )
+        .get("server-worker"),
+    ).toEqual({
+      worker_id: "server-worker",
+      status: "idle",
+      last_seen_at: fixedNow,
+    });
+    const ready = await built.app.inject({
+      method: "GET",
+      url: "/health/ready",
+    });
+    expect(ready.statusCode).toBe(200);
+    expect(ready.json()).toMatchObject({
+      status: "ready",
+      database: "ok",
+      worker: { health: "healthy", workerId: "server-worker" },
+    });
+
+    currentNow += 60_001;
+    const stale = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/internal/worker/health?workerId=server-worker",
+      headers: { "x-internal-token": internalToken },
+    });
+    expect(stale.statusCode).toBe(503);
+    expect(stale.json()).toMatchObject({
+      health: "stale",
+      healthy: false,
+      ageMs: 60_001,
+    });
+    expect(
+      (await built.app.inject({ method: "GET", url: "/health/ready" }))
+        .statusCode,
+    ).toBe(503);
+  });
+
+  it("renews job leases and bounds failures without re-claiming exhausted pending jobs", async () => {
+    const inboxPath = join(testRoot, "inbox", "retry-movie.mp4");
+    writeFileSync(inboxPath, "test");
+    const imported = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/internal/imports/sftp",
+      headers: { "x-internal-token": internalToken },
+      payload: { filename: "retry-movie.mp4", filePath: inboxPath, bytes: 4 },
+    });
+    const { mediaId, jobId } = imported.json<{
+      mediaId: string;
+      jobId: string;
+    }>();
+
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const claimed = await built.app.inject({
+        method: "POST",
+        url: "/api/v1/internal/jobs/claim",
+        headers: { "x-internal-token": internalToken },
+        payload: { workerId: "retry-worker" },
+      });
+      expect(claimed.statusCode).toBe(200);
+      const job = claimed.json<{
+        id: string;
+        leaseToken: string;
+        attempt: number;
+        maxAttempts: number;
+      }>();
+      expect(job).toMatchObject({
+        id: jobId,
+        attempt,
+        maxAttempts: 5,
+      });
+      if (attempt === 1) {
+        currentNow += 30_000;
+        const renewed = await built.app.inject({
+          method: "POST",
+          url: `/api/v1/internal/jobs/${job.id}/heartbeat`,
+          headers: { "x-internal-token": internalToken },
+          payload: {
+            leaseToken: job.leaseToken,
+            progress: { phase: "probe" },
+          },
+        });
+        expect(renewed.statusCode).toBe(204);
+        expect(
+          (
+            built.database
+              .prepare("SELECT lease_until FROM media_jobs WHERE id = ?")
+              .get(job.id) as { lease_until: number }
+          ).lease_until,
+        ).toBe(currentNow + 60_000);
+      }
+      const failed = await built.app.inject({
+        method: "POST",
+        url: `/api/v1/internal/jobs/${job.id}/fail`,
+        headers: { "x-internal-token": internalToken },
+        payload: {
+          leaseToken: job.leaseToken,
+          error: `simulated failure ${attempt}`,
+        },
+      });
+      expect(failed.statusCode).toBe(200);
+      expect(failed.json()).toMatchObject({
+        state: attempt === 5 ? "failed" : "pending",
+        attempt,
+        maxAttempts: 5,
+      });
+      if (attempt < 5) {
+        built.database
+          .prepare("UPDATE media_jobs SET not_before = ? WHERE id = ?")
+          .run(currentNow, job.id);
+      }
+    }
+
+    expect(
+      built.database
+        .prepare("SELECT state, error_code FROM media_jobs WHERE id = ?")
+        .get(jobId),
+    ).toEqual({ state: "failed", error_code: "WORKER_ERROR" });
+    expect(
+      built.database
+        .prepare("SELECT state FROM media WHERE id = ?")
+        .get(mediaId),
+    ).toEqual({ state: "failed" });
+
+    built.database
+      .prepare(
+        `UPDATE media_jobs
+         SET state = 'pending', attempts = 5, not_before = ?, error_code = 'WORKER_ERROR'
+         WHERE id = ?`,
+      )
+      .run(currentNow, jobId);
+    const exhausted = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/internal/jobs/claim",
+      headers: { "x-internal-token": internalToken },
+      payload: { workerId: "retry-worker" },
+    });
+    expect(exhausted.statusCode).toBe(204);
+    expect(
+      built.database
+        .prepare("SELECT state, error_code FROM media_jobs WHERE id = ?")
+        .get(jobId),
+    ).toEqual({
+      state: "failed",
+      error_code: "MAX_ATTEMPTS_EXCEEDED",
+    });
+  });
+
+  it("grants one bounded claim to a legacy high-attempt lease with no recorded error", async () => {
+    const inboxPath = join(testRoot, "inbox", "legacy-recovery.mp4");
+    writeFileSync(inboxPath, "test");
+    const imported = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/internal/imports/sftp",
+      headers: { "x-internal-token": internalToken },
+      payload: {
+        filename: "legacy-recovery.mp4",
+        filePath: inboxPath,
+        bytes: 4,
+      },
+    });
+    const { jobId } = imported.json<{ jobId: string }>();
+    built.database
+      .prepare(
+        `UPDATE media_jobs
+         SET state = 'leased', attempts = 1157, lease_until = ?,
+             error_code = NULL, lease_token_hash = 'legacy-token'
+         WHERE id = ?`,
+      )
+      .run(currentNow - 1, jobId);
+
+    const reclaimed = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/internal/jobs/claim",
+      headers: { "x-internal-token": internalToken },
+      payload: { workerId: "recovery-worker" },
+    });
+    expect(reclaimed.statusCode).toBe(200);
+    expect(reclaimed.json()).toMatchObject({
+      id: jobId,
+      attempt: 1,
+      maxAttempts: 5,
+    });
+    expect(
+      built.database
+        .prepare("SELECT attempts, error_code FROM media_jobs WHERE id = ?")
+        .get(jobId),
+    ).toEqual({ attempts: 1, error_code: "LEGACY_RECOVERY" });
+  });
+
   it("verifies LiveKit webhooks and re-enqueues an inactive participant idempotently", async () => {
     // Arrange
     const roomId = uuidv7();
@@ -430,6 +659,11 @@ describe("SimpleWatch API", () => {
       payload: { filename: "resume.mp4", bytes: 4, mime: "video/mp4" },
     });
     const upload = authorize.json<{ uploadId: string; uploadToken: string }>();
+    expect(
+      built.database
+        .prepare("SELECT reserved_bytes FROM uploads WHERE id = ?")
+        .get(upload.uploadId),
+    ).toEqual({ reserved_bytes: 8 });
     const hookHeaders = { "x-internal-token": internalToken };
     const hookEvent = (type: string, offset = 0) => ({
       Type: type,
@@ -462,9 +696,25 @@ describe("SimpleWatch API", () => {
         ...hookHeaders,
         "upload-token": upload.uploadToken,
         "x-forwarded-uri": `/files/${upload.uploadId}`,
+        "x-forwarded-method": "PATCH",
       },
     });
     expect(tusAllowed.statusCode).toBe(204);
+
+    const progress = await built.app.inject({
+      method: "POST",
+      url: "/api/v1/internal/tus/hooks",
+      headers: hookHeaders,
+      payload: hookEvent("post-receive", 2),
+    });
+    expect(progress.statusCode).toBe(200);
+    expect(
+      built.database
+        .prepare(
+          "SELECT received_bytes, reserved_bytes FROM uploads WHERE id = ?",
+        )
+        .get(upload.uploadId),
+    ).toEqual({ received_bytes: 2, reserved_bytes: 6 });
 
     writeFileSync(join(testRoot, "uploads", upload.uploadId), "test");
     const finish = await built.app.inject({
@@ -474,6 +724,11 @@ describe("SimpleWatch API", () => {
       payload: hookEvent("post-finish", 4),
     });
     expect(finish.statusCode).toBe(200);
+    expect(
+      built.database
+        .prepare("SELECT state, reserved_bytes FROM uploads WHERE id = ?")
+        .get(upload.uploadId),
+    ).toEqual({ state: "received", reserved_bytes: 4 });
     const repeated = await built.app.inject({
       method: "POST",
       url: "/api/v1/internal/tus/hooks",
@@ -1342,6 +1597,35 @@ describe("SimpleWatch API", () => {
   it("atomically clears all rooms, uploads and library files while preserving the admin", async () => {
     await createRoom();
     const admin = await loginAdmin();
+    const enrolled = built.edgeAuthService.enroll({
+      displayName: "SimpleServer",
+      softwareVersion: "0.1.0",
+    });
+    const scan = built.edgeCatalogService.startScan(enrolled.agentId, 1);
+    built.edgeCatalogService.addPage(enrolled.agentId, scan.scanId, {
+      generation: 1,
+      pageIndex: 0,
+      entries: [
+        {
+          localId: "complete-library-file",
+          relativePath: "Series/Episode 01.mkv",
+          displayName: "Episode 01.mkv",
+          bytes: 4,
+          mtimeMs: fixedNow,
+        },
+      ],
+    });
+    built.edgeCatalogService.commitScan(enrolled.agentId, scan.scanId, 1, 1);
+    const host = built.database
+      .prepare("SELECT id FROM accounts WHERE username_folded = 'host'")
+      .get() as { id: string };
+    const version = built.database
+      .prepare(
+        "SELECT current_version_id AS id FROM edge_catalog_items LIMIT 1",
+      )
+      .get() as { id: string };
+    const queue = built.programService.getOrCreateActiveQueue(host.id);
+    built.programService.addItems(host.id, queue.revision, [version.id]);
     const upload = await built.app.inject({
       method: "POST",
       url: "/api/v1/uploads/authorize",
@@ -1393,6 +1677,20 @@ describe("SimpleWatch API", () => {
       "token_jti",
       "service_outbox",
       "audit_events",
+      "edge_eviction_jobs",
+      "program_watch_ranges",
+      "program_play_history",
+      "program_queue_items",
+      "program_queues",
+      "edge_upload_credentials",
+      "edge_cache_replicas",
+      "edge_transfer_jobs",
+      "edge_agent_tasks",
+      "edge_catalog_scan_entries",
+      "edge_catalog_scan_pages",
+      "edge_catalog_scans",
+      "edge_catalog_versions",
+      "edge_catalog_items",
     ]) {
       const row = built.database
         .prepare(`SELECT COUNT(*) AS count FROM ${table}`)
@@ -1403,6 +1701,20 @@ describe("SimpleWatch API", () => {
       (
         built.database
           .prepare("SELECT COUNT(*) AS count FROM admin_users")
+          .get() as { count: number }
+      ).count,
+    ).toBe(1);
+    expect(
+      (
+        built.database
+          .prepare("SELECT COUNT(*) AS count FROM edge_agents")
+          .get() as { count: number }
+      ).count,
+    ).toBe(1);
+    expect(
+      (
+        built.database
+          .prepare("SELECT COUNT(*) AS count FROM edge_agent_tokens")
           .get() as { count: number }
       ).count,
     ).toBe(1);

@@ -40,10 +40,2579 @@ paths:
                     type: string
                     enum:
                       - ok
+                  worker:
+                    type: object
+                    properties:
+                      health:
+                        type: string
+                        enum:
+                          - healthy
+                          - stale
+                          - missing
+                      workerId:
+                        nullable: true
+                        type: string
+                      status:
+                        nullable: true
+                        type: string
+                        enum:
+                          - idle
+                          - busy
+                          - degraded
+                      currentJobId:
+                        nullable: true
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                      lastSeenAt:
+                        nullable: true
+                        type: string
+                        format: date-time
+                        pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                      ageMs:
+                        nullable: true
+                        type: integer
+                        minimum: 0
+                        maximum: 9007199254740991
+                    required:
+                      - health
+                      - workerId
+                      - status
+                      - currentJobId
+                      - lastSeenAt
+                      - ageMs
+                    additionalProperties: false
                 required:
                   - status
                   - database
+                  - worker
                 additionalProperties: false
+        "503":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum:
+                      - not-ready
+                  database:
+                    type: string
+                    enum:
+                      - ok
+                  worker:
+                    type: object
+                    properties:
+                      health:
+                        type: string
+                        enum:
+                          - healthy
+                          - stale
+                          - missing
+                      workerId:
+                        nullable: true
+                        type: string
+                      status:
+                        nullable: true
+                        type: string
+                        enum:
+                          - idle
+                          - busy
+                          - degraded
+                      currentJobId:
+                        nullable: true
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                      lastSeenAt:
+                        nullable: true
+                        type: string
+                        format: date-time
+                        pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                      ageMs:
+                        nullable: true
+                        type: integer
+                        minimum: 0
+                        maximum: 9007199254740991
+                    required:
+                      - health
+                      - workerId
+                      - status
+                      - currentJobId
+                      - lastSeenAt
+                      - ageMs
+                    additionalProperties: false
+                required:
+                  - status
+                  - database
+                  - worker
+                additionalProperties: false
+  /api/v1/edge/v1/heartbeat:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                protocolVersion:
+                  type: integer
+                  exclusiveMinimum: true
+                  maximum: 9007199254740991
+                softwareVersion:
+                  type: string
+                  minLength: 1
+                  maxLength: 120
+                capabilities:
+                  type: object
+                  additionalProperties: {}
+      responses:
+        "204":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: string
+                nullable: true
+                enum:
+                  - null
+  /api/v1/edge/v1/catalog/scans:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                generation:
+                  type: integer
+                  exclusiveMinimum: true
+                  maximum: 9007199254740991
+              required:
+                - generation
+      responses:
+        "201":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scanId:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  generation:
+                    type: integer
+                    exclusiveMinimum: true
+                    maximum: 9007199254740991
+                required:
+                  - scanId
+                  - generation
+                additionalProperties: false
+  /api/v1/edge/v1/catalog/scans/{scanId}/pages:
+    put:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                generation:
+                  type: integer
+                  exclusiveMinimum: true
+                  maximum: 9007199254740991
+                pageIndex:
+                  type: integer
+                  minimum: 0
+                  maximum: 9007199254740991
+                entries:
+                  maxItems: 2000
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      localId:
+                        type: string
+                        minLength: 1
+                        maxLength: 512
+                      relativePath:
+                        type: string
+                        minLength: 1
+                        maxLength: 2048
+                      displayName:
+                        type: string
+                        minLength: 1
+                        maxLength: 255
+                      bytes:
+                        type: integer
+                        minimum: -9007199254740991
+                        maximum: 9007199254740991
+                      mtimeMs:
+                        type: integer
+                        minimum: -9007199254740991
+                        maximum: 9007199254740991
+                    required:
+                      - localId
+                      - relativePath
+                      - displayName
+                      - bytes
+                      - mtimeMs
+              required:
+                - generation
+                - pageIndex
+                - entries
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: scanId
+          required: true
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted:
+                    type: boolean
+                required:
+                  - accepted
+                additionalProperties: false
+  /api/v1/edge/v1/catalog/scans/{scanId}/commit:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                generation:
+                  type: integer
+                  exclusiveMinimum: true
+                  maximum: 9007199254740991
+                pageCount:
+                  type: integer
+                  minimum: 0
+                  maximum: 9007199254740991
+              required:
+                - generation
+                - pageCount
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: scanId
+          required: true
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  itemCount:
+                    type: integer
+                    minimum: 0
+                    maximum: 9007199254740991
+                  changedCount:
+                    type: integer
+                    minimum: 0
+                    maximum: 9007199254740991
+                required:
+                  - itemCount
+                  - changedCount
+                additionalProperties: false
+  /api/v1/edge/v1/jobs/claim:
+    get:
+      parameters:
+        - schema:
+            default: 25
+            type: integer
+            minimum: 0
+            maximum: 25
+          in: query
+          name: waitSeconds
+          required: false
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  leaseToken:
+                    type: string
+                    minLength: 32
+                    maxLength: 512
+                  leaseExpiresAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  attempts:
+                    type: integer
+                    exclusiveMinimum: true
+                    maximum: 9007199254740991
+                  maxAttempts:
+                    type: integer
+                    exclusiveMinimum: true
+                    maximum: 9007199254740991
+                  payload:
+                    oneOf:
+                      - type: object
+                        properties:
+                          kind:
+                            type: string
+                            enum:
+                              - catalog_scan
+                          generation:
+                            type: integer
+                            exclusiveMinimum: true
+                            maximum: 9007199254740991
+                        required:
+                          - kind
+                          - generation
+                        additionalProperties: false
+                      - type: object
+                        properties:
+                          catalogItemId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                          catalogVersionId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                          localId:
+                            type: string
+                            minLength: 1
+                            maxLength: 512
+                          expectedBytes:
+                            type: integer
+                            minimum: -9007199254740991
+                            maximum: 9007199254740991
+                          expectedMtimeMs:
+                            type: integer
+                            minimum: -9007199254740991
+                            maximum: 9007199254740991
+                          expectedSha256:
+                            nullable: true
+                            type: string
+                            pattern: ^[a-f0-9]{64}$
+                          kind:
+                            type: string
+                            enum:
+                              - upload
+                          edgeTransferId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        required:
+                          - catalogItemId
+                          - catalogVersionId
+                          - localId
+                          - expectedBytes
+                          - expectedMtimeMs
+                          - expectedSha256
+                          - kind
+                          - edgeTransferId
+                        additionalProperties: false
+                      - type: object
+                        properties:
+                          catalogItemId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                          catalogVersionId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                          localId:
+                            type: string
+                            minLength: 1
+                            maxLength: 512
+                          expectedBytes:
+                            type: integer
+                            minimum: -9007199254740991
+                            maximum: 9007199254740991
+                          expectedMtimeMs:
+                            type: integer
+                            minimum: -9007199254740991
+                            maximum: 9007199254740991
+                          expectedSha256:
+                            nullable: true
+                            type: string
+                            pattern: ^[a-f0-9]{64}$
+                          kind:
+                            type: string
+                            enum:
+                              - verify_source
+                          edgeTransferId:
+                            nullable: true
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                          cacheReplicaId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        required:
+                          - catalogItemId
+                          - catalogVersionId
+                          - localId
+                          - expectedBytes
+                          - expectedMtimeMs
+                          - expectedSha256
+                          - kind
+                          - edgeTransferId
+                          - cacheReplicaId
+                        additionalProperties: false
+                      - type: object
+                        properties:
+                          kind:
+                            type: string
+                            enum:
+                              - cancel_transfer
+                          edgeTransferId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        required:
+                          - kind
+                          - edgeTransferId
+                        additionalProperties: false
+                required:
+                  - id
+                  - leaseToken
+                  - leaseExpiresAt
+                  - attempts
+                  - maxAttempts
+                  - payload
+                additionalProperties: false
+        "204":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: string
+                nullable: true
+                enum:
+                  - null
+  /api/v1/edge/v1/jobs/{jobId}/upload-credential:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                leaseToken:
+                  type: string
+                  minLength: 32
+                  maxLength: 512
+                source:
+                  type: object
+                  properties:
+                    bytes:
+                      type: integer
+                      minimum: -9007199254740991
+                      maximum: 9007199254740991
+                    mtimeMs:
+                      type: integer
+                      minimum: -9007199254740991
+                      maximum: 9007199254740991
+                    sha256:
+                      type: string
+                      pattern: ^[a-f0-9]{64}$
+                  required:
+                    - bytes
+                    - mtimeMs
+                    - sha256
+              required:
+                - leaseToken
+                - source
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: jobId
+          required: true
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  edgeTransferId:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  uploadId:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  tusUrl:
+                    type: string
+                    minLength: 1
+                    maxLength: 4096
+                  token:
+                    type: string
+                    minLength: 32
+                    maxLength: 4096
+                  expiresAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  refreshAfter:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  chunkBytes:
+                    type: integer
+                    exclusiveMinimum: true
+                    maximum: 9007199254740991
+                required:
+                  - edgeTransferId
+                  - uploadId
+                  - tusUrl
+                  - token
+                  - expiresAt
+                  - refreshAfter
+                  - chunkBytes
+                additionalProperties: false
+  /api/v1/edge/v1/jobs/{jobId}/heartbeat:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                leaseToken:
+                  type: string
+                  minLength: 32
+                  maxLength: 512
+                bytesTransferred:
+                  type: integer
+                  minimum: -9007199254740991
+                  maximum: 9007199254740991
+              required:
+                - leaseToken
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: jobId
+          required: true
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  leaseExpiresAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  cancelRequested:
+                    type: boolean
+                required:
+                  - leaseExpiresAt
+                  - cancelRequested
+                additionalProperties: false
+  /api/v1/edge/v1/jobs/{jobId}/cancelled:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                leaseToken:
+                  type: string
+                  minLength: 32
+                  maxLength: 512
+              required:
+                - leaseToken
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: jobId
+          required: true
+      responses:
+        "204":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: string
+                nullable: true
+                enum:
+                  - null
+  /api/v1/edge/v1/jobs/{jobId}/complete:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                leaseToken:
+                  type: string
+                  minLength: 32
+                  maxLength: 512
+                source:
+                  type: object
+                  properties:
+                    bytes:
+                      type: integer
+                      minimum: -9007199254740991
+                      maximum: 9007199254740991
+                    mtimeMs:
+                      type: integer
+                      minimum: -9007199254740991
+                      maximum: 9007199254740991
+                    sha256:
+                      type: string
+                      pattern: ^[a-f0-9]{64}$
+                  required:
+                    - bytes
+                    - mtimeMs
+                    - sha256
+              required:
+                - leaseToken
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: jobId
+          required: true
+      responses:
+        "204":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: string
+                nullable: true
+                enum:
+                  - null
+  /api/v1/edge/v1/jobs/{jobId}/fail:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                leaseToken:
+                  type: string
+                  minLength: 32
+                  maxLength: 512
+                code:
+                  type: string
+                  enum:
+                    - SOURCE_MISSING
+                    - SOURCE_CHANGED
+                    - PERMISSION_DENIED
+                    - INSUFFICIENT_STORAGE
+                    - TRANSFER_STALLED
+                    - NETWORK_ERROR
+                    - INTERNAL_ERROR
+                message:
+                  type: string
+                  minLength: 1
+                  maxLength: 1000
+                retryable:
+                  type: boolean
+              required:
+                - leaseToken
+                - code
+                - message
+                - retryable
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: jobId
+          required: true
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:
+                    type: string
+                    enum:
+                      - queued
+                      - failed
+                required:
+                  - state
+                additionalProperties: false
+  /api/v1/admin/edge/summary:
+    get:
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        displayName:
+                          type: string
+                          minLength: 1
+                          maxLength: 120
+                        state:
+                          type: string
+                          enum:
+                            - online
+                            - offline
+                            - stale
+                            - revoked
+                        protocolVersion:
+                          type: integer
+                          exclusiveMinimum: true
+                          maximum: 9007199254740991
+                        softwareVersion:
+                          type: string
+                          minLength: 1
+                          maxLength: 120
+                        lastSeenAt:
+                          nullable: true
+                          type: string
+                          format: date-time
+                          pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                        lastCompleteScanAt:
+                          nullable: true
+                          type: string
+                          format: date-time
+                          pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                        catalogItemCount:
+                          type: integer
+                          minimum: 0
+                          maximum: 9007199254740991
+                        credentialExpiresAt:
+                          nullable: true
+                          type: string
+                          format: date-time
+                          pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                        credentialExpiringSoon:
+                          type: boolean
+                      required:
+                        - id
+                        - displayName
+                        - state
+                        - protocolVersion
+                        - softwareVersion
+                        - lastSeenAt
+                        - lastCompleteScanAt
+                        - catalogItemCount
+                        - credentialExpiresAt
+                        - credentialExpiringSoon
+                      additionalProperties: false
+                  storage:
+                    type: object
+                    properties:
+                      capacityBytes:
+                        type: integer
+                        minimum: -9007199254740991
+                        maximum: 9007199254740991
+                      freeBytes:
+                        type: integer
+                        minimum: -9007199254740991
+                        maximum: 9007199254740991
+                      reservedBytes:
+                        type: integer
+                        minimum: -9007199254740991
+                        maximum: 9007199254740991
+                      safetyFloorBytes:
+                        type: integer
+                        minimum: -9007199254740991
+                        maximum: 9007199254740991
+                      permanentMediaBytes:
+                        type: integer
+                        minimum: -9007199254740991
+                        maximum: 9007199254740991
+                      edgeCacheBytes:
+                        type: integer
+                        minimum: -9007199254740991
+                        maximum: 9007199254740991
+                      inFlightBytes:
+                        type: integer
+                        minimum: -9007199254740991
+                        maximum: 9007199254740991
+                    required:
+                      - capacityBytes
+                      - freeBytes
+                      - reservedBytes
+                      - safetyFloorBytes
+                      - permanentMediaBytes
+                      - edgeCacheBytes
+                      - inFlightBytes
+                    additionalProperties: false
+                required:
+                  - agents
+                  - storage
+                additionalProperties: false
+  /api/v1/admin/edge/agents/{agentId}/catalog/refresh:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: {}
+              additionalProperties: false
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: agentId
+          required: true
+      responses:
+        "202":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agent:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                      displayName:
+                        type: string
+                        minLength: 1
+                        maxLength: 120
+                      state:
+                        type: string
+                        enum:
+                          - online
+                          - offline
+                          - stale
+                          - revoked
+                      protocolVersion:
+                        type: integer
+                        exclusiveMinimum: true
+                        maximum: 9007199254740991
+                      softwareVersion:
+                        type: string
+                        minLength: 1
+                        maxLength: 120
+                      lastSeenAt:
+                        nullable: true
+                        type: string
+                        format: date-time
+                        pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                      lastCompleteScanAt:
+                        nullable: true
+                        type: string
+                        format: date-time
+                        pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                      catalogItemCount:
+                        type: integer
+                        minimum: 0
+                        maximum: 9007199254740991
+                      credentialExpiresAt:
+                        nullable: true
+                        type: string
+                        format: date-time
+                        pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                      credentialExpiringSoon:
+                        type: boolean
+                    required:
+                      - id
+                      - displayName
+                      - state
+                      - protocolVersion
+                      - softwareVersion
+                      - lastSeenAt
+                      - lastCompleteScanAt
+                      - catalogItemCount
+                      - credentialExpiresAt
+                      - credentialExpiringSoon
+                    additionalProperties: false
+                  task:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                      state:
+                        type: string
+                        enum:
+                          - queued
+                          - leased
+                      deduplicated:
+                        type: boolean
+                    required:
+                      - id
+                      - state
+                      - deduplicated
+                    additionalProperties: false
+                required:
+                  - agent
+                  - task
+                additionalProperties: false
+  /api/v1/admin/edge/cache/{replicaId}:
+    patch:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expectedGeneration:
+                  type: integer
+                  exclusiveMinimum: true
+                  maximum: 9007199254740991
+                expectedRowVersion:
+                  type: integer
+                  minimum: 0
+                  maximum: 9007199254740991
+                pinned:
+                  type: boolean
+              required:
+                - expectedGeneration
+                - expectedRowVersion
+                - pinned
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: replicaId
+          required: true
+      responses:
+        "204":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: string
+                nullable: true
+                enum:
+                  - null
+  /api/v1/admin/edge/cache/{replicaId}/evict:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expectedGeneration:
+                  type: integer
+                  exclusiveMinimum: true
+                  maximum: 9007199254740991
+                expectedRowVersion:
+                  type: integer
+                  minimum: 0
+                  maximum: 9007199254740991
+              required:
+                - expectedGeneration
+                - expectedRowVersion
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: replicaId
+          required: true
+      responses:
+        "202":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  evictionId:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  state:
+                    type: string
+                required:
+                  - evictionId
+                  - state
+                additionalProperties: false
+  /api/v1/admin/edge/catalog:
+    get:
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: query
+          name: agentId
+          required: false
+        - schema:
+            default: 100
+            type: integer
+            minimum: 1
+            maximum: 500
+          in: query
+          name: limit
+          required: false
+        - schema:
+            type: string
+            minLength: 1
+            maxLength: 4096
+          in: query
+          name: cursor
+          required: false
+        - schema:
+            type: string
+            minLength: 1
+            maxLength: 255
+          in: query
+          name: search
+          required: false
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        versionId:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        relativePath:
+                          type: string
+                          minLength: 1
+                          maxLength: 2048
+                        displayName:
+                          type: string
+                          minLength: 1
+                          maxLength: 255
+                        bytes:
+                          type: integer
+                          minimum: -9007199254740991
+                          maximum: 9007199254740991
+                        mtimeMs:
+                          type: integer
+                          minimum: -9007199254740991
+                          maximum: 9007199254740991
+                        sourceState:
+                          type: string
+                          enum:
+                            - present
+                            - missing
+                            - changed
+                        cloudState:
+                          type: string
+                          enum:
+                            - not-requested
+                            - queued
+                            - validating
+                            - uploading
+                            - processing
+                            - ready
+                            - blocked
+                            - failed
+                            - evicted
+                        sha256:
+                          nullable: true
+                          type: string
+                          pattern: ^[a-f0-9]{64}$
+                      required:
+                        - id
+                        - versionId
+                        - relativePath
+                        - displayName
+                        - bytes
+                        - mtimeMs
+                        - sourceState
+                        - cloudState
+                        - sha256
+                      additionalProperties: false
+                  nextCursor:
+                    nullable: true
+                    type: string
+                    minLength: 1
+                required:
+                  - items
+                  - nextCursor
+                additionalProperties: false
+  /api/v1/admin/edge/transfers:
+    get:
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                      format: uuid
+                      pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                    catalogVersionId:
+                      nullable: true
+                      type: string
+                      format: uuid
+                      pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                    displayName:
+                      type: string
+                      minLength: 1
+                      maxLength: 255
+                    state:
+                      type: string
+                      enum:
+                        - queued
+                        - leased
+                        - validating
+                        - uploading
+                        - received
+                        - processing
+                        - ready
+                        - blocked_storage
+                        - source_missing
+                        - source_changed
+                        - permission_denied
+                        - cancel_requested
+                        - cancelled
+                        - incompatible
+                        - failed
+                        - evicted
+                    priority:
+                      type: integer
+                      minimum: -9007199254740991
+                      maximum: 9007199254740991
+                    declaredBytes:
+                      type: integer
+                      minimum: -9007199254740991
+                      maximum: 9007199254740991
+                    transferredBytes:
+                      type: integer
+                      minimum: -9007199254740991
+                      maximum: 9007199254740991
+                    attempts:
+                      type: integer
+                      minimum: 0
+                      maximum: 9007199254740991
+                    maxAttempts:
+                      type: integer
+                      exclusiveMinimum: true
+                      maximum: 9007199254740991
+                    speedBytesPerSecond:
+                      nullable: true
+                      type: number
+                      minimum: 0
+                    etaSeconds:
+                      nullable: true
+                      type: integer
+                      minimum: 0
+                      maximum: 9007199254740991
+                    errorCode:
+                      nullable: true
+                      type: string
+                    errorMessage:
+                      nullable: true
+                      type: string
+                    updatedAt:
+                      type: string
+                      format: date-time
+                      pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  required:
+                    - id
+                    - catalogVersionId
+                    - displayName
+                    - state
+                    - priority
+                    - declaredBytes
+                    - transferredBytes
+                    - attempts
+                    - maxAttempts
+                    - speedBytesPerSecond
+                    - etaSeconds
+                    - errorCode
+                    - errorMessage
+                    - updatedAt
+                  additionalProperties: false
+  /api/v1/admin/edge/cache:
+    get:
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                      format: uuid
+                      pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                    mediaId:
+                      nullable: true
+                      type: string
+                      format: uuid
+                      pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                    catalogVersionId:
+                      nullable: true
+                      type: string
+                      format: uuid
+                      pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                    displayName:
+                      type: string
+                      minLength: 1
+                      maxLength: 255
+                    bytes:
+                      type: integer
+                      minimum: -9007199254740991
+                      maximum: 9007199254740991
+                    state:
+                      type: string
+                      enum:
+                        - ready
+                        - protected
+                        - eligible
+                        - verifying_source
+                        - evicting
+                        - evicted
+                        - recovery_blocked
+                    pinned:
+                      type: boolean
+                    generation:
+                      type: integer
+                      exclusiveMinimum: true
+                      maximum: 9007199254740991
+                    rowVersion:
+                      type: integer
+                      minimum: 0
+                      maximum: 9007199254740991
+                    sourceVerifiedAt:
+                      nullable: true
+                      type: string
+                      format: date-time
+                      pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                    protectedReason:
+                      nullable: true
+                      type: string
+                  required:
+                    - id
+                    - mediaId
+                    - catalogVersionId
+                    - displayName
+                    - bytes
+                    - state
+                    - pinned
+                    - generation
+                    - rowVersion
+                    - sourceVerifiedAt
+                    - protectedReason
+                  additionalProperties: false
+  /api/v1/admin/program:
+    get:
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                nullable: true
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  displayName:
+                    type: string
+                    minLength: 1
+                    maxLength: 120
+                  state:
+                    type: string
+                    enum:
+                      - active
+                      - completed
+                      - cleared
+                  revision:
+                    type: integer
+                    minimum: 0
+                    maximum: 9007199254740991
+                  currentItemId:
+                    nullable: true
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        queueId:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        catalogVersionId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        transferId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        mediaId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        displayName:
+                          type: string
+                          minLength: 1
+                          maxLength: 255
+                        position:
+                          type: integer
+                          minimum: 0
+                          maximum: 9007199254740991
+                        preparationState:
+                          type: string
+                          enum:
+                            - pending
+                            - queued
+                            - validating
+                            - uploading
+                            - processing
+                            - ready
+                            - blocked
+                            - failed
+                            - evicted
+                        playbackState:
+                          type: string
+                          enum:
+                            - upcoming
+                            - current
+                            - completed
+                            - incomplete
+                            - removed
+                        pinned:
+                          type: boolean
+                        watchCoverage:
+                          nullable: true
+                          type: object
+                          properties:
+                            historyId:
+                              type: string
+                              format: uuid
+                              pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                            durationMs:
+                              nullable: true
+                              type: integer
+                              minimum: 0
+                              maximum: 9007199254740991
+                            coveredMs:
+                              type: integer
+                              minimum: 0
+                              maximum: 9007199254740991
+                            coveredRatio:
+                              type: number
+                              minimum: 0
+                              maximum: 1
+                            completed:
+                              type: boolean
+                            completionKind:
+                              nullable: true
+                              type: string
+                              enum:
+                                - automatic
+                                - manual
+                                - incomplete
+                            ranges:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  startMs:
+                                    type: integer
+                                    minimum: 0
+                                    maximum: 9007199254740991
+                                  endMs:
+                                    type: integer
+                                    exclusiveMinimum: true
+                                    maximum: 9007199254740991
+                                required:
+                                  - startMs
+                                  - endMs
+                                additionalProperties: false
+                          required:
+                            - historyId
+                            - durationMs
+                            - coveredMs
+                            - coveredRatio
+                            - completed
+                            - completionKind
+                            - ranges
+                          additionalProperties: false
+                      required:
+                        - id
+                        - queueId
+                        - catalogVersionId
+                        - transferId
+                        - mediaId
+                        - displayName
+                        - position
+                        - preparationState
+                        - playbackState
+                        - pinned
+                        - watchCoverage
+                      additionalProperties: false
+                  createdAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  updatedAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                required:
+                  - id
+                  - displayName
+                  - state
+                  - revision
+                  - currentItemId
+                  - items
+                  - createdAt
+                  - updatedAt
+                additionalProperties: false
+    post:
+      responses:
+        "201":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  displayName:
+                    type: string
+                    minLength: 1
+                    maxLength: 120
+                  state:
+                    type: string
+                    enum:
+                      - active
+                      - completed
+                      - cleared
+                  revision:
+                    type: integer
+                    minimum: 0
+                    maximum: 9007199254740991
+                  currentItemId:
+                    nullable: true
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        queueId:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        catalogVersionId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        transferId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        mediaId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        displayName:
+                          type: string
+                          minLength: 1
+                          maxLength: 255
+                        position:
+                          type: integer
+                          minimum: 0
+                          maximum: 9007199254740991
+                        preparationState:
+                          type: string
+                          enum:
+                            - pending
+                            - queued
+                            - validating
+                            - uploading
+                            - processing
+                            - ready
+                            - blocked
+                            - failed
+                            - evicted
+                        playbackState:
+                          type: string
+                          enum:
+                            - upcoming
+                            - current
+                            - completed
+                            - incomplete
+                            - removed
+                        pinned:
+                          type: boolean
+                        watchCoverage:
+                          nullable: true
+                          type: object
+                          properties:
+                            historyId:
+                              type: string
+                              format: uuid
+                              pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                            durationMs:
+                              nullable: true
+                              type: integer
+                              minimum: 0
+                              maximum: 9007199254740991
+                            coveredMs:
+                              type: integer
+                              minimum: 0
+                              maximum: 9007199254740991
+                            coveredRatio:
+                              type: number
+                              minimum: 0
+                              maximum: 1
+                            completed:
+                              type: boolean
+                            completionKind:
+                              nullable: true
+                              type: string
+                              enum:
+                                - automatic
+                                - manual
+                                - incomplete
+                            ranges:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  startMs:
+                                    type: integer
+                                    minimum: 0
+                                    maximum: 9007199254740991
+                                  endMs:
+                                    type: integer
+                                    exclusiveMinimum: true
+                                    maximum: 9007199254740991
+                                required:
+                                  - startMs
+                                  - endMs
+                                additionalProperties: false
+                          required:
+                            - historyId
+                            - durationMs
+                            - coveredMs
+                            - coveredRatio
+                            - completed
+                            - completionKind
+                            - ranges
+                          additionalProperties: false
+                      required:
+                        - id
+                        - queueId
+                        - catalogVersionId
+                        - transferId
+                        - mediaId
+                        - displayName
+                        - position
+                        - preparationState
+                        - playbackState
+                        - pinned
+                        - watchCoverage
+                      additionalProperties: false
+                  createdAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  updatedAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                required:
+                  - id
+                  - displayName
+                  - state
+                  - revision
+                  - currentItemId
+                  - items
+                  - createdAt
+                  - updatedAt
+                additionalProperties: false
+  /api/v1/admin/program/items:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expectedRevision:
+                  type: integer
+                  minimum: 0
+                  maximum: 9007199254740991
+                catalogVersionIds:
+                  minItems: 1
+                  maxItems: 500
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+              required:
+                - expectedRevision
+                - catalogVersionIds
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  displayName:
+                    type: string
+                    minLength: 1
+                    maxLength: 120
+                  state:
+                    type: string
+                    enum:
+                      - active
+                      - completed
+                      - cleared
+                  revision:
+                    type: integer
+                    minimum: 0
+                    maximum: 9007199254740991
+                  currentItemId:
+                    nullable: true
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        queueId:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        catalogVersionId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        transferId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        mediaId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        displayName:
+                          type: string
+                          minLength: 1
+                          maxLength: 255
+                        position:
+                          type: integer
+                          minimum: 0
+                          maximum: 9007199254740991
+                        preparationState:
+                          type: string
+                          enum:
+                            - pending
+                            - queued
+                            - validating
+                            - uploading
+                            - processing
+                            - ready
+                            - blocked
+                            - failed
+                            - evicted
+                        playbackState:
+                          type: string
+                          enum:
+                            - upcoming
+                            - current
+                            - completed
+                            - incomplete
+                            - removed
+                        pinned:
+                          type: boolean
+                        watchCoverage:
+                          nullable: true
+                          type: object
+                          properties:
+                            historyId:
+                              type: string
+                              format: uuid
+                              pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                            durationMs:
+                              nullable: true
+                              type: integer
+                              minimum: 0
+                              maximum: 9007199254740991
+                            coveredMs:
+                              type: integer
+                              minimum: 0
+                              maximum: 9007199254740991
+                            coveredRatio:
+                              type: number
+                              minimum: 0
+                              maximum: 1
+                            completed:
+                              type: boolean
+                            completionKind:
+                              nullable: true
+                              type: string
+                              enum:
+                                - automatic
+                                - manual
+                                - incomplete
+                            ranges:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  startMs:
+                                    type: integer
+                                    minimum: 0
+                                    maximum: 9007199254740991
+                                  endMs:
+                                    type: integer
+                                    exclusiveMinimum: true
+                                    maximum: 9007199254740991
+                                required:
+                                  - startMs
+                                  - endMs
+                                additionalProperties: false
+                          required:
+                            - historyId
+                            - durationMs
+                            - coveredMs
+                            - coveredRatio
+                            - completed
+                            - completionKind
+                            - ranges
+                          additionalProperties: false
+                      required:
+                        - id
+                        - queueId
+                        - catalogVersionId
+                        - transferId
+                        - mediaId
+                        - displayName
+                        - position
+                        - preparationState
+                        - playbackState
+                        - pinned
+                        - watchCoverage
+                      additionalProperties: false
+                  createdAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  updatedAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                required:
+                  - id
+                  - displayName
+                  - state
+                  - revision
+                  - currentItemId
+                  - items
+                  - createdAt
+                  - updatedAt
+                additionalProperties: false
+  /api/v1/admin/program/{queueId}/order:
+    put:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expectedRevision:
+                  type: integer
+                  minimum: 0
+                  maximum: 9007199254740991
+                itemIds:
+                  minItems: 1
+                  maxItems: 500
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+              required:
+                - expectedRevision
+                - itemIds
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: queueId
+          required: true
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  displayName:
+                    type: string
+                    minLength: 1
+                    maxLength: 120
+                  state:
+                    type: string
+                    enum:
+                      - active
+                      - completed
+                      - cleared
+                  revision:
+                    type: integer
+                    minimum: 0
+                    maximum: 9007199254740991
+                  currentItemId:
+                    nullable: true
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        queueId:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        catalogVersionId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        transferId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        mediaId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        displayName:
+                          type: string
+                          minLength: 1
+                          maxLength: 255
+                        position:
+                          type: integer
+                          minimum: 0
+                          maximum: 9007199254740991
+                        preparationState:
+                          type: string
+                          enum:
+                            - pending
+                            - queued
+                            - validating
+                            - uploading
+                            - processing
+                            - ready
+                            - blocked
+                            - failed
+                            - evicted
+                        playbackState:
+                          type: string
+                          enum:
+                            - upcoming
+                            - current
+                            - completed
+                            - incomplete
+                            - removed
+                        pinned:
+                          type: boolean
+                        watchCoverage:
+                          nullable: true
+                          type: object
+                          properties:
+                            historyId:
+                              type: string
+                              format: uuid
+                              pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                            durationMs:
+                              nullable: true
+                              type: integer
+                              minimum: 0
+                              maximum: 9007199254740991
+                            coveredMs:
+                              type: integer
+                              minimum: 0
+                              maximum: 9007199254740991
+                            coveredRatio:
+                              type: number
+                              minimum: 0
+                              maximum: 1
+                            completed:
+                              type: boolean
+                            completionKind:
+                              nullable: true
+                              type: string
+                              enum:
+                                - automatic
+                                - manual
+                                - incomplete
+                            ranges:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  startMs:
+                                    type: integer
+                                    minimum: 0
+                                    maximum: 9007199254740991
+                                  endMs:
+                                    type: integer
+                                    exclusiveMinimum: true
+                                    maximum: 9007199254740991
+                                required:
+                                  - startMs
+                                  - endMs
+                                additionalProperties: false
+                          required:
+                            - historyId
+                            - durationMs
+                            - coveredMs
+                            - coveredRatio
+                            - completed
+                            - completionKind
+                            - ranges
+                          additionalProperties: false
+                      required:
+                        - id
+                        - queueId
+                        - catalogVersionId
+                        - transferId
+                        - mediaId
+                        - displayName
+                        - position
+                        - preparationState
+                        - playbackState
+                        - pinned
+                        - watchCoverage
+                      additionalProperties: false
+                  createdAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  updatedAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                required:
+                  - id
+                  - displayName
+                  - state
+                  - revision
+                  - currentItemId
+                  - items
+                  - createdAt
+                  - updatedAt
+                additionalProperties: false
+  /api/v1/admin/program/{queueId}/items/{itemId}:
+    delete:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expectedRevision:
+                  type: integer
+                  minimum: 0
+                  maximum: 9007199254740991
+              required:
+                - expectedRevision
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: queueId
+          required: true
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: itemId
+          required: true
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  displayName:
+                    type: string
+                    minLength: 1
+                    maxLength: 120
+                  state:
+                    type: string
+                    enum:
+                      - active
+                      - completed
+                      - cleared
+                  revision:
+                    type: integer
+                    minimum: 0
+                    maximum: 9007199254740991
+                  currentItemId:
+                    nullable: true
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        queueId:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        catalogVersionId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        transferId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        mediaId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        displayName:
+                          type: string
+                          minLength: 1
+                          maxLength: 255
+                        position:
+                          type: integer
+                          minimum: 0
+                          maximum: 9007199254740991
+                        preparationState:
+                          type: string
+                          enum:
+                            - pending
+                            - queued
+                            - validating
+                            - uploading
+                            - processing
+                            - ready
+                            - blocked
+                            - failed
+                            - evicted
+                        playbackState:
+                          type: string
+                          enum:
+                            - upcoming
+                            - current
+                            - completed
+                            - incomplete
+                            - removed
+                        pinned:
+                          type: boolean
+                        watchCoverage:
+                          nullable: true
+                          type: object
+                          properties:
+                            historyId:
+                              type: string
+                              format: uuid
+                              pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                            durationMs:
+                              nullable: true
+                              type: integer
+                              minimum: 0
+                              maximum: 9007199254740991
+                            coveredMs:
+                              type: integer
+                              minimum: 0
+                              maximum: 9007199254740991
+                            coveredRatio:
+                              type: number
+                              minimum: 0
+                              maximum: 1
+                            completed:
+                              type: boolean
+                            completionKind:
+                              nullable: true
+                              type: string
+                              enum:
+                                - automatic
+                                - manual
+                                - incomplete
+                            ranges:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  startMs:
+                                    type: integer
+                                    minimum: 0
+                                    maximum: 9007199254740991
+                                  endMs:
+                                    type: integer
+                                    exclusiveMinimum: true
+                                    maximum: 9007199254740991
+                                required:
+                                  - startMs
+                                  - endMs
+                                additionalProperties: false
+                          required:
+                            - historyId
+                            - durationMs
+                            - coveredMs
+                            - coveredRatio
+                            - completed
+                            - completionKind
+                            - ranges
+                          additionalProperties: false
+                      required:
+                        - id
+                        - queueId
+                        - catalogVersionId
+                        - transferId
+                        - mediaId
+                        - displayName
+                        - position
+                        - preparationState
+                        - playbackState
+                        - pinned
+                        - watchCoverage
+                      additionalProperties: false
+                  createdAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  updatedAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                required:
+                  - id
+                  - displayName
+                  - state
+                  - revision
+                  - currentItemId
+                  - items
+                  - createdAt
+                  - updatedAt
+                additionalProperties: false
+  /api/v1/admin/program/{queueId}/items/{itemId}/pin:
+    patch:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expectedRevision:
+                  type: integer
+                  minimum: 0
+                  maximum: 9007199254740991
+                pinned:
+                  type: boolean
+              required:
+                - expectedRevision
+                - pinned
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: queueId
+          required: true
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: itemId
+          required: true
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  displayName:
+                    type: string
+                    minLength: 1
+                    maxLength: 120
+                  state:
+                    type: string
+                    enum:
+                      - active
+                      - completed
+                      - cleared
+                  revision:
+                    type: integer
+                    minimum: 0
+                    maximum: 9007199254740991
+                  currentItemId:
+                    nullable: true
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        queueId:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        catalogVersionId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        transferId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        mediaId:
+                          nullable: true
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        displayName:
+                          type: string
+                          minLength: 1
+                          maxLength: 255
+                        position:
+                          type: integer
+                          minimum: 0
+                          maximum: 9007199254740991
+                        preparationState:
+                          type: string
+                          enum:
+                            - pending
+                            - queued
+                            - validating
+                            - uploading
+                            - processing
+                            - ready
+                            - blocked
+                            - failed
+                            - evicted
+                        playbackState:
+                          type: string
+                          enum:
+                            - upcoming
+                            - current
+                            - completed
+                            - incomplete
+                            - removed
+                        pinned:
+                          type: boolean
+                        watchCoverage:
+                          nullable: true
+                          type: object
+                          properties:
+                            historyId:
+                              type: string
+                              format: uuid
+                              pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                            durationMs:
+                              nullable: true
+                              type: integer
+                              minimum: 0
+                              maximum: 9007199254740991
+                            coveredMs:
+                              type: integer
+                              minimum: 0
+                              maximum: 9007199254740991
+                            coveredRatio:
+                              type: number
+                              minimum: 0
+                              maximum: 1
+                            completed:
+                              type: boolean
+                            completionKind:
+                              nullable: true
+                              type: string
+                              enum:
+                                - automatic
+                                - manual
+                                - incomplete
+                            ranges:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  startMs:
+                                    type: integer
+                                    minimum: 0
+                                    maximum: 9007199254740991
+                                  endMs:
+                                    type: integer
+                                    exclusiveMinimum: true
+                                    maximum: 9007199254740991
+                                required:
+                                  - startMs
+                                  - endMs
+                                additionalProperties: false
+                          required:
+                            - historyId
+                            - durationMs
+                            - coveredMs
+                            - coveredRatio
+                            - completed
+                            - completionKind
+                            - ranges
+                          additionalProperties: false
+                      required:
+                        - id
+                        - queueId
+                        - catalogVersionId
+                        - transferId
+                        - mediaId
+                        - displayName
+                        - position
+                        - preparationState
+                        - playbackState
+                        - pinned
+                        - watchCoverage
+                      additionalProperties: false
+                  createdAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  updatedAt:
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                required:
+                  - id
+                  - displayName
+                  - state
+                  - revision
+                  - currentItemId
+                  - items
+                  - createdAt
+                  - updatedAt
+                additionalProperties: false
+  /api/v1/admin/edge/transfers/{transferId}/cancel:
+    post:
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: transferId
+          required: true
+      responses:
+        "204":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: string
+                nullable: true
+                enum:
+                  - null
+  /api/v1/admin/edge/transfers/{transferId}/retry:
+    post:
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: transferId
+          required: true
+      responses:
+        "204":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: string
+                nullable: true
+                enum:
+                  - null
+  /api/v1/admin/events:
+    get:
+      responses:
+        "200":
+          description: Default Response
+  /api/v1/internal/edge/reconcile:
+    post:
+      responses:
+        "200":
+          description: Default Response
   /api/v1/auth/login:
     post:
       requestBody:
@@ -1912,6 +4481,162 @@ paths:
       responses:
         "200":
           description: Default Response
+  /api/v1/internal/worker/heartbeat:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                workerId:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                currentJobId:
+                  nullable: true
+                  type: string
+                  format: uuid
+                  pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                lastError:
+                  nullable: true
+                  type: string
+                  maxLength: 2048
+              required:
+                - workerId
+      responses:
+        "200":
+          description: Default Response
+  /api/v1/internal/worker/health:
+    get:
+      parameters:
+        - schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+          in: query
+          name: workerId
+          required: true
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  health:
+                    type: string
+                    enum:
+                      - healthy
+                      - stale
+                      - missing
+                  healthy:
+                    type: boolean
+                  workerId:
+                    nullable: true
+                    type: string
+                  status:
+                    nullable: true
+                    type: string
+                    enum:
+                      - idle
+                      - busy
+                      - degraded
+                  currentJobId:
+                    nullable: true
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  lastError:
+                    nullable: true
+                    type: string
+                  startedAt:
+                    nullable: true
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  lastSeenAt:
+                    nullable: true
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  ageMs:
+                    nullable: true
+                    type: integer
+                    minimum: 0
+                    maximum: 9007199254740991
+                required:
+                  - health
+                  - healthy
+                  - workerId
+                  - status
+                  - currentJobId
+                  - lastError
+                  - startedAt
+                  - lastSeenAt
+                  - ageMs
+                additionalProperties: false
+        "503":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  health:
+                    type: string
+                    enum:
+                      - healthy
+                      - stale
+                      - missing
+                  healthy:
+                    type: boolean
+                  workerId:
+                    nullable: true
+                    type: string
+                  status:
+                    nullable: true
+                    type: string
+                    enum:
+                      - idle
+                      - busy
+                      - degraded
+                  currentJobId:
+                    nullable: true
+                    type: string
+                    format: uuid
+                    pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                  lastError:
+                    nullable: true
+                    type: string
+                  startedAt:
+                    nullable: true
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  lastSeenAt:
+                    nullable: true
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                  ageMs:
+                    nullable: true
+                    type: integer
+                    minimum: 0
+                    maximum: 9007199254740991
+                required:
+                  - health
+                  - healthy
+                  - workerId
+                  - status
+                  - currentJobId
+                  - lastError
+                  - startedAt
+                  - lastSeenAt
+                  - ageMs
+                additionalProperties: false
   /api/v1/internal/jobs/claim:
     post:
       requestBody:
@@ -1956,6 +4681,68 @@ paths:
       responses:
         "200":
           description: Default Response
+  /api/v1/internal/jobs/{jobId}/fail:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                leaseToken:
+                  type: string
+                  minLength: 1
+                error:
+                  type: string
+                  minLength: 1
+                  maxLength: 2048
+                errorCode:
+                  type: string
+                  pattern: ^[A-Z0-9_]{1,64}$
+              required:
+                - leaseToken
+                - error
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+          in: path
+          name: jobId
+          required: true
+      responses:
+        "200":
+          description: Default Response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:
+                    type: string
+                    enum:
+                      - pending
+                      - failed
+                  attempt:
+                    type: integer
+                    exclusiveMinimum: true
+                    maximum: 9007199254740991
+                  maxAttempts:
+                    type: integer
+                    exclusiveMinimum: true
+                    maximum: 9007199254740991
+                  retryAt:
+                    nullable: true
+                    type: string
+                    format: date-time
+                    pattern: ^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z))$
+                required:
+                  - state
+                  - attempt
+                  - maxAttempts
+                  - retryAt
+                additionalProperties: false
   /api/v1/internal/jobs/{jobId}/result:
     post:
       requestBody:
@@ -1975,6 +4762,9 @@ paths:
                   items:
                     type: string
                 sha256:
+                  type: string
+                  pattern: ^[a-f0-9]{64}$
+                sourceSha256:
                   type: string
                   pattern: ^[a-f0-9]{64}$
                 bytes:

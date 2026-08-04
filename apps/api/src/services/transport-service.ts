@@ -20,6 +20,7 @@ import { z } from "zod";
 import type { AppDatabase } from "../database.js";
 import { forbidden, unauthorized } from "../errors.js";
 import { createOpaqueToken, hashToken } from "../security.js";
+import { enqueueMediaSessionKicks } from "./media-session-outbox.js";
 import type { RoomIdentity } from "./room-service.js";
 
 interface TransportOptions {
@@ -169,26 +170,13 @@ export class TransportService {
           "UPDATE room_state SET live_path = ?, updated_at = ? WHERE live_path = ?",
         )
         .run(path, now, previous.path);
-      if (sessionIds.length > 0) {
-        this.database
-          .prepare(
-            `INSERT INTO service_outbox(
-              id, kind, dedupe_key, payload_json, state, attempts,
-              not_before, lease_until, last_error, created_at, completed_at
-            ) VALUES (?, 'mediamtx.kick-sessions', ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL)`,
-          )
-          .run(
-            uuidv7(),
-            `mediamtx-rotate:${uuidv7()}`,
-            JSON.stringify({
-              roomId: "rotation",
-              memberId: "publisher",
-              sessionIds,
-            }),
-            now,
-            now,
-          );
-      }
+      enqueueMediaSessionKicks(this.database, {
+        roomId: "rotation",
+        memberId: "publisher",
+        sessionIds,
+        dedupeKey: `mediamtx-rotate:${uuidv7()}`,
+        timestamp: now,
+      });
     })();
     return {
       url: `${this.options.mediaOrigin}/program/${path}/whip`,

@@ -3,8 +3,14 @@ import { v7 as uuidv7 } from "uuid";
 import type { AppDatabase } from "../database.js";
 import { conflict, notFound } from "../errors.js";
 import { createOpaqueToken, hashToken, verifyTokenHash } from "../security.js";
+import {
+  chunkMediaSessionIds,
+  LEGACY_MEDIA_SESSION_KICK_LIMIT,
+  uniqueMediaSessionIds,
+} from "./media-session-outbox.js";
 
 export type OutboxKind = "rtc.remove-participant" | "mediamtx.kick-sessions";
+export const MAX_OUTBOX_ATTEMPTS = 5;
 
 interface OutboxRow {
   readonly id: string;
@@ -12,6 +18,12 @@ interface OutboxRow {
   readonly payload_json: string;
   readonly attempts: number;
   readonly lease_token_hash: string | null;
+}
+
+interface LegacyOutboxRow {
+  readonly id: string;
+  readonly payload_json: string;
+  readonly last_error: string | null;
 }
 
 export class OutboxService {
@@ -24,16 +36,33 @@ export class OutboxService {
     const timestamp = this.now();
     return this.database
       .transaction(() => {
+        this.recoverLegacyMediaKickTasks(timestamp);
+        this.database
+          .prepare(
+            `UPDATE service_outbox
+             SET state = 'failed', lease_until = NULL,
+                 lease_token_hash = NULL, worker_id = NULL,
+                 last_error = COALESCE(last_error, 'Outbox 已达到最大尝试次数')
+             WHERE attempts >= ? AND (
+               state = 'pending'
+               OR (state = 'leased' AND lease_until <= ?)
+             )`,
+          )
+          .run(MAX_OUTBOX_ATTEMPTS, timestamp);
         const row = this.database
           .prepare(
             `SELECT id, kind, payload_json, attempts, lease_token_hash
            FROM service_outbox
-           WHERE (state = 'pending' AND not_before <= ?)
-              OR (state = 'leased' AND lease_until <= ?)
+           WHERE attempts < ? AND (
+             (state = 'pending' AND not_before <= ?)
+             OR (state = 'leased' AND lease_until <= ?)
+           )
            ORDER BY created_at, id
            LIMIT 1`,
           )
-          .get(timestamp, timestamp) as OutboxRow | undefined;
+          .get(MAX_OUTBOX_ATTEMPTS, timestamp, timestamp) as
+          | OutboxRow
+          | undefined;
         if (!row) return null;
         const leaseToken = createOpaqueToken();
         const changed = this.database
@@ -72,23 +101,41 @@ export class OutboxService {
       const row = this.requireLease(id, leaseToken);
       if (row.kind === "mediamtx.kick-sessions") {
         const payload = JSON.parse(row.payload_json) as {
-          memberId?: unknown;
+          sessionIds?: unknown;
         };
-        if (typeof payload.memberId === "string") {
+        if (
+          !Array.isArray(payload.sessionIds) ||
+          payload.sessionIds.length > LEGACY_MEDIA_SESSION_KICK_LIMIT ||
+          payload.sessionIds.some(
+            (sessionId) =>
+              typeof sessionId !== "string" || sessionId.length === 0,
+          )
+        ) {
+          throw conflict(
+            "INVALID_OUTBOX_PAYLOAD",
+            "MediaMTX Outbox payload 无效",
+          );
+        }
+        const sessionIds = uniqueMediaSessionIds(
+          payload.sessionIds as string[],
+        );
+        for (const chunk of chunkMediaSessionIds(sessionIds)) {
+          const placeholders = chunk.map(() => "?").join(", ");
           this.database
             .prepare(
               `UPDATE media_transport_sessions
                SET closed_at = ?
-               WHERE member_id = ? AND closed_at IS NULL`,
+               WHERE mediamtx_session_id IN (${placeholders})
+                 AND closed_at IS NULL`,
             )
-            .run(timestamp, payload.memberId);
+            .run(timestamp, ...chunk);
         }
       }
       this.database
         .prepare(
           `UPDATE service_outbox
            SET state = 'completed', lease_until = NULL,
-               lease_token_hash = NULL, completed_at = ?
+               lease_token_hash = NULL, worker_id = NULL, completed_at = ?
            WHERE id = ?`,
         )
         .run(timestamp, id);
@@ -98,14 +145,20 @@ export class OutboxService {
   public fail(id: string, leaseToken: string, error: string): void {
     const row = this.requireLease(id, leaseToken);
     const delay = Math.min(5 * 60_000, 1000 * 2 ** Math.min(row.attempts, 8));
+    const terminal = row.attempts >= MAX_OUTBOX_ATTEMPTS;
     this.database
       .prepare(
         `UPDATE service_outbox
-         SET state = 'pending', not_before = ?, lease_until = NULL,
-             lease_token_hash = NULL, last_error = ?
+         SET state = ?, not_before = ?, lease_until = NULL,
+             lease_token_hash = NULL, worker_id = NULL, last_error = ?
          WHERE id = ?`,
       )
-      .run(this.now() + delay, error.slice(0, 1000), id);
+      .run(
+        terminal ? "failed" : "pending",
+        terminal ? this.now() : this.now() + delay,
+        error.slice(0, 1000),
+        id,
+      );
   }
 
   public enqueueRemoveParticipant(
@@ -157,8 +210,9 @@ export class OutboxService {
       .prepare(
         `SELECT r.id AS room_id, m.member_id
          FROM rooms r
-         LEFT JOIN room_members m ON m.room_id = r.id AND r.status = 'active'
+         LEFT JOIN room_members m ON m.room_id = r.id
            AND m.left_at IS NULL AND m.kicked_at IS NULL
+         WHERE r.status = 'active'
          ORDER BY r.id, m.member_id`,
       )
       .all() as Array<{ room_id: string; member_id: string | null }>;
@@ -190,4 +244,58 @@ export class OutboxService {
     }
     return row;
   }
+
+  private recoverLegacyMediaKickTasks(timestamp: number): void {
+    const rows = this.database
+      .prepare(
+        `SELECT id, payload_json, last_error
+         FROM service_outbox
+         WHERE kind = 'mediamtx.kick-sessions'
+           AND attempts >= ?
+           AND (
+             state = 'pending'
+             OR (state = 'leased' AND lease_until <= ?)
+           )
+         ORDER BY created_at, id
+         LIMIT 100`,
+      )
+      .all(MAX_OUTBOX_ATTEMPTS, timestamp) as LegacyOutboxRow[];
+    const recover = this.database.prepare(
+      `UPDATE service_outbox
+       SET state = 'pending', attempts = 0, not_before = ?,
+           lease_until = NULL, lease_token_hash = NULL, worker_id = NULL,
+           last_error = '已兼容旧版 MediaMTX sessionIds 上限并恢复任务'
+       WHERE id = ?`,
+    );
+    for (const row of rows) {
+      if (!isLegacyMax32ValidationError(row.last_error)) continue;
+      let payload: { sessionIds?: unknown };
+      try {
+        payload = JSON.parse(row.payload_json) as { sessionIds?: unknown };
+      } catch {
+        continue;
+      }
+      if (
+        !Array.isArray(payload.sessionIds) ||
+        payload.sessionIds.length <= 32 ||
+        payload.sessionIds.length > LEGACY_MEDIA_SESSION_KICK_LIMIT ||
+        payload.sessionIds.some(
+          (sessionId) =>
+            typeof sessionId !== "string" || sessionId.length === 0,
+        )
+      ) {
+        continue;
+      }
+      recover.run(timestamp, row.id);
+    }
+  }
+}
+
+function isLegacyMax32ValidationError(error: string | null): boolean {
+  if (!error) return false;
+  return (
+    /"maximum"\s*:\s*32/.test(error) ||
+    /expected array to have <=?32 items/i.test(error) ||
+    /too_big[^]*32/i.test(error)
+  );
 }

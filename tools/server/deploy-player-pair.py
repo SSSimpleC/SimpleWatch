@@ -16,9 +16,10 @@ import sys
 import time
 
 BASELINE = Path("/opt/simplewatch/releases/20260801-120900-crossmount-86930ec")
-OLD_IMAGE = "sha256:ddb3037e925aee95ef3132033ba2954fe8d5fd2cde238e69793c703634b71791"
+PREVIOUS_PAIR = Path("/opt/simplewatch/releases/20261022-player-da98dd2cc28c/ops/compose.player.json")
+OLD_IMAGE = "sha256:e8f1471d98cb61902596c9d3027bbe7fb76ae537003e1b8a68b6b0b0b1981941"
 release = Path(sys.argv[1]).resolve()
-if release.parent != Path("/opt/simplewatch/releases") or not re.fullmatch(r"20261022-player-[0-9a-f]{12}", release.name):
+if release.parent != Path("/opt/simplewatch/releases") or not re.fullmatch(r"20261023-player-[0-9a-f]{12}", release.name):
     raise RuntimeError("Unexpected release target")
 source = release / "source"
 ops = release / "ops"
@@ -26,6 +27,8 @@ if (ops / "deployed.json").exists():
     raise RuntimeError("Release already deployed; inspect its receipt before retrying")
 if Path("/opt/simplewatch/current").resolve() != BASELINE:
     raise RuntimeError("Full-stack baseline changed")
+if json.loads(PREVIOUS_PAIR.read_text()) != {"services": {"app": {"image": OLD_IMAGE}, "worker": {"image": OLD_IMAGE}}}:
+    raise RuntimeError("Previous pair override changed")
 os.umask(0o077)
 
 
@@ -112,7 +115,7 @@ old_ffmpeg = run("docker", "exec", "simplewatch-server-app-1", "ffmpeg", "-versi
 if runtime["ffmpeg"] != old_ffmpeg:
     raise RuntimeError("FFmpeg runtime changed")
 
-compose = ["docker", "compose", "-p", "simplewatch-server", "--env-file", str(BASELINE / ".env.server"), "-f", str(BASELINE / "infra/compose/compose.server-ip.yaml")]
+compose = ["docker", "compose", "-p", "simplewatch-server", "--env-file", str(BASELINE / ".env.server"), "-f", str(BASELINE / "infra/compose/compose.server-ip.yaml"), "-f", str(PREVIOUS_PAIR)]
 override = ops / "compose.player.json"
 save(override.name, {"services": {"app": {"image": image}, "worker": {"image": image}}})
 candidate = compose + ["-f", str(override)]
@@ -175,7 +178,7 @@ try:
         raise RuntimeError("Protected database inventory changed while idle")
     save("deployed.json", {
         "atMs": int(time.time() * 1000), "release": str(release), "image": image,
-        "fullStackBaseline": str(BASELINE), "sourceSha256": manifest["sourceSha256"],
+        "fullStackBaseline": str(BASELINE), "previousPairOverride": str(PREVIOUS_PAIR), "sourceSha256": manifest["sourceSha256"],
         "health": health, "after": after,
         "inventoryUnchanged": after_inventory == before_inventory,
         "maintenanceCommand": candidate,

@@ -59,6 +59,8 @@ import { useSession } from "../store.js";
 import { DepartureDecisionDialog } from "./room/DepartureDecisionDialog.js";
 import { HostProgramQueue } from "./room/HostProgramQueue.js";
 
+type PlaybackComparison = "normal" | "native" | "host-only";
+
 export function RoomPage() {
   const { roomId = "" } = useParams();
   const navigate = useNavigate();
@@ -68,6 +70,10 @@ export function RoomPage() {
   const [snapshot, setSnapshot] = useState<RoomSnapshot | null>(null);
   const [joined, setJoined] = useState(false);
   const [error, setError] = useState("");
+  // Deliberately page-local: no URL flag, storage preference or server setting.
+  const [playbackComparison, setPlaybackComparison] =
+    useState<PlaybackComparison>("normal");
+  const playbackComparisonRef = useRef<PlaybackComparison>("normal");
   const [connected, setConnected] = useState(false);
   const [theaterMode, setTheaterMode] = useState(false);
   const socketRef = useRef<WebSocket | null>(null);
@@ -210,6 +216,7 @@ export function RoomPage() {
   );
   const hostControlsReady =
     isHost &&
+    playbackComparison !== "native" &&
     connected &&
     snapshot?.capabilities?.commandAck === true &&
     !commandQueueRef.current?.getState().frozen;
@@ -238,6 +245,8 @@ export function RoomPage() {
     liveRetryBlockedRef.current = false;
     liveRecoveryRef.current = new LiveFreezeRecovery();
     traceRef.current = [];
+    playbackComparisonRef.current = "normal";
+    setPlaybackComparison("normal");
     setJoined(false);
     setSnapshot(null);
     setPlaybackReports(null);
@@ -634,7 +643,7 @@ export function RoomPage() {
   useEffect(() => {
     startFrameObservation();
     return () => frameCancelRef.current?.();
-  }, [joined, snapshot?.mode, snapshot?.media?.id]);
+  }, [joined, snapshot?.mode, snapshot?.media?.id, playbackComparison]);
 
   function startFrameObservation() {
     frameCancelRef.current?.();
@@ -672,7 +681,10 @@ export function RoomPage() {
         mediaTime: metadata.mediaTime,
         presentedFrames: metadata.presentedFrames,
       };
-      if (latestSnapshotRef.current?.mode === "vod")
+      if (
+        latestSnapshotRef.current?.mode === "vod" &&
+        playbackComparisonRef.current !== "native"
+      )
         getVodController().notifyMediaEvent("frame", frameRef.current);
       if (latestSnapshotRef.current?.mode === "live") {
         liveHasFrameRef.current = true;
@@ -921,6 +933,8 @@ export function RoomPage() {
 
   function getVodController(): VodPlaybackController {
     vodControllerRef.current ??= new VodPlaybackController({
+      comparisonMode:
+        playbackComparisonRef.current === "host-only" ? "host-only" : "normal",
       clock: serverClockRef.current,
       media: {
         read: () => {
@@ -994,6 +1008,11 @@ export function RoomPage() {
   }
 
   function sendPlaybackStatus() {
+    if (
+      latestSnapshotRef.current?.mode === "vod" &&
+      playbackComparisonRef.current === "native"
+    )
+      return;
     const current = latestSnapshotRef.current;
     const socket = socketRef.current;
     const video = videoRef.current;
@@ -1064,6 +1083,8 @@ export function RoomPage() {
   }
 
   function sendPlaybackProgress(playingOverride?: boolean): boolean {
+    // A/B playback must not count toward the automatic episode completion path.
+    if (playbackComparisonRef.current !== "normal") return false;
     const socket = socketRef.current;
     const currentSnapshot = latestSnapshotRef.current;
     const currentProgram = latestProgramRef.current;
@@ -1187,6 +1208,7 @@ export function RoomPage() {
   }
 
   function reconcileVod(event: string) {
+    if (playbackComparisonRef.current === "native") return;
     const video = videoRef.current;
     const currentSnapshot = latestSnapshotRef.current;
     const transport = currentSnapshot?.transport;
@@ -1539,7 +1561,18 @@ export function RoomPage() {
     if (video) {
       video.muted = false;
       video.volume = preferences.programVolume / 100;
-      if (latestSnapshotRef.current?.mode === "vod") {
+      if (
+        latestSnapshotRef.current?.mode === "vod" &&
+        playbackComparisonRef.current === "native"
+      ) {
+        try {
+          await video.play();
+        } catch {
+          setError(
+            "原生播放未成功，请使用视频原生播放按钮；如提示认证失败，请正常重新登录，不要关闭鉴权。",
+          );
+        }
+      } else if (latestSnapshotRef.current?.mode === "vod") {
         reconcileVod("user-enable");
         getVodController().userPlay();
       } else if (
@@ -1603,6 +1636,7 @@ export function RoomPage() {
   }
 
   function reloadVodProgram() {
+    if (playbackComparisonRef.current === "native") return;
     const video = videoRef.current;
     if (!video) return;
     setSyncFailed(false);
@@ -1621,6 +1655,34 @@ export function RoomPage() {
     const buffered = bufferedAhead(video);
     setBufferedAheadSec(buffered);
     writeProgramDiagnostics(video, event, buffered);
+  }
+
+  function changePlaybackComparison(mode: PlaybackComparison) {
+    if (
+      !joined ||
+      latestSnapshotRef.current?.mode !== "vod" ||
+      getCommandQueue().getPendingIds().length
+    )
+      return;
+    vodControllerRef.current?.setEnabled(false);
+    vodControllerRef.current?.reset();
+    vodControllerRef.current = null;
+    playbackComparisonRef.current = mode;
+    programEnabledRef.current = false;
+    setProgramEnabled(false);
+    setPlaybackComparison(mode);
+    const video = videoRef.current;
+    if (video) {
+      video.pause();
+      video.playbackRate = 1;
+      video.muted = false;
+    }
+    vodStatusRef.current = null;
+    setVodStatus(null);
+    setSyncDeltaMs(null);
+    setSyncFailed(false);
+    setError("");
+    recordPlayerEvent(`comparison-${mode}`);
   }
 
   function writeProgramDiagnostics(
@@ -1647,6 +1709,10 @@ export function RoomPage() {
           bufferedAheadSec: round(buffered, 2),
           readyState: video.readyState,
           networkState: video.networkState,
+          comparisonMode: playbackComparisonRef.current,
+          muted: video.muted,
+          volume: video.volume,
+          playbackRate: video.playbackRate,
           stalls: stallCountRef.current,
           droppedFrames: quality?.droppedVideoFrames ?? null,
           totalFrames: quality?.totalVideoFrames ?? null,
@@ -1844,8 +1910,10 @@ export function RoomPage() {
             <span>REV {snapshot?.revision ?? 0}</span>
             {snapshot?.mode === "vod" && (
               <span>
-                SYNC {syncDeltaMs === null ? "—" : `${syncDeltaMs} ms`} · RTT{" "}
-                {clockRttMs === null ? "—" : `${clockRttMs} ms`}
+                {playbackComparison === "native"
+                  ? "原生对照 / 不参与同步"
+                  : `SYNC ${syncDeltaMs === null ? "—" : `${syncDeltaMs} ms`}`}{" "}
+                · RTT {clockRttMs === null ? "—" : `${clockRttMs} ms`}
               </span>
             )}
           </div>
@@ -1927,8 +1995,9 @@ export function RoomPage() {
               key={snapshot.media.id}
               ref={videoRef}
               data-media-id={snapshot.media.id}
+              data-comparison-mode={playbackComparison}
               src={`/api/v1/media/${snapshot.media.id}/content`}
-              controls={false}
+              controls={playbackComparison === "native"}
               playsInline
               preload="auto"
               onLoadedMetadata={(event) => {
@@ -2102,7 +2171,7 @@ export function RoomPage() {
                 </output>
               </div>
               <select
-                disabled={!hostControlsReady}
+                disabled={!hostControlsReady || playbackComparison !== "normal"}
                 aria-label="播放速度"
                 value={snapshot?.transport?.rate ?? 1}
                 onChange={(event) =>
@@ -2141,7 +2210,11 @@ export function RoomPage() {
           )}
           {snapshot?.mode === "vod" && (
             <div className="program-warning" role="status">
-              <span>{vodPhaseLabel(vodStatus?.phase)}</span>
+              <span>
+                {playbackComparison === "native"
+                  ? "原生对照：请点击视频原生播放按钮，不接收房间播放控制。"
+                  : vodPhaseLabel(vodStatus?.phase)}
+              </span>
               {vodStatus?.frameEvidence === "unavailable" && (
                 <small>此浏览器未提供逐帧证据，同步状态需结合画面确认。</small>
               )}
@@ -2155,6 +2228,41 @@ export function RoomPage() {
           )}
           <details className="playback-diagnostics">
             <summary>播放诊断</summary>
+            {snapshot?.mode === "vod" && (
+              <div>
+                <label>
+                  当前页面对照模式
+                  <select
+                    aria-label="当前页面对照模式"
+                    value={playbackComparison}
+                    disabled={!joined || pendingCommandCount > 0}
+                    onChange={(event) =>
+                      changePlaybackComparison(
+                        event.target.value as PlaybackComparison,
+                      )
+                    }
+                  >
+                    <option value="normal">正常同步</option>
+                    <option value="native">A：原生播放（不参与同步）</option>
+                    <option value="host-only">B：固定1×，仅跟随Host指令</option>
+                  </select>
+                </label>
+                <p>
+                  仅当前页面生效，刷新恢复正常；切换后请手动点击播放或启用节目声音。媒体会话、观影权限、签名和
+                  Range 鉴权保持不变。
+                </p>
+                {playbackComparison === "host-only" && (
+                  <p role="status">
+                    固定1×对照已启用：只做初次对齐和Host明确跳转；关闭速度微调、漂移自动定位、自动补偿及静音解码恢复。请Host保持1×。此模式允许偏差积累，不作为同步验收通过。
+                  </p>
+                )}
+                <p>
+                  本机音频/速度：静音 {videoRef.current?.muted ? "是" : "否"} ·
+                  音量 {Math.round((videoRef.current?.volume ?? 0) * 100)}% ·
+                  实际倍速 {videoRef.current?.playbackRate.toFixed(3) ?? "—"}×
+                </p>
+              </div>
+            )}
             <p>
               房间版本 {snapshot?.revision ?? "—"} · 目标{" "}
               {vodStatus?.targetSec?.toFixed(2) ?? "—"}s · 最近呈现{" "}

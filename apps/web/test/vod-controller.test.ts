@@ -10,7 +10,13 @@ import {
 
 type MutableMedia = { -readonly [K in keyof VodMediaState]: VodMediaState[K] };
 
-function fixture(options: { supported?: boolean; metadata?: boolean } = {}) {
+function fixture(
+  options: {
+    supported?: boolean;
+    metadata?: boolean;
+    commandOnly?: boolean;
+  } = {},
+) {
   let now = 0;
   const media: MutableMedia = {
     currentTime: 0,
@@ -36,6 +42,7 @@ function fixture(options: { supported?: boolean; metadata?: boolean } = {}) {
   const setPrimingMuted = vi.fn();
   const clock = new MonotonicServerClock(() => now, 100_000);
   const controller = new VodPlaybackController({
+    comparisonMode: options.commandOnly ? "host-only" : "normal",
     media: {
       read: () => ({ ...media }),
       seek,
@@ -107,6 +114,54 @@ function fixture(options: { supported?: boolean; metadata?: boolean } = {}) {
 }
 
 describe("VOD playback controller", () => {
+  it("keeps the explicit comparison at 1x without correcting accumulated drift", () => {
+    const f = fixture({ commandOnly: true });
+    f.controller.acceptSnapshot(f.snapshot(1, 10, "playing", 0, "seek"));
+    f.finish(10.04);
+    f.advance(30_000);
+    expect(f.media.playbackRate).toBe(1);
+    expect(f.seek).toHaveBeenCalledTimes(1);
+    expect(f.controller.getStatus().driftSec).toBeGreaterThan(20);
+    f.controller.acceptSnapshot(f.snapshot(2, 80, "playing", 750, "seek"));
+    f.advance(749);
+    expect(f.seek).toHaveBeenCalledTimes(1);
+    f.advance(1);
+    expect(f.seek).toHaveBeenLastCalledWith(80);
+    f.finish(80.04);
+    expect(f.seek).toHaveBeenCalledTimes(2);
+    expect(f.media.playbackRate).toBe(1);
+  });
+
+  it("never performs a compensation seek or muted decode prime in comparison mode", () => {
+    const f = fixture({ commandOnly: true });
+    f.controller.acceptSnapshot(f.snapshot(1, 42, "paused", 0, "seek"));
+    f.media.seeking = false;
+    f.controller.notifyMediaEvent("seeked");
+    f.advance(1600);
+    f.controller.userPlay();
+    f.advance(7000);
+    expect(f.seek).toHaveBeenCalledTimes(1);
+    expect(f.setPrimingMuted).not.toHaveBeenCalled();
+    expect(f.play).not.toHaveBeenCalled();
+    f.advance(1400);
+    expect(f.controller.getStatus().phase).toBe("error");
+  });
+
+  it("retains Host play/pause commands but ignores speed changes in the 1x comparison", () => {
+    const f = fixture({ commandOnly: true });
+    const snapshot = f.snapshot(1, 20, "playing", 0, "seek");
+    snapshot.transport.rate = 2;
+    f.controller.acceptSnapshot(snapshot);
+    f.finish(20.04);
+    expect(f.media.playbackRate).toBe(1);
+    expect(snapshot.transport.rate).toBe(2);
+    f.controller.acceptSnapshot(f.snapshot(2, 20.04, "paused", 0, "pause"));
+    expect(f.media.paused).toBe(true);
+    f.controller.acceptSnapshot(f.snapshot(3, 20.04, "playing", 0, "play"));
+    expect(f.media.paused).toBe(false);
+    expect(f.seek).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["playing", "paused"] as const)(
     "does not let an enable gesture play before the first %s anchor is effective",
     (state) => {

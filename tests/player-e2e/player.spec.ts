@@ -261,6 +261,133 @@ test("Host seek, pause, rapid final target and page recovery reach actual presen
   }
 });
 
+test("page-local comparisons preserve authenticated media and can return to normal sync", async ({
+  browser,
+}, testInfo) => {
+  const host = await createClient(browser);
+  const viewer = await createClient(browser);
+  try {
+    await login(host.page, "Host");
+    await closeExistingRoom(host.page);
+    await host.page.getByRole("button", { name: /开启放映室/ }).click();
+    await host.page.getByRole("button", { name: "进入主持房间" }).click();
+    await host.page
+      .getByLabel("选择点播影片")
+      .selectOption({ label: "sync-player-fixture.mp4" });
+    await login(viewer.page, "Simple");
+    await expect(viewer.page.locator("video")).toHaveAttribute(
+      "src",
+      `/api/v1/media/${mediaId}/content`,
+    );
+    await viewer.page.getByText("播放诊断", { exact: true }).click();
+    const comparison = viewer.page.getByLabel("当前页面对照模式");
+    await comparison.selectOption("native");
+    await expect(viewer.page.locator("video")).toHaveJSProperty(
+      "controls",
+      true,
+    );
+    await expect(viewer.page.locator("video")).toHaveAttribute(
+      "data-comparison-mode",
+      "native",
+    );
+    await host.page
+      .getByRole("button", { name: "启用节目声音", exact: true })
+      .click();
+    await host.page
+      .getByRole("button", { name: "▶ 播放", exact: true })
+      .click();
+    await viewer.page
+      .getByRole("button", { name: "启用节目声音", exact: true })
+      .click();
+    await expect
+      .poll(async () => (await latestFrame(viewer.page))?.mediaTime ?? -1)
+      .toBeGreaterThan(0.3);
+    await seekWithKeyboard(host.page, 35);
+    await expect
+      .poll(async () => (await latestFrame(host.page))?.mediaTime ?? -1)
+      .toBeGreaterThan(34.8);
+    const nativePosition = (await latestFrame(viewer.page))?.mediaTime ?? -1;
+    expect(nativePosition).toBeGreaterThan(0);
+    expect(nativePosition).toBeLessThan(15);
+    await expect(viewer.page.locator("video")).toHaveJSProperty(
+      "playbackRate",
+      1,
+    );
+    await expect(viewer.page.locator("video")).toHaveJSProperty("muted", false);
+    expect(viewer.evidence.mediaResponses.some((r) => r.status === 307)).toBe(
+      true,
+    );
+    expect(
+      viewer.evidence.mediaResponses.some(
+        (r) => r.status === 206 && r.mime?.includes("video/mp4"),
+      ),
+    ).toBe(true);
+    await viewer.page.screenshot({
+      path: testInfo.outputPath("native-comparison.png"),
+    });
+
+    await comparison.selectOption("host-only");
+    await expect(viewer.page.locator("video")).toHaveJSProperty(
+      "controls",
+      false,
+    );
+    await viewer.page
+      .getByRole("button", { name: "启用节目声音", exact: true })
+      .click();
+    await seekWithKeyboard(host.page, 10);
+    await expect
+      .poll(async () => {
+        const t = (await latestFrame(viewer.page))?.mediaTime ?? -1;
+        return t > 9.8 && t < 18;
+      })
+      .toBe(true);
+    await expect(viewer.page.locator("video")).toHaveJSProperty(
+      "playbackRate",
+      1,
+    );
+    await expect(viewer.page.locator("video")).toHaveJSProperty("muted", false);
+    await host.page
+      .getByRole("button", { name: "Ⅱ 暂停", exact: true })
+      .click();
+    await expect(viewer.page.locator("video")).toHaveJSProperty("paused", true);
+    await host.page
+      .getByRole("button", { name: "▶ 播放", exact: true })
+      .click();
+    await expect(viewer.page.locator("video")).toHaveJSProperty(
+      "paused",
+      false,
+    );
+    await viewer.page.screenshot({
+      path: testInfo.outputPath("host-only-comparison.png"),
+    });
+    await viewer.page.reload();
+    await expect(viewer.page.locator("video")).toHaveAttribute(
+      "data-comparison-mode",
+      "normal",
+    );
+    await expect(viewer.page.locator("video")).toHaveJSProperty(
+      "controls",
+      false,
+    );
+    expect(viewer.evidence.pageErrors).toEqual([]);
+    expect(host.evidence.pageErrors).toEqual([]);
+    await viewer.context.clearCookies();
+    expect(
+      (
+        await viewer.page.request.get(`/api/v1/media/${mediaId}/content`, {
+          maxRedirects: 0,
+        })
+      ).status(),
+    ).toBe(401);
+  } finally {
+    await attachEvidence(testInfo, "comparison-host", host);
+    await attachEvidence(testInfo, "comparison-viewer", viewer);
+    await closeExistingRoom(host.page).catch(() => undefined);
+    await host.context.close();
+    await viewer.context.close();
+  }
+});
+
 async function login(page: Page, username: "Host" | "Simple"): Promise<void> {
   await page.goto("/");
   await page.waitForLoadState("networkidle");

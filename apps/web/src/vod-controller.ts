@@ -117,6 +117,8 @@ export type VodMediaEvent =
   | "error";
 
 export interface VodControllerOptions {
+  /** Explicit, page-local A/B test. Never persisted or enabled by default. */
+  readonly comparisonMode?: "normal" | "host-only";
   readonly media: VodMediaAdapter;
   readonly clock: VodClock;
   readonly onStatus?: (status: VodStatus) => void;
@@ -177,7 +179,16 @@ export class VodPlaybackController {
       this.reconcile();
       return true;
     }
-    const stable = { ...snapshot, transport: { ...snapshot.transport } };
+    const stable = {
+      ...snapshot,
+      transport: {
+        ...snapshot.transport,
+        rate:
+          this.options.comparisonMode === "host-only"
+            ? 1
+            : snapshot.transport.rate,
+      },
+    };
     this.accepted = stable;
     this.pending.push(stable);
     this.tick();
@@ -396,6 +407,7 @@ export class VodPlaybackController {
       return;
     }
     if (
+      this.options.comparisonMode !== "host-only" &&
       Math.abs(drift) > (transport.state === "paused" ? 0.15 : 2) &&
       now - this.lastHardSeekMs >= 5_000
     ) {
@@ -404,6 +416,7 @@ export class VodPlaybackController {
       return;
     }
     if (
+      this.options.comparisonMode !== "host-only" &&
       transport.state === "playing" &&
       Math.abs(drift) > 0.15 &&
       now >= this.softCooldownUntilMs
@@ -512,6 +525,7 @@ export class VodPlaybackController {
     // of repeatedly writing the same currentTime. It still needs a real frame,
     // is capped at three seconds, and cannot extend the intent's deadline.
     if (
+      this.options.comparisonMode !== "host-only" &&
       transport.state === "paused" &&
       seekFinished &&
       positioned &&
@@ -543,7 +557,10 @@ export class VodPlaybackController {
       return;
     }
     const tolerance = transport.state === "paused" ? 0.15 : 2;
-    if (Math.abs(drift) > tolerance) {
+    if (
+      this.options.comparisonMode !== "host-only" &&
+      Math.abs(drift) > tolerance
+    ) {
       if (intent.attempts < 2 && !media.seeking) {
         this.issueSeek(intent, media, target, now);
         this.publish("seeking", target, drift);
@@ -666,6 +683,7 @@ export class VodPlaybackController {
 
   private startPausedPrime(fromGesture: boolean): void {
     if (
+      this.options.comparisonMode === "host-only" ||
       !this.enabled ||
       !this.visible ||
       this.error ||

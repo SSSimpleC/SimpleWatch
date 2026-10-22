@@ -21,6 +21,11 @@ containers = json.loads(run("docker", "inspect", *names))
 container_state = {}
 for service, item in zip(services, containers):
     configuration = {key: item[key] for key in ["Config", "HostConfig", "Mounts"]}
+    # Docker may enumerate the same mount map in different orders. Preserve
+    # every mount field, but canonicalize this order-insensitive list only.
+    configuration["Mounts"] = sorted(
+        item["Mounts"], key=lambda mount: json.dumps(mount, sort_keys=True)
+    )
     container_state[service] = {
         "id": item["Id"],
         "image": item["Image"],

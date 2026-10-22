@@ -35,3 +35,29 @@
 ## 真机对照仍待执行
 
 先在 iPad A 模式播放同片 30–60 秒，记录是否有声、是否卡顿；再使用 B 模式播放同一片段，先不拖动约一分钟，再测一次向前/向后拖动。Mac 保持同片与 1× 作参照。两种模式的结果分开记录；不预判无声或卡顿的根因，不把此对照当作真实 OBS 直播验收。
+
+用户在发布后明确暂时无法真机测试，并要求后续不要提问。故当前交付到「对照入口实现并上线」，真机结果未获得，不记录为问题已解决，也不自行开始 OBS 或创建线上测试房间。
+
+## 实际发布与交接
+
+- 发布时间：北京时间 2026-10-23 01:04:12。应用提交 `1941f0a5895d43402564bb1a5db16986bbb0ab68`，打包工作区干净、`production` 清单覆盖 125 个构建文件。
+- 发布目录：`/opt/simplewatch/releases/20261023-player-d7871aaf0c31`。
+- 源码哈希：`d7871aaf0c31723b26dcaf71a7960e1cad6977185334b994179937c339c50a74`；归档 SHA-256：`f8fdf4bcd3c8c8c5356a69aa9fb645cf444b2b25caa3935075d4045eeaa47430`。
+- 镜像：`sha256:887d17f5ba6c0cea3d454eaef04a373fad68ed4ef97fa2409b7076228d4b38c5`。生产标签、Git SHA、源码哈希、Linux 原生依赖与 Node/FFmpeg 基线检查通过。
+- 构建前及实际切换前均 quiet=true；所有房间、上传、后台任务、直播/语音会话和媒体写入计数为 0。只重建 App/Worker；上线后两者 healthy，公网 ready、数据库 ok、Worker idle。
+- Caddy、tusd、MediaMTX、LiveKit 的容器 ID、镜像和配置摘要完全不变。6 个账户、2 条媒体及字幕、12 项迁移的内容哈希均不变；没有操作影片文件或家庭硬盘。
+- 新的一致性数据库备份仅保留在云端 `ops/predeploy.sqlite3`，完整性和外键检查通过；未清理旧备份、未恢复旧库。
+- 公网严格 TLS 校验通过：入口及 6 个静态资源共 7 个文件返回 200，SHA-256 与运行容器逐一匹配；已确认新对照入口文案在实际 bundle 内。
+- 无凭据访问会话、媒体列表、Host 管理及当前影片 `/content` 均返回 401 / UNAUTHORIZED。对照测试仍使用房间内已授权的媒体元素，没有关闭鉴权或新增公开直链。
+- 本地发布证据：`artifacts/releases/20261023-player-d7871aaf0c31-uV55U4/`，包括构建/部署日志、脚本清单、成功回执、前后状态及 `public-smoke.json`。未下载数据库备份或账户凭据。
+
+`/opt/simplewatch/current` 仍为原全栈基线，不能单独调用旧 Compose 维护当前 App/Worker。正确维护命令以新回执 `ops/deployed.json` 中的 `maintenanceCommand` 为准，同时包含原基线及以下两个覆盖文件：
+
+```text
+-f /opt/simplewatch/releases/20261022-player-da98dd2cc28c/ops/compose.player.json
+-f /opt/simplewatch/releases/20261023-player-d7871aaf0c31/ops/compose.player.json
+```
+
+回滚用同一回执的 `rollbackCommand`：只保留第一个覆盖文件并重建 App/Worker，回到 `e8f1471d…` 镜像；不动数据库、媒体及其他四个容器。旧镜像和备份已保留。
+
+以后恢复工作先读取本记录、确认实际线上镜像，再进行真机 A/B；切勿直接把诊断模式改为默认同步策略。模式仅当前页面生效，选择「正常同步」或刷新即可退出，正常播放不需要回滚部署。此前真实 OBS 低帧率和大延时仍待独立验收。

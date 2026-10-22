@@ -63,28 +63,7 @@ export interface MediaItem {
   }>;
 }
 
-export interface RoomSnapshot {
-  roomId: string;
-  revision: number;
-  status: "active" | "closed";
-  mode: "idle" | "vod" | "live";
-  media: { id: string; title: string; durationSec: number } | null;
-  live: { state: "offline" | "connecting" | "online" } | null;
-  transport: {
-    state: "playing" | "paused";
-    positionSec: number;
-    rate: number;
-    anchoredAtServerMs: number;
-  } | null;
-  hostMemberId: string;
-  members: Array<{
-    id: string;
-    nickname: string;
-    role: "host" | "member";
-    online: boolean;
-  }>;
-  serverNowMs: number;
-}
+export type { RoomSnapshot } from "@simplewatch/contracts";
 
 export interface LiveStatus {
   state: "offline" | "online" | "unknown";

@@ -526,6 +526,7 @@ export class RoomService {
         online: now - member.last_seen_at <= 60_000,
       })),
       serverNowMs: now,
+      capabilities: { commandAck: true, playbackStatus: true },
     };
   }
 
@@ -588,7 +589,10 @@ export class RoomService {
           now,
           identity.roomId,
         );
-      result = this.getSnapshot(identity.roomId);
+      result = {
+        ...this.getSnapshot(identity.roomId),
+        cause: { commandId: request.commandId, kind: request.command.kind },
+      };
       this.database
         .prepare(
           `INSERT INTO room_commands(

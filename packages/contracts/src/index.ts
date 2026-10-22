@@ -244,8 +244,72 @@ export const roomSnapshotSchema = z.object({
   hostMemberId: participantIdSchema,
   members: z.array(roomMemberSchema),
   serverNowMs: z.number().int().nonnegative(),
+  capabilities: z
+    .object({ commandAck: z.boolean(), playbackStatus: z.boolean() })
+    .optional(),
+  cause: z
+    .object({
+      commandId: z.string().uuid(),
+      kind: z.enum([
+        "select-vod",
+        "select-live",
+        "restore-vod",
+        "play",
+        "pause",
+        "seek",
+        "set-rate",
+        "activate-queue-item",
+      ]),
+    })
+    .optional(),
 });
 export type RoomSnapshot = z.infer<typeof roomSnapshotSchema>;
+
+export const roomCommandAppliedSchema = z.object({
+  commandId: z.string().uuid(),
+  revision: z.number().int().nonnegative(),
+  snapshot: roomSnapshotSchema,
+  currentSnapshot: roomSnapshotSchema,
+});
+export type RoomCommandApplied = z.infer<typeof roomCommandAppliedSchema>;
+
+// Strict, bounded observations only: never accept client identity, paths or free text.
+export const playbackStatusSchema = z.strictObject({
+  mode: z.enum(["vod", "live"]),
+  mediaId: z.string().uuid().nullable().optional(),
+  state: z.enum([
+    "waiting-metadata",
+    "user-action-required",
+    "seeking",
+    "buffering",
+    "playing",
+    "paused",
+    "reconnecting",
+    "error",
+  ]),
+  positionSec: z.number().min(0).max(31_536_000).nullable(),
+  targetSec: z.number().min(0).max(31_536_000).nullable().optional(),
+  revision: z.number().int().nonnegative(),
+  readyState: z.number().int().min(0).max(4).nullable().optional(),
+  videoFrames: z.number().int().nonnegative().nullable().optional(),
+  fps: z.number().min(0).max(1000).nullable().optional(),
+});
+export type PlaybackStatus = z.infer<typeof playbackStatusSchema>;
+
+export const playbackStatusSummarySchema = z.object({
+  reports: z
+    .array(
+      z.object({
+        memberId: participantIdSchema,
+        nickname: z.string().min(1).max(24),
+        receivedAtMs: z.number().int().nonnegative(),
+        report: playbackStatusSchema,
+      }),
+    )
+    .max(5),
+  serverNowMs: z.number().int().nonnegative(),
+});
+export type PlaybackStatusSummary = z.infer<typeof playbackStatusSummarySchema>;
 
 export const roomCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("select-vod"), mediaId: z.string().uuid() }),
@@ -273,5 +337,6 @@ export const envelopeSchema = <T extends z.ZodType>(payload: T) =>
     id: z.string().uuid(),
     roomId: roomIdSchema,
     sentAtMs: z.number().int().nonnegative(),
+    replyTo: z.string().uuid().optional(),
     payload,
   });

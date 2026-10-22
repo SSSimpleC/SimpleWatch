@@ -580,7 +580,7 @@ describe("SimpleWatch API", () => {
                   {
                     name: livePath,
                     ready: true,
-                    source: { type: "webRTCSession" },
+                    source: { type: "webRTCSession", id: "current-publisher" },
                     tracks: ["H264", "Opus"],
                   },
                 ],
@@ -590,7 +590,7 @@ describe("SimpleWatch API", () => {
           );
         expect(new URL(requestUrl(input)).search).toBe("");
         metricsCall += 1;
-        const suffix = `path="${livePath}",state="publish"`;
+        const suffix = `id="current-publisher",path="${livePath}",state="publish"`;
         return Promise.resolve(
           new Response(
             metricsCall === 1

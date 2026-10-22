@@ -4,9 +4,15 @@ import type {
   ProgramQueue,
   ProgramQueueItem,
   RoomCommandRequest,
+  PlaybackStatus,
+  PlaybackStatusSummary,
 } from "@simplewatch/contracts";
 import {
-  decideDriftCorrection,
+  playbackStatusSummarySchema,
+  roomCommandAppliedSchema,
+  roomSnapshotSchema,
+} from "@simplewatch/contracts";
+import {
   estimateClock,
   selectStableClockEstimate,
   type ClockEstimate,
@@ -18,12 +24,24 @@ import { Link, useNavigate, useParams } from "react-router";
 
 import {
   api,
+  ApiError,
   type LiveStatus,
   type MediaItem,
   type RoomSnapshot,
 } from "../api.js";
 import { adminQueryKeys, hasHostControls } from "../admin-data.js";
 import { decideProgramTrack, replaceRetryTimer } from "../live-program.js";
+import { LiveStatsSampler, type LiveViewerStats } from "../live-stats.js";
+import { LiveFreezeRecovery } from "../live-playback.js";
+import { RoomCommandQueue } from "../room-command-queue.js";
+import {
+  MonotonicServerClock,
+  VodPlaybackController,
+  type VodStatus,
+  type VodMediaEvent,
+} from "../vod-controller.js";
+import { mediaErrorMessage, vodPhaseLabel } from "../player-ui.js";
+export { classifyViewerHealth, type LiveViewerStats } from "../live-stats.js";
 import { averageBitrateMbps, isHighLoadVod } from "../media-performance.js";
 import { loadPreferences, savePreferences } from "../preferences.js";
 import {
@@ -66,13 +84,46 @@ export function RoomPage() {
   const liveReaderGenerationRef = useRef(0);
   const liveRetryTimerRef = useRef(0);
   const rejectedLiveTracksRef = useRef(0);
-  const previousLiveStatsRef = useRef<LiveStatsSample | null>(null);
+  const liveSamplerRef = useRef(new LiveStatsSampler());
+  const liveRecoveryRef = useRef(new LiveFreezeRecovery());
+  const liveConnectingRef = useRef(false);
+  const liveRetryBlockedRef = useRef(false);
+  const liveHasFrameRef = useRef(false);
+  const liveStateRef = useRef<"idle" | "connecting" | "playing" | "error">(
+    "idle",
+  );
+  const liveStatsRef = useRef<LiveViewerStats | null>(null);
+  const frameRef = useRef<{
+    mediaTime: number;
+    presentedFrames: number;
+  } | null>(null);
+  const frameGenerationRef = useRef(0);
+  const frameCancelRef = useRef<(() => void) | null>(null);
+  const frameModeRef = useRef<RoomSnapshot["mode"] | null>(null);
+  const roomIdRef = useRef(roomId);
+  const roomGenerationRef = useRef(0);
+  const socketGenerationRef = useRef(0);
+  const refreshRequestRef = useRef<string | null>(null);
+  const refreshTimerRef = useRef(0);
+  const mountedRef = useRef(true);
+  const serverClockRef = useRef(
+    new MonotonicServerClock(() => performance.now(), Date.now()),
+  );
+  const vodControllerRef = useRef<VodPlaybackController | null>(null);
+  const vodStatusRef = useRef<VodStatus | null>(null);
+  const lastVodUiRef = useRef(0);
+  const commandQueueRef = useRef<RoomCommandQueue | null>(null);
+  const traceRef = useRef<Array<Record<string, string | number | null>>>([]);
   const stallCountRef = useRef(0);
   const seekingRef = useRef(false);
+  const seekDraftRef = useRef<number | null>(null);
+  const pendingSeekRef = useRef<{
+    commandId: string;
+    revision?: number;
+  } | null>(null);
   const clockOffsetMsRef = useRef<number | null>(null);
   const clockSamplesRef = useRef<ClockEstimate[]>([]);
   const clockBurstTimersRef = useRef<number[]>([]);
-  const excessiveDriftSinceRef = useRef<number | null>(null);
   const closingRoomRef = useRef(false);
   const latestSnapshotRef = useRef<RoomSnapshot | null>(null);
   const latestProgramRef = useRef<ProgramQueue | null | undefined>(undefined);
@@ -84,7 +135,13 @@ export function RoomPage() {
   const [syncDeltaMs, setSyncDeltaMs] = useState<number | null>(null);
   const [clockRttMs, setClockRttMs] = useState<number | null>(null);
   const [syncFailed, setSyncFailed] = useState(false);
+  const [vodStatus, setVodStatus] = useState<VodStatus | null>(null);
+  const [commandState, setCommandState] = useState("");
+  const [pendingCommandCount, setPendingCommandCount] = useState(0);
+  const [playbackReports, setPlaybackReports] =
+    useState<PlaybackStatusSummary | null>(null);
   const [seekDraftSec, setSeekDraftSec] = useState<number | null>(null);
+  const [pendingSeekSec, setPendingSeekSec] = useState<number | null>(null);
   const [liveProgramState, setLiveProgramState] = useState<
     "idle" | "connecting" | "playing" | "error"
   >("idle");
@@ -147,10 +204,15 @@ export function RoomPage() {
   const durationSec =
     snapshot?.media?.durationSec ?? (media.data?.durationMs ?? 0) / 1000;
   const displayedPositionSec = clamp(
-    seekDraftSec ?? playheadSec,
+    seekDraftSec ?? pendingSeekSec ?? playheadSec,
     0,
     durationSec,
   );
+  const hostControlsReady =
+    isHost &&
+    connected &&
+    snapshot?.capabilities?.commandAck === true &&
+    !commandQueueRef.current?.getState().frozen;
   const bitrateMbps = averageBitrateMbps(media.data);
   const onlinePlaybackEndpoints =
     snapshot?.members.filter((member) => member.online).length ?? 0;
@@ -162,10 +224,30 @@ export function RoomPage() {
     ) ?? [],
   );
 
-  latestSnapshotRef.current = snapshot;
+  roomIdRef.current = roomId;
   latestProgramRef.current = program.data;
   latestIsHostRef.current = isHost;
   programEnabledRef.current = programEnabled;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    roomGenerationRef.current += 1;
+    latestSnapshotRef.current = null;
+    vodControllerRef.current?.reset();
+    commandQueueRef.current?.reset();
+    liveRetryBlockedRef.current = false;
+    liveRecoveryRef.current = new LiveFreezeRecovery();
+    traceRef.current = [];
+    setJoined(false);
+    setSnapshot(null);
+    setPlaybackReports(null);
+    return () => {
+      mountedRef.current = false;
+      window.clearTimeout(refreshTimerRef.current);
+      vodControllerRef.current?.reset();
+      commandQueueRef.current?.reset();
+    };
+  }, [roomId]);
 
   useEffect(() => {
     let active = true;
@@ -176,8 +258,9 @@ export function RoomPage() {
         if (!active) return;
         setRoomCsrf(bootstrap.csrfToken);
         setMemberId(bootstrap.memberId);
-        setSnapshot(bootstrap.snapshot);
+        acceptRoomSnapshot(bootstrap.snapshot);
         clockOffsetMsRef.current = bootstrap.snapshot.serverNowMs - Date.now();
+        serverClockRef.current.calibrate(bootstrap.snapshot.serverNowMs);
         setJoined(true);
       })
       .catch(() => setError("当前设备未持有观影席，请返回门厅重新接管"));
@@ -282,10 +365,12 @@ export function RoomPage() {
 
   useEffect(() => {
     setSeekDraftSec(null);
+    seekDraftRef.current = null;
+    seekingRef.current = false;
     setPlayheadSec(0);
     setBufferedAheadSec(0);
     stallCountRef.current = 0;
-  }, [snapshot?.media?.id]);
+  }, [snapshot?.media?.id, snapshot?.mode]);
 
   useEffect(() => {
     if (!joined || !isHost || snapshot?.mode !== "live" || publishConfig)
@@ -319,23 +404,37 @@ export function RoomPage() {
 
     const connect = () => {
       if (disposed) return;
+      const generation = ++socketGenerationRef.current;
       const socket = new WebSocket(
         `${protocol}//${location.host}/api/v1/rooms/${roomId}/ws`,
         "simplewatch.v1",
       );
       socketRef.current = socket;
       socket.addEventListener("open", () => {
+        if (
+          disposed ||
+          socketRef.current !== socket ||
+          generation !== socketGenerationRef.current
+        )
+          return;
         retryAttempt = 0;
         setConnected(true);
-        socket.send(JSON.stringify(envelope(roomId, "room.hello", {})));
+        refreshRoomSnapshot();
         scheduleClockBurst(socket);
       });
       socket.addEventListener("close", (event) => {
+        if (
+          disposed ||
+          socketRef.current !== socket ||
+          generation !== socketGenerationRef.current
+        )
+          return;
         setConnected(false);
-        if (disposed) return;
+        window.clearTimeout(refreshTimerRef.current);
+        refreshRequestRef.current = null;
         if ([4001, 4003, 4010].includes(event.code)) {
           closeLiveProgram();
-          voiceRoomRef.current?.disconnect();
+          void voiceRoomRef.current?.disconnect().catch(() => undefined);
           voiceRoomRef.current = null;
           setVoiceState("idle");
           if (event.code === 4010 && closingRoomRef.current) return;
@@ -354,30 +453,65 @@ export function RoomPage() {
         retryTimer = window.setTimeout(connect, delay);
       });
       socket.addEventListener("message", (event) => {
-        const message = JSON.parse(String(event.data)) as {
+        if (
+          disposed ||
+          socketRef.current !== socket ||
+          generation !== socketGenerationRef.current
+        )
+          return;
+        let message: {
           type: string;
           payload: unknown;
+          replyTo?: string;
         };
+        try {
+          message = JSON.parse(String(event.data)) as typeof message;
+        } catch {
+          return;
+        }
         if (
           message.type === "room.snapshot" ||
           message.type === "host.changed"
         ) {
-          const next = message.payload as RoomSnapshot;
-          setSnapshot(next);
-          if (pendingProgramCommandsRef.current.resolveSnapshot(next)) {
-            setPendingProgramItemId(null);
-            setDeparturePrompt(null);
-            void Promise.all([
-              queryClient.invalidateQueries({
-                queryKey: adminQueryKeys.program,
-              }),
-              queryClient.invalidateQueries({
-                queryKey: adminQueryKeys.edgeTransfers,
-              }),
-            ]);
+          const parsed = roomSnapshotSchema.safeParse(message.payload);
+          if (!parsed.success) return;
+          const next = parsed.data;
+          const authoritative =
+            message.replyTo !== undefined &&
+            message.replyTo === refreshRequestRef.current;
+          if (authoritative) {
+            window.clearTimeout(refreshTimerRef.current);
+            refreshRequestRef.current = null;
           }
+          // Consume this reply before accepting it: rejecting an old revision
+          // can synchronously start a new refresh whose timer must survive.
+          acceptRoomSnapshot(next, authoritative);
           if (clockOffsetMsRef.current === null)
             clockOffsetMsRef.current = next.serverNowMs - Date.now();
+        }
+        if (message.type === "room.command.applied") {
+          const parsed = roomCommandAppliedSchema.safeParse(message.payload);
+          if (!parsed.success || parsed.data.currentSnapshot.roomId !== roomId)
+            return;
+          const receipt = parsed.data;
+          acceptRoomSnapshot(receipt.currentSnapshot);
+          getCommandQueue().acknowledge(
+            receipt.commandId,
+            receipt.revision,
+            receipt.currentSnapshot.revision,
+          );
+          recordPlayerEvent(
+            "command-applied",
+            receipt.commandId,
+            receipt.revision,
+          );
+        }
+        if (
+          message.type === "playback.status.summary" &&
+          latestIsHostRef.current
+        ) {
+          const parsed = playbackStatusSummarySchema.safeParse(message.payload);
+          if (parsed.success) setPlaybackReports(parsed.data);
         }
         if (message.type === "clock.pong") {
           const pong = message.payload as {
@@ -396,6 +530,7 @@ export function RoomPage() {
           const stable = selectStableClockEstimate(clockSamplesRef.current);
           if (stable) {
             clockOffsetMsRef.current = stable.offsetMs;
+            serverClockRef.current.calibrate(Date.now() + stable.offsetMs);
             setClockRttMs(Math.round(stable.roundTripMs));
           }
         }
@@ -409,6 +544,11 @@ export function RoomPage() {
           const pending = pendingProgramCommandsRef.current.take(
             rejection.commandId,
           );
+          if (rejection.commandId)
+            getCommandQueue().reject(
+              rejection.commandId,
+              rejection.code ?? "command-rejected",
+            );
           if (pending) {
             setPendingProgramItemId(null);
             if (rejection.code === "PROGRAM_DEPARTURE_DECISION_REQUIRED") {
@@ -436,9 +576,24 @@ export function RoomPage() {
       if (socket?.readyState === WebSocket.OPEN) scheduleClockBurst(socket, 3);
     }, 30_000);
     const recalibrate = () => {
-      if (document.visibilityState === "hidden") return;
+      getVodController().setVisible(document.visibilityState !== "hidden");
+      if (document.visibilityState === "hidden") {
+        liveRecoveryRef.current.shouldRecover({
+          generation: liveReaderGenerationRef.current,
+          atMs: performance.now(),
+          foreground: false,
+          enabled: programEnabledRef.current,
+          started: liveHasFrameRef.current,
+          videoBytesReceived: null,
+          renderedFrames: null,
+        });
+        return;
+      }
       const socket = socketRef.current;
-      if (socket?.readyState === WebSocket.OPEN) scheduleClockBurst(socket);
+      if (socket?.readyState === WebSocket.OPEN) {
+        scheduleClockBurst(socket);
+        refreshRoomSnapshot();
+      }
     };
     document.addEventListener("visibilitychange", recalibrate);
     addEventListener("online", recalibrate);
@@ -446,6 +601,8 @@ export function RoomPage() {
       disposed = true;
       window.clearTimeout(retryTimer);
       window.clearInterval(calibrationTimer);
+      window.clearTimeout(refreshTimerRef.current);
+      refreshRequestRef.current = null;
       clockBurstTimersRef.current.forEach(window.clearTimeout);
       clockBurstTimersRef.current = [];
       document.removeEventListener("visibilitychange", recalibrate);
@@ -466,19 +623,86 @@ export function RoomPage() {
   ]);
 
   useEffect(() => {
-    if (snapshot?.mode !== "vod") return;
-    const timer = window.setInterval(() => reconcileVod("periodic"), 500);
+    if (!joined) return;
+    const timer = window.setInterval(() => {
+      commandQueueRef.current?.tick();
+      if (latestSnapshotRef.current?.mode === "vod") reconcileVod("periodic");
+    }, 250);
     return () => window.clearInterval(timer);
-  }, [durationSec, snapshot?.media?.id, snapshot?.mode]);
+  }, [joined, roomId]);
 
   useEffect(() => {
-    if (snapshot?.mode !== "live" || isHost || liveProgramState !== "playing")
+    startFrameObservation();
+    return () => frameCancelRef.current?.();
+  }, [joined, snapshot?.mode, snapshot?.media?.id]);
+
+  function startFrameObservation() {
+    frameCancelRef.current?.();
+    const video = videoRef.current;
+    const generation = ++frameGenerationRef.current;
+    const current = latestSnapshotRef.current;
+    const mode = current?.mode;
+    const mediaId = current?.media?.id;
+    const readerGeneration = liveReaderGenerationRef.current;
+    const sourceObject = video?.srcObject;
+    frameModeRef.current = mode ?? null;
+    frameRef.current = null;
+    liveHasFrameRef.current = false;
+    if (
+      !video ||
+      typeof video.requestVideoFrameCallback !== "function" ||
+      (mode === "live" && !sourceObject)
+    )
       return;
+    let handle = 0;
+    let cancelled = false;
+    const frame: VideoFrameRequestCallback = (_now, metadata) => {
+      if (
+        cancelled ||
+        generation !== frameGenerationRef.current ||
+        video !== videoRef.current ||
+        latestSnapshotRef.current?.mode !== mode ||
+        latestSnapshotRef.current?.media?.id !== mediaId ||
+        (mode === "live" &&
+          (readerGeneration !== liveReaderGenerationRef.current ||
+            video.srcObject !== sourceObject))
+      )
+        return;
+      frameRef.current = {
+        mediaTime: metadata.mediaTime,
+        presentedFrames: metadata.presentedFrames,
+      };
+      if (latestSnapshotRef.current?.mode === "vod")
+        getVodController().notifyMediaEvent("frame", frameRef.current);
+      if (latestSnapshotRef.current?.mode === "live") {
+        liveHasFrameRef.current = true;
+        if (liveStateRef.current !== "playing") {
+          liveStateRef.current = "playing";
+          setLiveProgramState("playing");
+        }
+      }
+      handle = video.requestVideoFrameCallback(frame);
+    };
+    handle = video.requestVideoFrameCallback(frame);
+    frameCancelRef.current = () => {
+      cancelled = true;
+      video.cancelVideoFrameCallback?.(handle);
+    };
+  }
+
+  useEffect(() => {
+    if (!joined) return;
+    const timer = window.setInterval(() => sendPlaybackStatus(), 2000);
+    return () => window.clearInterval(timer);
+  }, [joined, roomId]);
+
+  useEffect(() => {
+    if (snapshot?.mode !== "live" || isHost || !programEnabled) return;
     const update = () => void collectLiveStats();
     update();
     const timer = window.setInterval(update, 1000);
     return () => window.clearInterval(timer);
-  }, [isHost, liveProgramState, snapshot?.mode]);
+  }, [isHost, programEnabled, snapshot?.mode]);
 
   useEffect(() => {
     if (snapshot?.mode !== "live" || isHost) {
@@ -489,7 +713,13 @@ export function RoomPage() {
       if (liveStatus.data?.state === "offline") closeLiveProgram();
       return;
     }
-    if (!liveReaderRef.current) void enableLiveProgram();
+    if (
+      !liveReaderRef.current &&
+      !liveConnectingRef.current &&
+      !liveRetryBlockedRef.current &&
+      !liveRetryTimerRef.current
+    )
+      void enableLiveProgram();
   }, [
     isHost,
     liveRetry,
@@ -500,30 +730,337 @@ export function RoomPage() {
 
   useEffect(
     () => () => {
-      voiceRoomRef.current?.disconnect();
+      void voiceRoomRef.current?.disconnect().catch(() => undefined);
       voiceRoomRef.current = null;
       closeLiveProgram();
     },
     [],
   );
 
+  function commandContext(current = latestSnapshotRef.current) {
+    return {
+      roomId: roomIdRef.current,
+      mediaId: current?.mode === "vod" ? (current.media?.id ?? null) : null,
+      generation: roomGenerationRef.current,
+    };
+  }
+
+  function recordPlayerEvent(
+    event: string,
+    commandId?: string,
+    revision?: number,
+  ) {
+    const current = latestSnapshotRef.current;
+    traceRef.current = [
+      ...traceRef.current.slice(-119),
+      {
+        event,
+        serverAtMs: Math.round(serverClockRef.current.serverNowMs()),
+        commandId: commandId ?? current?.cause?.commandId ?? null,
+        revision: revision ?? current?.revision ?? null,
+        mediaId: current?.media?.id ?? null,
+        positionSec: finiteSeconds(videoRef.current?.currentTime),
+        targetSec: vodStatusRef.current?.targetSec ?? null,
+        presentedTimeSec: frameRef.current?.mediaTime ?? null,
+        connectionGeneration: socketGenerationRef.current,
+      },
+    ];
+    try {
+      sessionStorage.setItem(
+        "simplewatch.playback-trace",
+        JSON.stringify(traceRef.current),
+      );
+    } catch {
+      /* Diagnostics must not prevent playback when storage is unavailable. */
+    }
+  }
+
+  function getCommandQueue(): RoomCommandQueue {
+    commandQueueRef.current ??= new RoomCommandQueue({
+      nowMs: () => performance.now(),
+      serverNowMs: serverClockRef.current.serverNowMs,
+      createId: () => uuidv7(),
+      send: (request, context) => {
+        const socket = socketRef.current;
+        if (
+          socket?.readyState !== WebSocket.OPEN ||
+          context.roomId !== roomIdRef.current ||
+          context.generation !== roomGenerationRef.current
+        )
+          return false;
+        recordPlayerEvent(
+          "command-submitted",
+          request.commandId,
+          request.expectedRevision,
+        );
+        socket.send(
+          JSON.stringify(envelope(context.roomId, "room.command", request)),
+        );
+        return true;
+      },
+      onRefresh: () => refreshRoomSnapshot(),
+      onChange: () => {
+        if (!mountedRef.current) return;
+        const state = commandQueueRef.current?.getState();
+        setPendingCommandCount(state?.pendingIds.length ?? 0);
+        if (state?.frozen)
+          setCommandState("正在获取权威状态；未发送操作已取消");
+        else if (state?.pendingIds.length)
+          setCommandState(`等待服务器确认（${state.pendingIds.length}）`);
+      },
+      onResult: (result) => {
+        if (!mountedRef.current) return;
+        recordPlayerEvent(`command-${result.outcome}`, result.commandId);
+        if (pendingSeekRef.current?.commandId === result.commandId) {
+          if (
+            result.outcome === "applied" &&
+            result.executionRevision !== undefined
+          )
+            pendingSeekRef.current.revision = result.executionRevision;
+          else {
+            pendingSeekRef.current = null;
+            setPendingSeekSec(null);
+          }
+        }
+        if (result.outcome === "unknown")
+          setError(
+            "操作结果暂不确定，未发送操作已取消；正在获取最新状态，请勿重复提交",
+          );
+        if (result.outcome === "applied")
+          setCommandState(
+            commandQueueRef.current?.getState().frozen
+              ? "原操作已确认，仍在等待最新权威状态；未发送操作已取消"
+              : "服务器已确认；各观看端正在协调画面",
+          );
+        if (result.outcome === "rejected")
+          setCommandState("操作未被接受，正在刷新状态");
+        if (result.outcome === "unknown" || result.outcome === "cancelled") {
+          if (pendingProgramCommandsRef.current.take(result.commandId))
+            setPendingProgramItemId(null);
+        }
+      },
+    });
+    return commandQueueRef.current;
+  }
+
+  function refreshRoomSnapshot() {
+    const socket = socketRef.current;
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    const request = envelope(roomIdRef.current, "room.hello", {
+      playbackStatus: latestIsHostRef.current,
+    });
+    refreshRequestRef.current = request.id;
+    window.clearTimeout(refreshTimerRef.current);
+    socket.send(JSON.stringify(request));
+    refreshTimerRef.current = window.setTimeout(() => {
+      if (
+        socketRef.current === socket &&
+        refreshRequestRef.current === request.id
+      ) {
+        recordPlayerEvent("snapshot-refresh-timeout");
+        socket.close(4000, "state refresh timeout");
+      }
+    }, 5000);
+  }
+
+  function acceptRoomSnapshot(next: RoomSnapshot, authoritative = false) {
+    if (next.roomId !== roomIdRef.current || !mountedRef.current) return;
+    const previous = latestSnapshotRef.current;
+    if (
+      previous &&
+      previous.roomId === next.roomId &&
+      next.revision < previous.revision
+    ) {
+      recordPlayerEvent(
+        "stale-snapshot-ignored",
+        next.cause?.commandId,
+        next.revision,
+      );
+      if (authoritative) refreshRoomSnapshot();
+      return;
+    }
+    if (
+      previous?.mode !== next.mode ||
+      previous?.media?.id !== next.media?.id
+    ) {
+      frameCancelRef.current?.();
+      frameGenerationRef.current += 1;
+      frameRef.current = null;
+      vodControllerRef.current?.reset();
+      seekDraftRef.current = null;
+      seekingRef.current = false;
+      setSeekDraftSec(null);
+      pendingSeekRef.current = null;
+      setPendingSeekSec(null);
+    }
+    latestSnapshotRef.current = next;
+    setSnapshot(next);
+    recordPlayerEvent(
+      authoritative ? "authoritative-snapshot" : "snapshot-received",
+      next.cause?.commandId,
+      next.revision,
+    );
+    if (pendingProgramCommandsRef.current.resolveSnapshot(next)) {
+      setPendingProgramItemId(null);
+      setDeparturePrompt(null);
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: adminQueryKeys.program }),
+        queryClient.invalidateQueries({
+          queryKey: adminQueryKeys.edgeTransfers,
+        }),
+      ]);
+    }
+    const queue = getCommandQueue();
+    queue.setContext(commandContext(next), next.revision);
+    if (authoritative) {
+      queue.acceptAuthoritativeSnapshot(commandContext(next), next.revision);
+      if (queue.getPendingIds().length === 0) setCommandState("最新状态已恢复");
+    }
+    if (next.mode !== "vod") vodControllerRef.current?.reset();
+  }
+
+  function getVodController(): VodPlaybackController {
+    vodControllerRef.current ??= new VodPlaybackController({
+      clock: serverClockRef.current,
+      media: {
+        read: () => {
+          const video = videoRef.current;
+          return {
+            currentTime: video?.currentTime ?? 0,
+            duration: video?.duration ?? Number.NaN,
+            readyState: video?.readyState ?? 0,
+            seeking: video?.seeking ?? false,
+            paused: video?.paused ?? true,
+            playbackRate: video?.playbackRate ?? 1,
+            bufferedAheadSec: video ? bufferedAhead(video) : 0,
+            frameEvidenceSupported: Boolean(
+              video && typeof video.requestVideoFrameCallback === "function",
+            ),
+            ...(frameRef.current ? { frame: frameRef.current } : {}),
+          };
+        },
+        seek: (seconds) => {
+          const video = videoRef.current;
+          if (!video) throw new Error("video-element-unavailable");
+          recordPlayerEvent("seek-requested");
+          video.currentTime = seconds;
+        },
+        setPlaybackRate: (rate) => {
+          if (videoRef.current) videoRef.current.playbackRate = rate;
+        },
+        play: () => videoRef.current?.play(),
+        pause: () => videoRef.current?.pause(),
+        setPrimingMuted: (muted) => {
+          if (videoRef.current) videoRef.current.muted = muted;
+        },
+      },
+      onStatus: (status) => {
+        const previous = vodStatusRef.current;
+        vodStatusRef.current = status;
+        if (!mountedRef.current) return;
+        const pendingSeek = pendingSeekRef.current;
+        const current = latestSnapshotRef.current;
+        if (
+          pendingSeek?.revision !== undefined &&
+          current?.transport &&
+          status.mediaId === current.media?.id &&
+          status.activeRevision !== null &&
+          status.activeRevision >= pendingSeek.revision &&
+          serverClockRef.current.serverNowMs() >=
+            current.transport.anchoredAtServerMs &&
+          (status.phase === "playing" || status.phase === "paused") &&
+          status.frameEvidence !== "pending"
+        ) {
+          pendingSeekRef.current = null;
+          setPendingSeekSec(null);
+        }
+        const changed =
+          status.phase !== previous?.phase ||
+          status.intentId !== previous?.intentId ||
+          status.frameEvidence !== previous?.frameEvidence;
+        if (changed)
+          recordPlayerEvent(`vod-${status.phase}-${status.frameEvidence}`);
+        if (!changed && performance.now() - lastVodUiRef.current < 250) return;
+        lastVodUiRef.current = performance.now();
+        setVodStatus(status);
+        setSyncDeltaMs(
+          status.driftSec === null ? null : Math.round(status.driftSec * 1000),
+        );
+        setSyncFailed(status.phase === "error");
+        setPlayheadSec(videoRef.current?.currentTime ?? 0);
+      },
+    });
+    return vodControllerRef.current;
+  }
+
+  function sendPlaybackStatus() {
+    const current = latestSnapshotRef.current;
+    const socket = socketRef.current;
+    const video = videoRef.current;
+    if (
+      !current?.capabilities?.playbackStatus ||
+      !video ||
+      (current.mode !== "vod" && current.mode !== "live") ||
+      socket?.readyState !== WebSocket.OPEN
+    )
+      return;
+    const phase = vodStatusRef.current?.phase;
+    const state: PlaybackStatus["state"] =
+      current.mode === "live"
+        ? liveStateRef.current === "playing"
+          ? "playing"
+          : liveStateRef.current === "error"
+            ? "error"
+            : "reconnecting"
+        : phase === "disabled" || phase === "autoplay-blocked"
+          ? "user-action-required"
+          : phase === "preparing" || !phase
+            ? "waiting-metadata"
+            : phase;
+    const payload: PlaybackStatus = {
+      mode: current.mode,
+      mediaId: current.media?.id ?? null,
+      state,
+      positionSec: finiteSeconds(video.currentTime),
+      targetSec:
+        current.mode === "vod"
+          ? (vodStatusRef.current?.targetSec ?? null)
+          : null,
+      revision: current.revision,
+      readyState: video.readyState,
+      videoFrames: frameRef.current?.presentedFrames ?? null,
+      fps:
+        current.mode === "live"
+          ? (liveStatsRef.current?.renderedFramesPerSecond ?? null)
+          : null,
+    };
+    socket.send(
+      JSON.stringify(envelope(roomIdRef.current, "playback.status", payload)),
+    );
+  }
+
   function command(
     commandPayload: RoomCommandRequest["command"],
   ): string | null {
-    if (!snapshot || socketRef.current?.readyState !== WebSocket.OPEN)
+    const current = latestSnapshotRef.current;
+    if (
+      !current ||
+      socketRef.current?.readyState !== WebSocket.OPEN ||
+      !latestIsHostRef.current
+    ) {
+      if (latestIsHostRef.current)
+        setError("控制连接尚未就绪，操作未发送；请等待连接恢复后重试");
       return null;
-    const commandId = uuidv7();
-    socketRef.current.send(
-      JSON.stringify(
-        envelope(roomId, "room.command", {
-          commandId,
-          expectedRevision: snapshot.revision,
-          effectiveAtServerMs: Date.now() + 750,
-          command: commandPayload,
-        }),
-      ),
-    );
-    return commandId;
+    }
+    if (!current.capabilities?.commandAck) {
+      setError("当前服务器尚不支持可靠控制确认，请确认前后端版本并刷新页面");
+      return null;
+    }
+    const queue = getCommandQueue();
+    queue.setContext(commandContext(current), current.revision);
+    const id = queue.enqueue(commandPayload);
+    if (!id) setError("正在恢复权威状态，请稍后重新操作");
+    return id;
   }
 
   function sendPlaybackProgress(playingOverride?: boolean): boolean {
@@ -656,50 +1193,42 @@ export function RoomPage() {
     if (
       !video ||
       !transport ||
+      !currentSnapshot.media ||
       currentSnapshot.mode !== "vod" ||
-      video.readyState === HTMLMediaElement.HAVE_NOTHING
+      video.dataset.mediaId !== currentSnapshot.media.id
     )
       return;
-
-    const serverNowMs = Date.now() + (clockOffsetMsRef.current ?? 0);
-    const elapsedMs = Math.max(0, serverNowMs - transport.anchoredAtServerMs);
-    const desired =
-      transport.positionSec +
-      (transport.state === "playing" ? (elapsedMs / 1000) * transport.rate : 0);
-    const maximum =
-      durationSec ||
-      (Number.isFinite(video.duration) ? video.duration : desired);
-    const boundedDesired = clamp(desired, 0, maximum || desired);
-    const driftSeconds = boundedDesired - video.currentTime;
-    setSyncDeltaMs(Math.round(driftSeconds * 1000));
-
-    if (transport.state === "paused") {
-      video.pause();
-      video.playbackRate = transport.rate;
-      if (Math.abs(driftSeconds) > 0.05) seekVideo(video, boundedDesired);
-      excessiveDriftSinceRef.current = null;
-      setSyncFailed(false);
-      setPlayheadSec(boundedDesired);
-      writeProgramDiagnostics(video, event);
-      return;
-    }
-
-    const correction = decideDriftCorrection(driftSeconds, transport.rate);
-    if (correction.kind === "seek") seekVideo(video, boundedDesired);
-    video.playbackRate = correction.playbackRate;
-    if (programEnabledRef.current) void video.play().catch(() => undefined);
-    else video.pause();
-
-    if (Math.abs(driftSeconds) > 1) {
-      excessiveDriftSinceRef.current ??= Date.now();
-      if (Date.now() - excessiveDriftSinceRef.current >= 5_000)
-        setSyncFailed(true);
-    } else {
-      excessiveDriftSinceRef.current = null;
-      setSyncFailed(false);
-    }
-    setPlayheadSec(video.currentTime);
-    writeProgramDiagnostics(video, event);
+    const controller = getVodController();
+    if (document.visibilityState === "hidden") controller.setVisible(false);
+    if (!programEnabledRef.current) controller.setEnabled(false);
+    controller.acceptSnapshot({
+      revision: currentSnapshot.revision,
+      mediaId: currentSnapshot.media.id,
+      transport,
+      ...(currentSnapshot.cause
+        ? {
+            commandId: currentSnapshot.cause.commandId,
+            commandKind: currentSnapshot.cause.kind,
+          }
+        : {}),
+    });
+    controller.setVisible(document.visibilityState !== "hidden");
+    controller.setEnabled(programEnabledRef.current);
+    const events: Record<string, VodMediaEvent> = {
+      "loaded-metadata": "loadedmetadata",
+      "loaded-data": "loadeddata",
+      seeking: "seeking",
+      seeked: "seeked",
+      waiting: "waiting",
+      playing: "playing",
+      error: "error",
+    };
+    const mediaEvent = events[event];
+    if (mediaEvent) {
+      recordPlayerEvent(`media-${mediaEvent}`);
+      controller.notifyMediaEvent(mediaEvent);
+    } else controller.tick();
+    if (event !== "periodic") writeProgramDiagnostics(video, event);
   }
 
   async function enableVoice() {
@@ -760,7 +1289,7 @@ export function RoomPage() {
       }
       setVoiceState("connected");
     } catch (voiceError) {
-      voiceRoomRef.current?.disconnect();
+      void voiceRoomRef.current?.disconnect().catch(() => undefined);
       voiceRoomRef.current = null;
       setVoiceState("error");
       setError(
@@ -770,8 +1299,17 @@ export function RoomPage() {
   }
 
   async function enableLiveProgram() {
-    if (!roomCsrf || liveReaderRef.current || isHost) return;
+    if (
+      !roomCsrf ||
+      liveReaderRef.current ||
+      liveConnectingRef.current ||
+      liveRetryBlockedRef.current ||
+      latestIsHostRef.current
+    )
+      return;
     const generation = ++liveReaderGenerationRef.current;
+    liveConnectingRef.current = true;
+    liveStateRef.current = "connecting";
     setLiveProgramState("connecting");
     try {
       const credential = await api<{ url: string; token: string }>(
@@ -789,6 +1327,7 @@ export function RoomPage() {
         user: "",
         pass: "",
         token: credential.token,
+        autoRetry: false,
         onTrack: (event) => {
           if (generation !== liveReaderGenerationRef.current) {
             event.track.stop();
@@ -819,12 +1358,20 @@ export function RoomPage() {
           track.addEventListener(
             "ended",
             () => {
-              if (liveTracksRef.current.get(kind)?.id === track.id)
-                liveTracksRef.current.delete(kind);
+              if (
+                generation !== liveReaderGenerationRef.current ||
+                liveTracksRef.current.get(kind) !== track
+              )
+                return;
+              liveTracksRef.current.delete(kind);
+              if (latestSnapshotRef.current?.mode === "live")
+                scheduleLiveRetry("直播轨道已结束，正在恢复连接");
             },
             { once: true },
           );
+          const sourceChanged = video.srcObject !== stream;
           video.srcObject = stream;
+          if (sourceChanged) startFrameObservation();
           video.volume = preferences.programVolume / 100;
           writeProgramDiagnostics(video, "live-track-added");
           if (
@@ -834,10 +1381,30 @@ export function RoomPage() {
             return;
           void video
             .play()
-            .then(() => setLiveProgramState("playing"))
-            .catch(() => {
+            .then(() => {
+              if (
+                generation !== liveReaderGenerationRef.current ||
+                video !== videoRef.current
+              )
+                return;
+              if (typeof video.requestVideoFrameCallback !== "function") {
+                liveStateRef.current = "playing";
+                setLiveProgramState("playing");
+              }
+            })
+            .catch((reason: unknown) => {
+              if (
+                generation !== liveReaderGenerationRef.current ||
+                video !== videoRef.current
+              )
+                return;
+              liveStateRef.current = "error";
               setLiveProgramState("error");
-              setError("浏览器阻止了节目声音，请再次点击“启用节目声音”");
+              setError(
+                reason instanceof Error && reason.name === "NotSupportedError"
+                  ? "当前设备无法播放直播编码；服务器不会转码"
+                  : "浏览器未开始播放，请点击“启用节目声音”恢复",
+              );
             });
         },
         onError: (readerError) => {
@@ -849,30 +1416,62 @@ export function RoomPage() {
         liveReaderRef.current = reader;
       else reader.close();
     } catch (readerError) {
-      if (generation === liveReaderGenerationRef.current)
+      if (
+        generation === liveReaderGenerationRef.current &&
+        readerError instanceof ApiError &&
+        [401, 403].includes(readerError.status)
+      ) {
+        closeLiveProgram();
+        liveRetryBlockedRef.current = true;
+        liveStateRef.current = "error";
+        setLiveProgramState("error");
+        setError("直播访问权限已失效，请返回门厅确认当前设备席位");
+      } else if (generation === liveReaderGenerationRef.current)
         scheduleLiveRetry(
           readerError instanceof Error
             ? `直播连接失败，正在重试：${readerError.message}`
             : "直播连接失败，正在重试",
         );
+    } finally {
+      if (generation === liveReaderGenerationRef.current)
+        liveConnectingRef.current = false;
     }
   }
 
-  function scheduleLiveRetry(message: string) {
+  function scheduleLiveRetry(message: string, budgetConsumed = false) {
     closeLiveProgram();
+    const retry =
+      budgetConsumed || liveRecoveryRef.current.requestRetry(performance.now());
+    liveRetryBlockedRef.current = !retry;
+    liveStateRef.current = "error";
     setLiveProgramState("error");
-    setError(message);
+    setError(
+      retry ? message : "直播自动恢复已达到上限，请检查信号后手动重新连接",
+    );
+    recordPlayerEvent(retry ? "live-recovery" : "live-recovery-stopped");
+    if (!retry) return;
     liveRetryTimerRef.current = replaceRetryTimer(
       liveRetryTimerRef.current,
       window.clearTimeout,
       window.setTimeout,
-      () => setLiveRetry((value) => value + 1),
+      () => {
+        liveRetryTimerRef.current = 0;
+        setLiveRetry((value) => value + 1);
+      },
       2000,
     );
   }
 
   function closeLiveProgram() {
+    if (frameModeRef.current === "live") {
+      frameCancelRef.current?.();
+      frameGenerationRef.current += 1;
+      frameRef.current = null;
+    }
     liveReaderGenerationRef.current += 1;
+    liveConnectingRef.current = false;
+    liveHasFrameRef.current = false;
+    liveStateRef.current = "idle";
     window.clearTimeout(liveRetryTimerRef.current);
     liveRetryTimerRef.current = 0;
     liveReaderRef.current?.close();
@@ -880,7 +1479,8 @@ export function RoomPage() {
     liveStreamRef.current?.getTracks().forEach((track) => track.stop());
     liveStreamRef.current = null;
     liveTracksRef.current.clear();
-    previousLiveStatsRef.current = null;
+    liveSamplerRef.current.reset();
+    liveStatsRef.current = null;
     setLiveStats(null);
     if (videoRef.current?.srcObject) videoRef.current.srcObject = null;
     setLiveProgramState("idle");
@@ -888,107 +1488,79 @@ export function RoomPage() {
 
   async function collectLiveStats() {
     const peer = liveReaderRef.current?.getPeerConnection();
-    if (!peer) return;
-    const report = await peer.getStats();
-    let video: InboundVideoStats | null = null;
-    let candidatePair: CandidatePairStats | null = null;
-    let protocol = "unknown";
-    report.forEach((entry) => {
-      if (
-        entry.type === "inbound-rtp" &&
-        entry.kind === "video" &&
-        !entry.isRemote
-      )
-        video = entry as InboundVideoStats;
-      if (entry.type === "transport" && entry.selectedCandidatePairId) {
-        const selected = report.get(entry.selectedCandidatePairId);
-        if (selected?.type === "candidate-pair")
-          candidatePair = selected as CandidatePairStats;
-      }
+    const generation = liveReaderGenerationRef.current;
+    if (
+      !peer ||
+      latestSnapshotRef.current?.mode !== "live" ||
+      document.visibilityState === "hidden"
+    )
+      return;
+    const sample = await liveSamplerRef.current.sample(peer, {
+      generation,
+      atMs: performance.now(),
+      renderedFrames: frameRef.current?.presentedFrames ?? null,
     });
-    const videoStats = video as InboundVideoStats | null;
-    const selectedPair = candidatePair as CandidatePairStats | null;
-    if (!videoStats) return;
-    if (selectedPair) {
-      const local = report.get(selectedPair.localCandidateId);
-      protocol =
-        local?.type === "local-candidate" && typeof local.protocol === "string"
-          ? local.protocol.toUpperCase()
-          : "unknown";
+    if (
+      !sample ||
+      generation !== liveReaderGenerationRef.current ||
+      !mountedRef.current ||
+      document.hidden
+    )
+      return;
+    liveStatsRef.current = sample;
+    setLiveStats(sample);
+    try {
+      sessionStorage.setItem(
+        "simplewatch.live-diagnostics",
+        JSON.stringify({ updatedAt: new Date().toISOString(), ...sample }),
+      );
+    } catch {
+      /* Optional diagnostics cannot interrupt a stream. */
     }
-    const now = performance.now();
-    const bytes = videoStats.bytesReceived ?? 0;
-    const packets = videoStats.packetsReceived ?? 0;
-    const lost = videoStats.packetsLost ?? 0;
-    const previous = previousLiveStatsRef.current;
-    const elapsedSeconds = previous ? (now - previous.atMs) / 1000 : 0;
-    const bitrateMbps =
-      previous && elapsedSeconds > 0
-        ? ((bytes - previous.bytes) * 8) / elapsedSeconds / 1_000_000
-        : 0;
-    const receivedDelta = previous
-      ? Math.max(0, packets - previous.packets)
-      : 0;
-    const lostDelta = previous ? Math.max(0, lost - previous.lost) : 0;
-    const packetLossPercent =
-      receivedDelta + lostDelta > 0
-        ? (lostDelta / (receivedDelta + lostDelta)) * 100
-        : 0;
-    previousLiveStatsRef.current = { atMs: now, bytes, packets, lost };
-    const rttMs = selectedPair?.currentRoundTripTime
-      ? selectedPair.currentRoundTripTime * 1000
-      : null;
-    const jitterMs = (videoStats.jitter ?? 0) * 1000;
-    const jitterBufferMs =
-      videoStats.jitterBufferEmittedCount && videoStats.jitterBufferDelay
-        ? (videoStats.jitterBufferDelay / videoStats.jitterBufferEmittedCount) *
-          1000
-        : null;
-    const framesPerSecond = videoStats.framesPerSecond ?? 0;
-    setLiveStats({
-      bitrateMbps,
-      packetLossPercent,
-      rttMs,
-      jitterMs,
-      jitterBufferMs,
-      framesPerSecond,
-      protocol,
-      health: classifyViewerHealth(packetLossPercent, rttMs, framesPerSecond),
-    });
-    sessionStorage.setItem(
-      "simplewatch.live-diagnostics",
-      JSON.stringify({
-        updatedAt: new Date().toISOString(),
-        bitrateMbps: round(bitrateMbps, 2),
-        packetLossPercent: round(packetLossPercent, 2),
-        rttMs: rttMs === null ? null : round(rttMs, 0),
-        jitterMs: round(jitterMs, 1),
-        jitterBufferMs:
-          jitterBufferMs === null ? null : round(jitterBufferMs, 1),
-        framesPerSecond: round(framesPerSecond, 1),
-        protocol,
-      }),
-    );
+    if (
+      liveRecoveryRef.current.shouldRecover({
+        generation,
+        atMs: performance.now(),
+        foreground: !document.hidden,
+        enabled: programEnabledRef.current,
+        started: liveHasFrameRef.current,
+        videoBytesReceived: sample.videoBytesReceived,
+        renderedFrames: frameRef.current?.presentedFrames ?? null,
+      })
+    )
+      scheduleLiveRetry("持续收包但画面没有推进，正在恢复节目", true);
   }
 
   async function enableProgramSound() {
+    programEnabledRef.current = true;
     setProgramEnabled(true);
     setError("");
     const video = videoRef.current;
     if (video) {
       video.muted = false;
       video.volume = preferences.programVolume / 100;
-      if (snapshot?.mode === "vod" && snapshot.transport?.state === "playing") {
-        await video
-          .play()
-          .catch(() => setError("无法启用节目声音，请检查浏览器媒体权限"));
-      } else if (snapshot?.mode === "vod") {
-        // A short play/pause in the direct click gesture unlocks later
-        // synchronized playback without starting the room early.
-        await video
-          .play()
-          .then(() => video.pause())
-          .catch(() => setError("无法启用节目声音，请检查浏览器媒体权限"));
+      if (latestSnapshotRef.current?.mode === "vod") {
+        reconcileVod("user-enable");
+        getVodController().userPlay();
+      } else if (
+        latestSnapshotRef.current?.mode === "live" &&
+        video.srcObject
+      ) {
+        // Invoke play in this gesture even when a Reader already exists.
+        const generation = liveReaderGenerationRef.current;
+        try {
+          await video.play();
+          if (
+            generation === liveReaderGenerationRef.current &&
+            typeof video.requestVideoFrameCallback !== "function"
+          ) {
+            liveStateRef.current = "playing";
+            setLiveProgramState("playing");
+          }
+        } catch {
+          if (generation === liveReaderGenerationRef.current)
+            setError("请允许浏览器播放节目声音后再次点击恢复");
+        }
       }
     }
     if (
@@ -1001,11 +1573,18 @@ export function RoomPage() {
   }
 
   async function toggleVodPlayback() {
-    if (!isHost || !snapshot?.transport) return;
+    if (!isHost || getCommandQueue().getPendingIds().length > 0) return;
     if (!programEnabled) await enableProgramSound();
-    if (snapshot.transport.state === "playing") sendPlaybackProgress(false);
+    const current = latestSnapshotRef.current;
+    if (
+      current?.mode !== "vod" ||
+      !current.transport ||
+      getCommandQueue().getPendingIds().length > 0
+    )
+      return;
+    if (current.transport.state === "playing") sendPlaybackProgress(false);
     command({
-      kind: snapshot.transport.state === "playing" ? "pause" : "play",
+      kind: current.transport.state === "playing" ? "pause" : "play",
     });
   }
 
@@ -1013,15 +1592,28 @@ export function RoomPage() {
     if (!isHost || !durationSec) return;
     const next = clamp(positionSec, 0, durationSec);
     setSeekDraftSec(null);
-    command({ kind: "seek", positionSec: next });
+    seekDraftRef.current = null;
+    const commandId = command({ kind: "seek", positionSec: next });
+    if (commandId && getCommandQueue().getPendingIds().includes(commandId)) {
+      // Keep the submitted target until it is acknowledged and presented.
+      // Otherwise the next key/drag starts from the old, not-yet-seeked frame.
+      pendingSeekRef.current = { commandId };
+      setPendingSeekSec(next);
+    }
   }
 
   function reloadVodProgram() {
     const video = videoRef.current;
     if (!video) return;
     setSyncFailed(false);
-    excessiveDriftSinceRef.current = null;
-    video.load();
+    setError("");
+    refreshRoomSnapshot();
+    if (video.error) {
+      frameRef.current = null;
+      video.load();
+    }
+    getVodController().retry();
+    getVodController().userPlay();
   }
 
   function updateProgramMetrics(video: HTMLVideoElement, event: string) {
@@ -1036,37 +1628,41 @@ export function RoomPage() {
     event: string,
     buffered = bufferedAhead(video),
   ) {
-    const quality = video.getVideoPlaybackQuality?.();
-    sessionStorage.setItem(
-      "simplewatch.program-diagnostics",
-      JSON.stringify({
-        updatedAt: new Date().toISOString(),
-        event,
-        mode: snapshot?.mode ?? "idle",
-        codec: media.data?.video.codec ?? null,
-        resolution:
-          media.data?.video.width && media.data.video.height
-            ? `${media.data.video.width}x${media.data.video.height}`
-            : null,
-        averageBitrateMbps: round(bitrateMbps, 1),
-        currentTimeSec: round(video.currentTime, 2),
-        durationSec: round(video.duration || durationSec, 2),
-        bufferedAheadSec: round(buffered, 2),
-        readyState: video.readyState,
-        networkState: video.networkState,
-        stalls: stallCountRef.current,
-        droppedFrames: quality?.droppedVideoFrames ?? null,
-        totalFrames: quality?.totalVideoFrames ?? null,
-        liveAudioTracks: liveStreamRef.current?.getAudioTracks().length ?? 0,
-        liveVideoTracks: liveStreamRef.current?.getVideoTracks().length ?? 0,
-        rejectedLiveTracks: rejectedLiveTracksRef.current,
-        syncDeltaMs,
-        clockRttMs,
-        serverAudioTracks: liveStatus.data?.audioTrackCount ?? null,
-        serverVideoTracks: liveStatus.data?.videoTrackCount ?? null,
-        readerGeneration: liveReaderGenerationRef.current,
-      }),
-    );
+    try {
+      const quality = video.getVideoPlaybackQuality?.();
+      sessionStorage.setItem(
+        "simplewatch.program-diagnostics",
+        JSON.stringify({
+          updatedAt: new Date().toISOString(),
+          event,
+          mode: snapshot?.mode ?? "idle",
+          codec: media.data?.video.codec ?? null,
+          resolution:
+            media.data?.video.width && media.data.video.height
+              ? `${media.data.video.width}x${media.data.video.height}`
+              : null,
+          averageBitrateMbps: round(bitrateMbps, 1),
+          currentTimeSec: round(video.currentTime, 2),
+          durationSec: round(video.duration || durationSec, 2),
+          bufferedAheadSec: round(buffered, 2),
+          readyState: video.readyState,
+          networkState: video.networkState,
+          stalls: stallCountRef.current,
+          droppedFrames: quality?.droppedVideoFrames ?? null,
+          totalFrames: quality?.totalVideoFrames ?? null,
+          liveAudioTracks: liveStreamRef.current?.getAudioTracks().length ?? 0,
+          liveVideoTracks: liveStreamRef.current?.getVideoTracks().length ?? 0,
+          rejectedLiveTracks: rejectedLiveTracksRef.current,
+          syncDeltaMs,
+          clockRttMs,
+          serverAudioTracks: liveStatus.data?.audioTrackCount ?? null,
+          serverVideoTracks: liveStatus.data?.videoTrackCount ?? null,
+          readerGeneration: liveReaderGenerationRef.current,
+        }),
+      );
+    } catch {
+      // Optional diagnostics must never interrupt media events or play().
+    }
   }
 
   async function toggleMicrophone() {
@@ -1087,7 +1683,7 @@ export function RoomPage() {
         body: JSON.stringify({ reason: "host_removed" }),
       },
     );
-    setSnapshot(result);
+    acceptRoomSnapshot(result);
   }
 
   async function requestPublishConfig() {
@@ -1129,7 +1725,7 @@ export function RoomPage() {
       headers: { "x-csrf-token": roomCsrf },
     });
     closeLiveProgram();
-    voiceRoomRef.current?.disconnect();
+    await voiceRoomRef.current?.disconnect();
     setMemberId(null);
     void navigate("/", { replace: true });
   }
@@ -1143,7 +1739,7 @@ export function RoomPage() {
         headers: { "x-csrf-token": roomCsrf },
       });
       closeLiveProgram();
-      voiceRoomRef.current?.disconnect();
+      await voiceRoomRef.current?.disconnect();
       void navigate("/admin", { replace: true });
     } catch (closeError) {
       closingRoomRef.current = false;
@@ -1162,6 +1758,8 @@ export function RoomPage() {
 
   function reconnectLiveProgram() {
     closeLiveProgram();
+    liveRetryBlockedRef.current = false;
+    programEnabledRef.current = true;
     setProgramEnabled(true);
     setLiveRetry((value) => value + 1);
   }
@@ -1254,9 +1852,11 @@ export function RoomPage() {
           {syncFailed && snapshot?.mode === "vod" && (
             <div className="program-warning" role="alert">
               <strong>本机同步暂未收敛</strong>
-              <span>播放器将继续自动纠偏；若仍从头播放，请重新加载节目。</span>
+              <span>
+                自动定位已停止，避免反复跳转。请检查网络或媒体错误后重试。
+              </span>
               <button type="button" onClick={() => reloadVodProgram()}>
-                重新加载节目
+                重新同步节目
               </button>
             </div>
           )}
@@ -1285,7 +1885,12 @@ export function RoomPage() {
             </div>
           )}
           {snapshot?.mode === "live" && !isHost ? (
-            <video ref={videoRef} controls={false} playsInline />
+            <video
+              key="live-program"
+              ref={videoRef}
+              controls={false}
+              playsInline
+            />
           ) : snapshot?.mode === "live" && isHost ? (
             <div className="live-director-view">
               <p className="eyebrow">LIVE CONTROL / OBS</p>
@@ -1310,13 +1915,18 @@ export function RoomPage() {
                     音频来源。
                   </p>
                 )}
-              <button onClick={() => command({ kind: "restore-vod" })}>
+              <button
+                disabled={!hostControlsReady}
+                onClick={() => command({ kind: "restore-vod" })}
+              >
                 返回服务器影片
               </button>
             </div>
           ) : snapshot?.media ? (
             <video
+              key={snapshot.media.id}
               ref={videoRef}
+              data-media-id={snapshot.media.id}
               src={`/api/v1/media/${snapshot.media.id}/content`}
               controls={false}
               playsInline
@@ -1326,6 +1936,8 @@ export function RoomPage() {
                 reconcileVod("loaded-metadata");
               }}
               onCanPlay={() => reconcileVod("can-play")}
+              onLoadedData={() => reconcileVod("loaded-data")}
+              onSeeking={() => reconcileVod("seeking")}
               onSeeked={() => reconcileVod("seeked")}
               onTimeUpdate={(event) =>
                 updateProgramMetrics(event.currentTarget, "time-update")
@@ -1348,13 +1960,16 @@ export function RoomPage() {
               onWaiting={(event) => {
                 stallCountRef.current += 1;
                 updateProgramMetrics(event.currentTarget, "waiting");
+                reconcileVod("waiting");
               }}
               onError={(event) => {
                 updateProgramMetrics(event.currentTarget, "error");
+                reconcileVod("error");
                 setError(
-                  media.data?.video.codec === "hevc"
-                    ? "当前终端无法解码这条 H.265 影片，服务器不会转码"
-                    : "影片加载失败，请检查网络或文件状态",
+                  mediaErrorMessage(
+                    event.currentTarget.error?.code ?? null,
+                    media.data?.video.codec,
+                  ),
                 );
               }}
             >
@@ -1380,17 +1995,19 @@ export function RoomPage() {
               role="status"
             >
               <strong>{viewerHealthLabel(liveStats?.health)}</strong>
+              <span>接收 {liveStats?.bitrateMbps?.toFixed(2) ?? "—"} Mbps</span>
               <span>
-                接收 {liveStats ? liveStats.bitrateMbps.toFixed(2) : "—"} Mbps
+                呈现 {liveStats?.renderedFramesPerSecond?.toFixed(0) ?? "—"} fps
+                · 解码 {liveStats?.decodedFramesPerSecond?.toFixed(0) ?? "—"}{" "}
+                fps
               </span>
               <span>
-                {liveStats ? liveStats.framesPerSecond.toFixed(0) : "—"} fps
+                丢包 {liveStats?.packetLossPercent?.toFixed(2) ?? "—"}%
               </span>
               <span>
-                丢包 {liveStats ? liveStats.packetLossPercent.toFixed(2) : "—"}%
-              </span>
-              <span>
-                RTT {liveStats?.rttMs ? liveStats.rttMs.toFixed(0) : "—"} ms
+                RTT {liveStats?.rttMs?.toFixed(0) ?? "—"} ms · 抖动缓冲{" "}
+                {liveStats?.jitterBufferMs?.toFixed(0) ?? "—"}{" "}
+                ms（非端到端延迟）
               </span>
               <span>{liveStats?.protocol ?? "—"}</span>
               {liveQualityExplanation(liveStatus.data, liveStats) && (
@@ -1403,31 +2020,32 @@ export function RoomPage() {
           {snapshot?.mode === "vod" && (
             <div className="transport-bar">
               <button
-                disabled={!isHost}
+                disabled={!hostControlsReady || pendingCommandCount > 0}
                 onClick={() => void toggleVodPlayback()}
               >
                 {snapshot?.transport?.state === "playing" ? "Ⅱ 暂停" : "▶ 播放"}
               </button>
               <button
-                disabled={!isHost}
+                disabled={!hostControlsReady}
                 onClick={() => commitSeek(displayedPositionSec - 10)}
               >
                 −10s
               </button>
               <button
-                disabled={!isHost}
+                disabled={!hostControlsReady}
                 onClick={() => commitSeek(displayedPositionSec + 10)}
               >
                 +10s
               </button>
               <div className="playback-scrubber">
                 <input
+                  key={`${roomId}:${snapshot?.mode}:${snapshot?.media?.id ?? "none"}`}
                   aria-label="播放进度"
                   type="range"
                   min="0"
                   max={Math.max(durationSec, 0.1)}
                   step="0.1"
-                  disabled={!isHost || durationSec <= 0}
+                  disabled={!hostControlsReady || durationSec <= 0}
                   value={displayedPositionSec}
                   style={
                     {
@@ -1435,15 +2053,28 @@ export function RoomPage() {
                       "--buffered-percent": `${durationSec ? (Math.min(durationSec, playheadSec + bufferedAheadSec) / durationSec) * 100 : 0}%`,
                     } as CSSProperties
                   }
-                  onPointerDown={() => {
+                  onPointerDown={(event) => {
                     seekingRef.current = true;
+                    event.currentTarget.setPointerCapture(event.pointerId);
                   }}
-                  onChange={(event) =>
-                    setSeekDraftSec(Number(event.currentTarget.value))
-                  }
+                  onChange={(event) => {
+                    seekDraftRef.current = Number(event.currentTarget.value);
+                    setSeekDraftSec(seekDraftRef.current);
+                  }}
                   onPointerUp={(event) => {
+                    if (!seekingRef.current && seekDraftRef.current === null)
+                      return;
                     seekingRef.current = false;
+                    if (event.currentTarget.hasPointerCapture(event.pointerId))
+                      event.currentTarget.releasePointerCapture(
+                        event.pointerId,
+                      );
                     commitSeek(Number(event.currentTarget.value));
+                  }}
+                  onPointerCancel={() => {
+                    seekingRef.current = false;
+                    seekDraftRef.current = null;
+                    setSeekDraftSec(null);
                   }}
                   onKeyUp={(event) => {
                     if (
@@ -1454,12 +2085,13 @@ export function RoomPage() {
                         "End",
                         "PageUp",
                         "PageDown",
-                      ].includes(event.key)
+                      ].includes(event.key) &&
+                      seekDraftRef.current !== null
                     )
                       commitSeek(Number(event.currentTarget.value));
                   }}
                   onBlur={(event) => {
-                    if (!seekingRef.current) return;
+                    if (seekDraftRef.current === null) return;
                     seekingRef.current = false;
                     commitSeek(Number(event.currentTarget.value));
                   }}
@@ -1470,7 +2102,7 @@ export function RoomPage() {
                 </output>
               </div>
               <select
-                disabled={!isHost}
+                disabled={!hostControlsReady}
                 aria-label="播放速度"
                 value={snapshot?.transport?.rate ?? 1}
                 onChange={(event) =>
@@ -1507,6 +2139,40 @@ export function RoomPage() {
               )}
             </div>
           )}
+          {snapshot?.mode === "vod" && (
+            <div className="program-warning" role="status">
+              <span>{vodPhaseLabel(vodStatus?.phase)}</span>
+              {vodStatus?.frameEvidence === "unavailable" && (
+                <small>此浏览器未提供逐帧证据，同步状态需结合画面确认。</small>
+              )}
+              {isHost && commandState && <span>{commandState}</span>}
+              {vodStatus?.phase === "autoplay-blocked" && (
+                <button type="button" onClick={() => void enableProgramSound()}>
+                  点击恢复播放
+                </button>
+              )}
+            </div>
+          )}
+          <details className="playback-diagnostics">
+            <summary>播放诊断</summary>
+            <p>
+              房间版本 {snapshot?.revision ?? "—"} · 目标{" "}
+              {vodStatus?.targetSec?.toFixed(2) ?? "—"}s · 最近呈现{" "}
+              {vodStatus?.presentedTimeSec?.toFixed(2) ?? "—"}s · 定位尝试{" "}
+              {vodStatus?.seekAttempts ?? 0}
+            </p>
+            <p>服务端确认只表示操作已接受，画面是否完成同步以各观看端为准。</p>
+            {isHost &&
+              playbackReports?.reports.map(
+                ({ memberId: id, nickname, report }) => (
+                  <p key={id}>
+                    {nickname} · REV {report.revision} · {report.state} ·{" "}
+                    {report.positionSec?.toFixed(2) ?? "—"}s · 呈现{" "}
+                    {report.fps?.toFixed(0) ?? "—"}fps
+                  </p>
+                ),
+              )}
+          </details>
           <div className="local-mix">
             {(!isHost || snapshot?.mode === "vod") && (
               <button
@@ -1519,10 +2185,13 @@ export function RoomPage() {
                 onClick={() => void enableProgramSound()}
               >
                 {programEnabled
-                  ? snapshot?.mode === "live" &&
-                    liveProgramState === "connecting"
-                    ? "节目连接中…"
-                    : "节目声音已启用"
+                  ? vodStatus?.phase === "autoplay-blocked" ||
+                    (snapshot?.mode === "live" && liveProgramState === "error")
+                    ? "点击恢复节目"
+                    : snapshot?.mode === "live" &&
+                        liveProgramState === "connecting"
+                      ? "节目连接中…"
+                      : "节目声音已启用"
                   : "启用节目声音"}
               </button>
             )}
@@ -1574,7 +2243,10 @@ export function RoomPage() {
               <strong>主持控制</strong>
               <select
                 aria-label="选择点播影片"
-                defaultValue=""
+                disabled={!hostControlsReady}
+                value={
+                  snapshot?.mode === "vod" ? (snapshot.media?.id ?? "") : ""
+                }
                 onChange={(event) =>
                   event.target.value &&
                   command({ kind: "select-vod", mediaId: event.target.value })
@@ -1594,11 +2266,17 @@ export function RoomPage() {
                   ))}
               </select>
               {snapshot?.mode === "live" ? (
-                <button onClick={() => command({ kind: "restore-vod" })}>
+                <button
+                  disabled={!hostControlsReady}
+                  onClick={() => command({ kind: "restore-vod" })}
+                >
                   返回服务器影片
                 </button>
               ) : (
-                <button onClick={() => command({ kind: "select-live" })}>
+                <button
+                  disabled={!hostControlsReady}
+                  onClick={() => command({ kind: "select-live" })}
+                >
                   切换直播
                 </button>
               )}
@@ -1781,13 +2459,10 @@ function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(Math.max(value, minimum), maximum);
 }
 
-function seekVideo(video: HTMLVideoElement, positionSec: number): void {
-  try {
-    video.currentTime = positionSec;
-  } catch {
-    // Some engines reject seeks until metadata is ready. loadedmetadata and
-    // canplay both invoke reconciliation again, so this target is not lost.
-  }
+function finiteSeconds(value: number | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
 }
 
 function bufferedAhead(video: HTMLVideoElement): number {
@@ -1827,59 +2502,6 @@ function liveLabel(state: LiveStatus["state"] | undefined): string {
         : "正在检查";
 }
 
-interface LiveStatsSample {
-  readonly atMs: number;
-  readonly bytes: number;
-  readonly packets: number;
-  readonly lost: number;
-}
-
-interface InboundVideoStats extends RTCStats {
-  readonly bytesReceived?: number;
-  readonly packetsReceived?: number;
-  readonly packetsLost?: number;
-  readonly jitter?: number;
-  readonly jitterBufferDelay?: number;
-  readonly jitterBufferEmittedCount?: number;
-  readonly framesPerSecond?: number;
-}
-
-interface CandidatePairStats extends RTCStats {
-  readonly localCandidateId: string;
-  readonly currentRoundTripTime?: number;
-}
-
-export interface LiveViewerStats {
-  readonly bitrateMbps: number;
-  readonly packetLossPercent: number;
-  readonly rttMs: number | null;
-  readonly jitterMs: number;
-  readonly jitterBufferMs: number | null;
-  readonly framesPerSecond: number;
-  readonly protocol: string;
-  readonly health: "good" | "degraded" | "poor";
-}
-
-export function classifyViewerHealth(
-  packetLossPercent: number,
-  rttMs: number | null,
-  framesPerSecond: number,
-): LiveViewerStats["health"] {
-  if (
-    packetLossPercent > 3 ||
-    (rttMs ?? 0) > 400 ||
-    (framesPerSecond > 0 && framesPerSecond < 20)
-  )
-    return "poor";
-  if (
-    packetLossPercent > 1 ||
-    (rttMs ?? 0) > 250 ||
-    (framesPerSecond > 0 && framesPerSecond < 27)
-  )
-    return "degraded";
-  return "good";
-}
-
 function viewerHealthLabel(
   health: LiveViewerStats["health"] | undefined,
 ): string {
@@ -1897,10 +2519,24 @@ export function liveQualityExplanation(
   viewer: LiveViewerStats | null,
 ): string {
   if (source?.sourceHealth === "poor" || source?.sourceHealth === "degraded")
-    return "OBS 到服务器的上行正在丢包，请降低 OBS 码率或更换发起端网络。";
-  if (viewer && viewer.packetLossPercent > 1)
-    return "OBS 上行正常，当前观看端下行丢包较高。";
-  if (viewer && viewer.framesPerSecond > 0 && viewer.framesPerSecond < 27)
-    return "网络未见明显丢包，但当前终端解码或渲染帧率不足。";
+    return "OBS 到服务器的上行指标显示波动，请结合实际编码输出和网络记录核对。";
+  if (
+    viewer?.packetLossPercent !== null &&
+    viewer?.packetLossPercent !== undefined &&
+    viewer.packetLossPercent > 1
+  )
+    return "当前观看端下行丢包较高；源端编码与上传情况仍需独立核对。";
+  if (
+    viewer?.renderedFramesPerSecond === 0 &&
+    (viewer.decodedFramesPerSecond ?? 0) > 0
+  )
+    return "已解码但画面没有推进，请核对解码或渲染链路与浏览器播放状态。";
+  if (
+    !viewer ||
+    viewer.health === "unknown" ||
+    !source ||
+    source.sourceHealth === "unknown"
+  )
+    return "指标不足，尚不能判断卡顿环节；缺失值不代表正常。";
   return "";
 }

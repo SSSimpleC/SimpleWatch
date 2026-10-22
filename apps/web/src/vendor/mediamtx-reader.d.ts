@@ -7,6 +7,7 @@ declare global {
       user: string;
       pass: string;
       token: string;
+      autoRetry?: boolean;
       onTrack: (event: RTCTrackEvent) => void;
       onError: (error: string) => void;
     }) => {

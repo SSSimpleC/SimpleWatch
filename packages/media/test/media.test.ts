@@ -105,9 +105,57 @@ describe("media compatibility", () => {
   it("accepts the locked H.264/AAC stereo profile", () => {
     expect(evaluateCompatibility(compatibleProbe)).toMatchObject({
       compatible: true,
+      playbackSupport: "broad",
       reasons: [],
       durationMs: 10_000,
       bytes: 123_456,
+    });
+  });
+
+  it.each([
+    { codec: "opus", channels: 2, sampleRate: "48000" },
+    { codec: "dts", channels: 2, sampleRate: "44100" },
+    { codec: "ac3", channels: 6, sampleRate: "48000" },
+    { codec: "aac", channels: 6, sampleRate: "44100" },
+    { codec: "aac", channels: 8, sampleRate: "96000" },
+  ])(
+    "keeps H.264 with $codec/$channels channels device-dependent without rejecting or altering audio",
+    ({ codec, channels, sampleRate }) => {
+      const input = {
+        ...compatibleProbe,
+        streams: [
+          compatibleProbe.streams[0],
+          {
+            codec_type: "audio",
+            codec_name: codec,
+            channels,
+            sample_rate: sampleRate,
+          },
+        ],
+      };
+      const before = structuredClone(input);
+      expect(evaluateCompatibility(input)).toMatchObject({
+        compatible: true,
+        playbackSupport: "device-dependent",
+        reasons: [],
+        video: { codec: "h264" },
+        audio: { codec, channels, sampleRate: Number(sampleRate) },
+      });
+      expect(input).toEqual(before);
+    },
+  );
+
+  it("does not require an audio track for broadly supported H.264", () => {
+    expect(
+      evaluateCompatibility({
+        ...compatibleProbe,
+        streams: [compatibleProbe.streams[0]],
+      }),
+    ).toMatchObject({
+      compatible: true,
+      playbackSupport: "broad",
+      reasons: [],
+      audio: { codec: null, channels: null, sampleRate: null },
     });
   });
 

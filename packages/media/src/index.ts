@@ -190,7 +190,11 @@ export function evaluateCompatibility(probeInput: unknown): MediaCompatibility {
             video?.pix_fmt !== "yuv420p" ||
             (video.width ?? 0) > 1920 ||
             (video.height ?? 0) > 1080 ||
-            (fps ?? 0) > 30.5
+            (fps ?? 0) > 30.5 ||
+            Boolean(
+              audio &&
+              (audio.codec_name !== "aac" || (audio.channels ?? 0) > 2),
+            )
           ? "device-dependent"
           : "broad",
     fastStart: true,

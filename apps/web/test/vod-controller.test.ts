@@ -130,8 +130,7 @@ describe("VOD playback controller", () => {
       f.frame(Math.max(10.04, position));
       f.advance(1000 / 30);
     }
-    expect(f.setPlaybackRate.mock.calls.length).toBeLessThanOrEqual(3);
-    expect(f.setPlaybackRate.mock.calls.map(([rate]) => rate)).toEqual([1.05]);
+    expect(f.setPlaybackRate).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -140,7 +139,7 @@ describe("VOD playback controller", () => {
     { costMs: 200, ahead: true },
     { costMs: 300, ahead: true },
   ])(
-    "converges over ninety seconds with waiting and $costMs ms rate cost (ahead=$ahead)",
+    "converges without invoking the costly rate actuator (cost=$costMs, ahead=$ahead)",
     ({ costMs, ahead }) => {
       let now = 0;
       let decoderBlockedUntil = 0;
@@ -198,8 +197,8 @@ describe("VOD playback controller", () => {
           anchoredAtServerMs: 100_000,
         },
       });
-      // A real seek needs 1.5 seconds to decode the first frame. No synthetic RTT
-      // error or network starvation is necessary to expose the feedback loop.
+      // Legacy first-frame-delay regression. The independent fixed-rate suite
+      // also models every asynchronous seek completion and play-start delay.
       now = 1500;
       position = ahead ? 12.96 : 10.04;
       media.currentTime = position;
@@ -219,9 +218,9 @@ describe("VOD playback controller", () => {
         media.currentTime = Math.floor(position * 10) / 10;
         controller.notifyMediaEvent("frame", media.frame);
       }
-      expect(rates).toEqual([ahead ? 0.95 : 1.05, 1]);
-      expect(rateWriteTimes.every((time) => time < 60_000)).toBe(true);
-      expect(seeks).toHaveLength(0);
+      expect(rates).toEqual([]);
+      expect(rateWriteTimes).toEqual([]);
+      expect(seeks.length).toBeLessThanOrEqual(3);
       expect(controller.getStatus().error).toBeNull();
       expect(Math.abs(controller.getStatus().driftSec!)).toBeLessThan(0.5);
       expect(media.playbackRate).toBe(1);
@@ -295,7 +294,7 @@ describe("VOD playback controller", () => {
   });
 
   it.each(["low-buffer", "hidden", "pause"] as const)(
-    "restores base rate exactly once for %s and discards stale correction history",
+    "never enters an automatic speed correction before or after %s",
     (reason) => {
       const f = fixture();
       f.controller.acceptSnapshot(f.snapshot(1, 10, "playing", 0, "seek"));
@@ -305,7 +304,7 @@ describe("VOD playback controller", () => {
         f.frame(f.media.currentTime);
         f.advance(1000 / 30);
       }
-      expect(f.media.playbackRate).toBe(1.05);
+      expect(f.media.playbackRate).toBe(1);
       if (reason === "low-buffer") f.media.bufferedAheadSec = 0.05;
       if (reason === "hidden") f.controller.setVisible(false);
       if (reason === "pause")
@@ -313,9 +312,7 @@ describe("VOD playback controller", () => {
           f.snapshot(2, f.media.currentTime, "paused"),
         );
       for (let i = 0; i < 10; i += 1) f.advance(100);
-      expect(f.setPlaybackRate.mock.calls.map(([rate]) => rate)).toEqual([
-        1.05, 1,
-      ]);
+      expect(f.setPlaybackRate).not.toHaveBeenCalled();
       expect(f.seek).toHaveBeenCalledTimes(1);
     },
   );
@@ -571,8 +568,8 @@ describe("VOD playback controller", () => {
       f.snapshot(2, 20, "playing", 750, "seek", "jump"),
     );
     f.media.currentTime = 0.5;
-    f.frame(0.5);
     f.advance(500);
+    f.frame(0.5);
     expect(f.seek).not.toHaveBeenCalled();
     expect(f.controller.getStatus().targetSec).toBe(0.5);
     f.advance(250);
@@ -625,7 +622,7 @@ describe("VOD playback controller", () => {
     expect(f.seek).toHaveBeenCalledTimes(1);
   });
 
-  it("does not restart a slow seek every 500ms and requires actual playback frames", () => {
+  it("waits for a slow seek frame before predicting one bounded alignment", () => {
     const f = fixture();
     f.controller.acceptSnapshot(f.snapshot(1, 20, "playing", 0, "seek"));
     f.advance(500);
@@ -637,15 +634,16 @@ describe("VOD playback controller", () => {
     expect(f.controller.getStatus().phase).not.toBe("playing");
     f.media.currentTime = 20.04;
     f.frame(20.04);
+    expect(f.controller.getStatus().phase).toBe("seeking");
+    expect(f.seek).toHaveBeenCalledTimes(2);
+    expect(f.seek.mock.lastCall![0]).toBeCloseTo(22.96, 2);
+    f.advance(1500);
+    f.finish(23);
     expect(f.controller.getStatus()).toMatchObject({
       phase: "playing",
       frameEvidence: "verified",
     });
-    expect(f.seek).toHaveBeenCalledTimes(1);
-    f.advance(2_000);
-    f.media.currentTime = 22.04;
-    f.controller.tick();
-    expect(f.media.playbackRate).toBeLessThanOrEqual(1.1);
+    expect(f.setPlaybackRate).not.toHaveBeenCalled();
   });
 
   it("does not claim paused seek success from currentTime, seeked, or the wrong frame", () => {
@@ -831,7 +829,7 @@ describe("VOD playback controller", () => {
     expect(f.controller.getStatus().phase).toBe("error");
   });
 
-  it("permits only one supplementary seek and does not loop afterward", () => {
+  it("permits at most three observed attempts and never loops after failure", () => {
     const f = fixture();
     f.controller.acceptSnapshot(f.snapshot(1, 20, "playing", 0, "seek"));
     f.advance(3_000);
@@ -840,17 +838,17 @@ describe("VOD playback controller", () => {
     f.controller.notifyMediaEvent("seeked");
     f.frame(20.04);
     expect(f.seek).toHaveBeenCalledTimes(2);
+    f.advance(300);
+    f.finish(f.seek.mock.lastCall![0] + 0.04);
+    expect(f.seek).toHaveBeenCalledTimes(3);
     f.advance(3_000);
-    f.media.seeking = false;
-    f.media.currentTime = 23.04;
-    f.controller.notifyMediaEvent("seeked");
-    f.frame(23.04);
+    f.finish(f.seek.mock.lastCall![0] + 0.04);
     expect(f.controller.getStatus()).toMatchObject({
       phase: "error",
       error: "seek-target-not-reached",
     });
     f.advance(5_000);
-    expect(f.seek).toHaveBeenCalledTimes(2);
+    expect(f.seek).toHaveBeenCalledTimes(3);
   });
 
   it("reconciles the same revision after local position divergence", () => {
@@ -882,16 +880,21 @@ describe("VOD playback controller", () => {
     expect(f.seek).not.toHaveBeenCalled();
   });
 
-  it("uses a stable five-percent rate and restores authoritative pause and speed", () => {
+  it("uses only the authoritative base rate, including explicit Host speed changes", () => {
     const f = fixture();
     f.controller.acceptSnapshot(f.snapshot(0, 0));
     f.controller.acceptSnapshot(f.snapshot(1, 0, "playing"));
-    for (let i = 1; i <= 120; i += 1) {
-      f.media.currentTime = Math.max(0, i / 30 - 0.8);
-      f.frame(f.media.currentTime);
+    // Complete the play transition first; steady drift must not be confused
+    // with startup loss, which the independent async suite verifies separately.
+    f.advance(40);
+    f.media.currentTime = 0.04;
+    f.frame(0.04);
+    for (let i = 1; i <= 90; i += 1) {
+      f.media.currentTime = Math.max(0.04, 0.04 + i / 30 - 0.8);
       f.advance(1000 / 30);
+      f.frame(f.media.currentTime);
     }
-    expect(f.media.playbackRate).toBe(1.05);
+    expect(f.media.playbackRate).toBe(1);
     f.controller.acceptSnapshot(f.snapshot(2, f.media.currentTime, "paused"));
     expect(f.media.playbackRate).toBe(1);
     const faster = f.snapshot(3, f.media.currentTime, "playing");

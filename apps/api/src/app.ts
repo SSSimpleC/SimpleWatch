@@ -360,7 +360,16 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
 
   const webRoot = resolve(options.webRoot ?? "dist/web");
   if (existsSync(webRoot)) {
-    await app.register(fastifyStatic, { root: webRoot, wildcard: false });
+    await app.register(fastifyStatic, {
+      root: webRoot,
+      wildcard: false,
+      setHeaders(response, path) {
+        if (
+          /(?:^|[/\\])(?:index\.html|sw\.js|player-version\.json)$/.test(path)
+        )
+          response.header("Cache-Control", "no-store");
+      },
+    });
     app.get("/*", (request, reply) => {
       if (
         request.url.startsWith("/api/") ||
@@ -368,6 +377,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
       ) {
         throw new AppError(404, "NOT_FOUND", "资源不存在");
       }
+      reply.header("Cache-Control", "no-store");
       return reply.sendFile("index.html", { maxAge: 0, immutable: false });
     });
   }

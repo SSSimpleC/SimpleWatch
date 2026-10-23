@@ -98,6 +98,8 @@ interface SeekIntent {
   readonly reason: "explicit" | "automatic" | "alignment";
   startedAtMs: number;
   attempts: number;
+  issuedAtMs: number | null;
+  predictionValid: boolean;
   issuedTargetSec: number | null;
   issuedPositionSec: number;
   frameBaseline: number;
@@ -154,11 +156,6 @@ export class VodPlaybackController {
   private nextIntentId = 0;
   private lastHardSeekMs = Number.NEGATIVE_INFINITY;
   private softCooldownUntilMs = 0;
-  private lastCorrectionSampleMs = Number.NEGATIVE_INFINITY;
-  private filteredDriftSec: number | null = null;
-  private correctionDirection: -1 | 0 | 1 = 0;
-  private correctionChangedAtMs = Number.NEGATIVE_INFINITY;
-  private lastRateWriteMs = Number.NEGATIVE_INFINITY;
   private progressPosition: number | null = null;
   private progressFrameCount: number | null = null;
   private lastProgressMs: number | null = null;
@@ -241,6 +238,7 @@ export class VodPlaybackController {
     if (!visible) {
       this.stopPausedPrime();
       this.hiddenAtMs = now;
+      if (this.intent) this.intent.predictionValid = false;
     } else {
       if (this.intent && this.hiddenAtMs !== null)
         this.intent.startedAtMs +=
@@ -286,14 +284,22 @@ export class VodPlaybackController {
     const media = this.options.media.read();
     if (
       this.active &&
-      atMediaEnd(
+      (atMediaEnd(
         media,
         targetAt(
           this.active.transport,
           this.options.clock.serverNowMs(),
           media.duration,
         ),
-      )
+      ) ||
+        this.holdingPredictedEnd(
+          media,
+          targetAt(
+            this.active.transport,
+            this.options.clock.serverNowMs(),
+            media.duration,
+          ),
+        ))
     ) {
       // Calling play() at EOF would restart the film from zero.
       this.tick();
@@ -372,21 +378,27 @@ export class VodPlaybackController {
     ) {
       const applied = this.pending.shift()!;
       const first = this.active === null;
+      const startingPlayback =
+        this.active?.transport.state === "paused" &&
+        applied.transport.state === "playing";
       if (this.active && this.active.transport.rate !== applied.transport.rate)
-        this.resetCorrection(
-          this.options.media.read(),
-          applied.transport.rate,
-          now,
-        );
+        this.restoreRate(this.options.media.read(), applied.transport.rate);
       this.active = applied;
       const commandKey = applied.commandId ?? `revision:${applied.revision}`;
       const explicit = ["seek", "select-vod", "restore-vod"].includes(
         applied.commandKind ?? "",
       );
-      if (first || (explicit && commandKey !== this.lastIntentCommandKey)) {
+      if (
+        first ||
+        (commandKey !== this.lastIntentCommandKey &&
+          (explicit ||
+            startingPlayback ||
+            this.intent !== null ||
+            this.error !== null))
+      ) {
         this.lastIntentCommandKey = commandKey;
         newIntent = true;
-        newIntentReason = first ? "alignment" : "explicit";
+        newIntentReason = explicit && !first ? "explicit" : "alignment";
       }
     }
     if (newIntent) {
@@ -418,7 +430,6 @@ export class VodPlaybackController {
       : active.transport;
     const drift = target - media.currentTime;
     if (!this.visible) {
-      this.resetCorrection(media, transport.rate, now);
       this.resetProgress();
       this.publish("buffering", target, drift);
       return;
@@ -429,6 +440,18 @@ export class VodPlaybackController {
     }
     if (this.blocked) {
       this.publish("autoplay-blocked", target, drift);
+      return;
+    }
+    // A predicted alignment can reach the last frame slightly before the
+    // authority. play() at native EOF would restart the film at zero. Keep the
+    // final frame until the unchanged authority catches up, or a new command
+    // replaces this intent. The existing deadline still bounds the wait.
+    if (this.holdingPredictedEnd(media, target)) {
+      this.applyTransport(media, { ...transport, state: "paused" });
+      if (now - this.intent!.startedAtMs >= 10_000) {
+        this.error = "seek-no-progress";
+        this.publish("error", target, drift);
+      } else this.publish("buffering", target, drift);
       return;
     }
     this.applyTransport(media, transport);
@@ -452,7 +475,6 @@ export class VodPlaybackController {
         media.bufferedAheadSec < 0.1 &&
         !bufferedToEnd(media))
     ) {
-      this.resetCorrection(media, transport.rate, now);
       this.resetProgress();
       this.publish("buffering", target, drift);
       return;
@@ -461,7 +483,6 @@ export class VodPlaybackController {
       transport.state === "paused" ||
       this.options.comparisonMode === "host-only"
     ) {
-      this.resetCorrection(media, transport.rate, now);
       this.resetProgress();
       if (
         transport.state === "paused" &&
@@ -473,15 +494,15 @@ export class VodPlaybackController {
         this.advanceIntent(media, target, drift, now);
         return;
       }
-    } else if (this.correctSteadyPlayback(media, transport, target, drift, now))
-      return;
+    } else if (this.observeSteadyPlayback(media, target, drift, now)) return;
     this.publish(transport.state, target, drift);
   }
 
-  /** Frame callbacks supply evidence, not a new playbackRate on every frame. */
-  private correctSteadyPlayback(
+  /** Steady playback never changes speed. Only a bounded re-entry can repair
+   * persistent drift after healthy frames return; media events are observations,
+   * not permission to repeatedly restart the decoder. */
+  private observeSteadyPlayback(
     media: VodMediaState,
-    transport: TransportAnchor,
     target: number,
     drift: number,
     now: number,
@@ -515,13 +536,6 @@ export class VodPlaybackController {
     const stalled =
       this.lastProgressMs !== null && now - this.lastProgressMs >= 1000;
     if (!sufficientBuffer || prolongedWait || stalled) {
-      // A rate change itself can briefly emit waiting. Do not immediately undo
-      // it and cause a second decoder/audio restart; low buffer is not exempt.
-      const ownShortRecovery =
-        media.readyState >= 2 &&
-        media.bufferedAheadSec >= 1.5 &&
-        now - this.lastRateWriteMs < 1000;
-      if (!ownShortRecovery) this.resetCorrection(media, transport.rate, now);
       this.stableSinceMs = null;
       this.hardDriftSinceMs = null;
       this.publish("buffering", target, drift);
@@ -530,7 +544,6 @@ export class VodPlaybackController {
     if (ending) {
       // A fully buffered short tail is healthy playback, not network starvation.
       // Do not initiate another catch-up just before the native ended event.
-      this.resetCorrection(media, transport.rate, now);
       this.hardDriftSinceMs = null;
       return false;
     }
@@ -543,14 +556,9 @@ export class VodPlaybackController {
       this.hardDriftSinceMs = null;
       return false;
     }
-    if (now - this.lastCorrectionSampleMs < 500) return false;
-    this.lastCorrectionSampleMs = now;
-    this.filteredDriftSec =
-      this.filteredDriftSec === null
-        ? drift
-        : this.filteredDriftSec * 0.5 + drift * 0.5;
-    const filtered = this.filteredDriftSec;
-    if (Math.abs(filtered) > 4) this.hardDriftSinceMs ??= now;
+    const presentedDrift = position === null ? drift : target - position;
+    if (Math.abs(drift) > 0.5 || Math.abs(presentedDrift) > 0.5)
+      this.hardDriftSinceMs ??= now;
     else this.hardDriftSinceMs = null;
     this.automaticSeekTimes = this.automaticSeekTimes.filter(
       (at) => now - at < 120_000,
@@ -558,29 +566,18 @@ export class VodPlaybackController {
     if (
       this.hardDriftSinceMs !== null &&
       now - this.hardDriftSinceMs >= 3000 &&
-      now - this.lastHardSeekMs >= 30_000 &&
-      this.automaticSeekTimes.length === 0
+      now - this.lastHardSeekMs >= 5_000
     ) {
+      if (this.automaticSeekTimes.length > 0) {
+        this.frameVerified = false;
+        this.error = "sync-recovery-budget-exhausted";
+        this.publish("error", target, drift);
+        return true;
+      }
       this.automaticSeekTimes.push(now);
       this.beginIntent(false, "automatic");
       this.advanceIntent(media, target, drift, now);
       return true;
-    }
-    if (now - this.correctionChangedAtMs < 2000) return false;
-    let direction = this.correctionDirection;
-    // The wide hysteresis includes a 200–300ms decoder restart cost when the
-    // rate returns to 1x; otherwise returning to normal starts another cycle.
-    if (direction === 0 && Math.abs(filtered) > 0.45)
-      direction = filtered > 0 ? 1 : -1;
-    else if (
-      (direction === 1 && filtered <= 0.05) ||
-      (direction === -1 && filtered >= -0.05)
-    )
-      direction = 0;
-    if (direction !== this.correctionDirection) {
-      this.correctionDirection = direction;
-      this.correctionChangedAtMs = now;
-      this.restoreRate(media, transport.rate * (1 + direction * 0.05), "drift");
     }
     return false;
   }
@@ -594,28 +591,12 @@ export class VodPlaybackController {
     this.hardDriftSinceMs = null;
   }
 
-  private resetCorrection(
-    media: VodMediaState,
-    baseRate: number,
-    now: number,
-  ): void {
-    this.correctionDirection = 0;
-    this.filteredDriftSec = null;
-    this.lastCorrectionSampleMs = now;
-    this.correctionChangedAtMs = now;
-    this.restoreRate(media, baseRate, "recovery");
-  }
-
   private beginIntent(
     explicit: boolean,
     reason: SeekIntent["reason"] = explicit ? "explicit" : "alignment",
   ): void {
     const media = this.options.media.read();
-    this.resetCorrection(
-      media,
-      this.active?.transport.rate ?? 1,
-      this.options.clock.monotonicNowMs(),
-    );
+    this.restoreRate(media, this.active?.transport.rate ?? 1);
     this.resetProgress();
     this.intent = {
       id: ++this.nextIntentId,
@@ -623,6 +604,8 @@ export class VodPlaybackController {
       reason,
       startedAtMs: this.options.clock.monotonicNowMs(),
       attempts: 0,
+      issuedAtMs: null,
+      predictionValid: true,
       issuedTargetSec: null,
       issuedPositionSec: media.currentTime,
       frameBaseline: this.frame(media)?.presentedFrames ?? -1,
@@ -673,6 +656,7 @@ export class VodPlaybackController {
         // Reuse a known static frame. Without one, a single same-position seek
         // asks the browser to present a frame that an rVFC subscriber can observe.
         intent.issuedTargetSec = media.currentTime;
+        intent.issuedAtMs = now;
         intent.issuedPositionSec = media.currentTime;
         intent.seekedObserved = true;
         intent.samePosition = true;
@@ -745,14 +729,36 @@ export class VodPlaybackController {
       this.publish(seekFinished ? "buffering" : "seeking", target, drift);
       return;
     }
-    const tolerance = transport.state === "paused" ? 0.15 : 2;
+    // A setter, seeked event or two-second residual is not synchronization.
+    // Validate both the media clock and the actually presented frame. Do not
+    // change the authoritative anchor or subtract a synthetic SYNC offset.
+    const tolerance = transport.state === "paused" ? 0.15 : 0.25;
+    const presentedDrift = target - progressPosition;
     if (
       this.options.comparisonMode !== "host-only" &&
-      intent.explicit &&
-      Math.abs(drift) > tolerance
+      (Math.abs(drift) > tolerance || Math.abs(presentedDrift) > tolerance)
     ) {
-      if (intent.attempts < 2 && !media.seeking) {
-        this.issueSeek(intent, media, target, now);
+      if (intent.attempts < 3 && !media.seeking) {
+        // Predict only from this attempt's observed first advancing frame.
+        // Cold and warm seeks can differ greatly; never accumulate the previous
+        // prediction or measure time spent waiting for metadata/user permission.
+        const elapsedSec = Math.max(0, now - (intent.issuedAtMs ?? now)) / 1000;
+        const advancedSec = Math.max(
+          0,
+          progressPosition - intent.issuedTargetSec,
+        );
+        const lostSec =
+          transport.state === "playing" && intent.predictionValid
+            ? Math.min(
+                3 * transport.rate,
+                Math.max(0, elapsedSec * transport.rate - advancedSec),
+              )
+            : 0;
+        const predicted =
+          Number.isFinite(media.duration) && media.duration > 0
+            ? Math.min(media.duration, target + lostSec)
+            : target + lostSec;
+        this.issueSeek(intent, media, predicted, now);
         this.publish("seeking", target, drift);
         return;
       }
@@ -764,7 +770,6 @@ export class VodPlaybackController {
     this.frameVerified = frameEvidence;
     this.stopPausedPrime();
     this.softCooldownUntilMs = now + 2_000;
-    this.resetCorrection(media, transport.rate, now);
     this.resetProgress();
     this.restoreRate(media, transport.rate);
     this.publish(transport.state, target, drift);
@@ -777,6 +782,8 @@ export class VodPlaybackController {
     now: number,
   ): void {
     intent.attempts += 1;
+    intent.issuedAtMs = now;
+    intent.predictionValid = true;
     intent.issuedTargetSec = target;
     intent.issuedPositionSec = target;
     intent.frameBaseline = this.frame(media)?.presentedFrames ?? -1;
@@ -813,6 +820,18 @@ export class VodPlaybackController {
     } else if (media.paused && !this.playPending) this.requestPlay();
   }
 
+  private holdingPredictedEnd(media: VodMediaState, target: number): boolean {
+    const issued = this.intent?.issuedTargetSec;
+    return (
+      issued !== null &&
+      issued !== undefined &&
+      Number.isFinite(media.duration) &&
+      issued >= media.duration &&
+      atMediaEnd(media, media.duration) &&
+      !atMediaEnd(media, target)
+    );
+  }
+
   private requestPlay(fromGesture = false): void {
     if (this.playPending && !fromGesture) return;
     const generation = this.generation;
@@ -832,6 +851,7 @@ export class VodPlaybackController {
       if (name === "AbortError") return;
       if (name === "NotAllowedError") {
         this.blocked = true;
+        if (this.intent) this.intent.predictionValid = false;
         this.blockedAtMs ??= this.options.clock.monotonicNowMs();
         this.publish(
           "autoplay-blocked",
@@ -874,11 +894,10 @@ export class VodPlaybackController {
       Math.abs(media.playbackRate - rate) > 0.001 &&
       Math.abs(this.options.media.read().playbackRate - rate) > 0.001
     ) {
-      this.lastRateWriteMs = this.options.clock.monotonicNowMs();
       this.options.onAction?.({
         kind: "rate",
         reason,
-        atMs: this.lastRateWriteMs,
+        atMs: this.options.clock.monotonicNowMs(),
         rate,
       });
       this.options.media.setPlaybackRate(rate);
@@ -943,11 +962,6 @@ export class VodPlaybackController {
     this.playPending = false;
     this.lastHardSeekMs = Number.NEGATIVE_INFINITY;
     this.softCooldownUntilMs = 0;
-    this.lastCorrectionSampleMs = Number.NEGATIVE_INFINITY;
-    this.filteredDriftSec = null;
-    this.correctionDirection = 0;
-    this.correctionChangedAtMs = Number.NEGATIVE_INFINITY;
-    this.lastRateWriteMs = Number.NEGATIVE_INFINITY;
     this.automaticSeekTimes = [];
     this.resetProgress();
     this.presentedFrame = null;

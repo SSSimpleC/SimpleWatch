@@ -41,6 +41,8 @@ import {
   type VodMediaEvent,
 } from "../vod-controller.js";
 import { mediaErrorMessage, vodPhaseLabel } from "../player-ui.js";
+import { PLAYER_BUILD, usePlayerBuild } from "../player-build.js";
+import { serializePlayerReport } from "../player-report.js";
 import {
   allowsVodControl,
   DiagnosticsWriteGate,
@@ -75,6 +77,9 @@ export function RoomPage() {
   const [snapshot, setSnapshot] = useState<RoomSnapshot | null>(null);
   const [joined, setJoined] = useState(false);
   const [error, setError] = useState("");
+  const latestPlayerBuild = usePlayerBuild();
+  const [reportCopyState, setReportCopyState] = useState("");
+  const [reportText, setReportText] = useState("");
   // Deliberately page-local: no URL flag, storage preference or server setting.
   const [playbackComparison, setPlaybackComparison] =
     useState<PlaybackComparison>("normal");
@@ -271,6 +276,8 @@ export function RoomPage() {
     setJoined(false);
     setSnapshot(null);
     setPlaybackReports(null);
+    setReportCopyState("");
+    setReportText("");
     return () => {
       mountedRef.current = false;
       window.clearTimeout(refreshTimerRef.current);
@@ -1857,6 +1864,72 @@ export function RoomPage() {
     }
   }
 
+  function copyPlaybackReport() {
+    // Capture live refs now: no navigation, no video command, no stale storage
+    // flush and no network request. The exporter whitelists every field.
+    const video = videoRef.current;
+    const quality = video?.getVideoPlaybackQuality?.();
+    const report = serializePlayerReport({
+      buildId: PLAYER_BUILD,
+      latestBuildId: latestPlayerBuild,
+      online: navigator.onLine,
+      visibility: document.visibilityState,
+      room: {
+        connected,
+        voiceState,
+        revision: latestSnapshotRef.current?.revision,
+      },
+      controller: vodStatusRef.current,
+      program: {
+        mode: latestSnapshotRef.current?.mode,
+        codec: media.data?.video.codec,
+        averageBitrateMbps: bitrateMbps,
+        currentTimeSec: video?.currentTime,
+        durationSec: video?.duration,
+        bufferedAheadSec: video ? bufferedAhead(video) : null,
+        readyState: video?.readyState,
+        networkState: video?.networkState,
+        comparisonMode: playbackComparisonRef.current,
+        muted: video?.muted,
+        paused: video?.paused,
+        seeking: video?.seeking,
+        volume: video?.volume,
+        playbackRate: video?.playbackRate,
+        effects: vodEffectsRef.current,
+        positionDriftSec: vodStatusRef.current?.driftSec,
+        presentedTimeSec: frameRef.current?.mediaTime,
+        frameAgeMs:
+          frameObservedAtMsRef.current === null
+            ? null
+            : performance.now() - frameObservedAtMsRef.current,
+        stalls: stallCountRef.current,
+        droppedFrames: quality?.droppedVideoFrames,
+        totalFrames: quality?.totalVideoFrames,
+        syncDeltaMs,
+        clockRttMs,
+      },
+      live: liveStatsRef.current,
+      trace: traceRef.current,
+    });
+    const fallback = () => {
+      setReportText(report);
+      setReportCopyState(
+        "自动复制不可用，请在下方选中并复制报告；播放不会中断。",
+      );
+    };
+    try {
+      void navigator.clipboard
+        .writeText(report)
+        .then(() => {
+          setReportText("");
+          setReportCopyState("已复制脱敏播放报告（含最近事件），播放未中断。");
+        })
+        .catch(fallback);
+    } catch {
+      fallback();
+    }
+  }
+
   async function toggleMicrophone() {
     const room = voiceRoomRef.current;
     if (!room) return;
@@ -2023,6 +2096,21 @@ export function RoomPage() {
           )}
         </nav>
       </header>
+      <div className="program-warning" role="status" aria-label="播放器版本">
+        <span>播放器版本 {PLAYER_BUILD.slice(0, 12)}</span>
+        {latestPlayerBuild && latestPlayerBuild !== PLAYER_BUILD && (
+          <>
+            <span>
+              {" "}
+              · 已有新版 {latestPlayerBuild.slice(0, 12)}
+              ，当前页面尚未更新；不会自动中断播放。
+            </span>
+            <button type="button" onClick={() => window.location.reload()}>
+              刷新更新播放器
+            </button>
+          </>
+        )}
+      </div>
       <div className="screen-layout">
         <section className="screen-frame" ref={screenRef}>
           <div className="screen-meta">
@@ -2372,6 +2460,24 @@ export function RoomPage() {
           )}
           <details className="playback-diagnostics">
             <summary>播放诊断</summary>
+            <p>
+              播放器版本 {PLAYER_BUILD.slice(0, 12)} ·
+              报告只在本机生成，不自动上传。
+            </p>
+            <button type="button" onClick={copyPlaybackReport}>
+              复制当前播放报告（不离开房间）
+            </button>
+            {reportCopyState && <p role="status">{reportCopyState}</p>}
+            {reportText && (
+              <textarea
+                aria-label="脱敏播放报告"
+                readOnly
+                value={reportText}
+                rows={8}
+                style={{ width: "100%" }}
+                onFocus={(event) => event.currentTarget.select()}
+              />
+            )}
             {snapshot?.mode === "vod" && (
               <div>
                 <label>
@@ -2400,6 +2506,12 @@ export function RoomPage() {
                   权威播放位置减本机播放位置，正数表示落后、负数表示超前；RTT =
                   控制消息往返时间。正在播放不等于已经同步，数值也不代替实际画面验收。
                 </p>
+                {playbackComparison === "normal" && (
+                  <p>
+                    正常同步采用恒速对齐：保持 Host
+                    基准倍速，不持续调速追赶；Host 明确修改倍速时仍会跟随。
+                  </p>
+                )}
                 {playbackComparison === "host-only" && (
                   <p role="status">
                     固定1×对照已启用：只做初次对齐和Host明确跳转；关闭速度微调、漂移自动定位、自动补偿及静音解码恢复。请Host保持1×。此模式允许偏差积累，不作为同步验收通过。

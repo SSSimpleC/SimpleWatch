@@ -8,6 +8,8 @@ import {
   type Page,
   type TestInfo,
 } from "@playwright/test";
+import { readFile, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import type { RoomSnapshot } from "../../packages/contracts/src/index.js";
 
 const origin = "https://127.0.0.1:18443";
@@ -399,6 +401,285 @@ test("page-local comparisons preserve authenticated media and can return to norm
   }
 });
 
+test("in-room reports and update notices preserve continuous playback and exact build identity", async ({
+  browser,
+}, testInfo) => {
+  expect(
+    testInfo.config.workers,
+    "The generated identity fixture requires exclusive local-stack ownership",
+  ).toBe(1);
+  const host = await createClient(browser);
+  const viewer = await createClient(browser);
+  let browserVersionRequests = 0;
+  const versionPath = resolve("dist/web/player-version.json");
+  const originalVersion = await readFile(versionPath);
+  let versionReplaced = false;
+  viewer.page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/player-version.json")
+      browserVersionRequests += 1;
+  });
+  try {
+    await login(host.page, "Host");
+    await closeExistingRoom(host.page);
+    await host.page.getByRole("button", { name: /开启放映室/ }).click();
+    await host.page.getByRole("button", { name: "进入主持房间" }).click();
+    await host.page
+      .getByLabel("选择点播影片")
+      .selectOption({ label: "sync-player-fixture.mp4" });
+    await login(viewer.page, "Simple");
+    for (const page of [host.page, viewer.page]) {
+      await expect(page.locator("video")).toHaveAttribute(
+        "src",
+        `/api/v1/media/${mediaId}/content`,
+      );
+      await page
+        .getByRole("button", { name: "启用节目声音", exact: true })
+        .click();
+    }
+    await host.page
+      .getByRole("button", { name: "▶ 播放", exact: true })
+      .click();
+    await expect
+      .poll(async () => (await latestFrame(viewer.page))?.mediaTime ?? -1)
+      .toBeGreaterThan(1);
+    await expect(
+      viewer.page.getByRole("status").filter({ hasText: /^正在播放/ }),
+    ).toBeVisible();
+    await expect
+      .poll(async () => await driftFromAuthority(viewer.page, viewer.evidence))
+      .toBeLessThanOrEqual(0.25);
+    await expect(viewer.page.locator("video")).toHaveJSProperty(
+      "seeking",
+      false,
+    );
+
+    const versionResponse = await viewer.page.request.get(
+      "/player-version.json",
+    );
+    expect(versionResponse.status()).toBe(200);
+    expect(versionResponse.headers()["cache-control"]).toContain("no-store");
+    const manifest = (await versionResponse.json()) as {
+      schemaVersion: number;
+      buildId: string;
+    };
+    expect(manifest.schemaVersion).toBe(1);
+    expect(manifest.buildId).toMatch(/^[a-f0-9]{64}$/);
+    await expect.poll(() => browserVersionRequests).toBeGreaterThan(0);
+    await expect(
+      viewer.page.getByRole("status", { name: "播放器版本" }),
+    ).toContainText(manifest.buildId.slice(0, 12));
+    const roomUrl = viewer.page.url();
+    const video = await viewer.page.locator("video").elementHandle();
+    if (!video) throw new Error("Missing continuous playback video");
+    const baseline = await video.evaluate((element) => ({
+      atMs: performance.timeOrigin + performance.now(),
+      currentTime: (element as HTMLVideoElement).currentTime,
+    }));
+    let documentNavigations = 0;
+    viewer.page.on("framenavigated", (frame) => {
+      if (frame === viewer.page.mainFrame()) documentNavigations += 1;
+    });
+
+    // Only the clipboard sink is substituted. The player, media requests,
+    // clocks, currentTime, seek events and presented frames stay real.
+    await viewer.page.evaluate(() => {
+      const capture = window as unknown as { __copiedPlayerReport?: string };
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: {
+          writeText: (value: string) => {
+            capture.__copiedPlayerReport = value;
+            return Promise.resolve();
+          },
+        },
+      });
+    });
+    await viewer.page.getByText("播放诊断", { exact: true }).click();
+    const copy = viewer.page.getByRole("button", {
+      name: "复制当前播放报告（不离开房间）",
+      exact: true,
+    });
+    await copy.click();
+    await expect(
+      viewer.page.getByText("已复制脱敏播放报告（含最近事件），播放未中断。", {
+        exact: true,
+      }),
+    ).toBeVisible();
+    const copied = await viewer.page.evaluate(
+      () =>
+        (window as unknown as { __copiedPlayerReport?: string })
+          .__copiedPlayerReport,
+    );
+    expect(copied).toBeTruthy();
+    const report = JSON.parse(copied!) as {
+      schemaVersion: number;
+      buildId: string;
+      latestBuildId: string | null;
+      program: { playbackRate: number; currentTimeSec: number };
+      controller: {
+        phase: string;
+        frameEvidence: string;
+        intentId: number | null;
+      };
+      trace: unknown[];
+    };
+    expect(report.schemaVersion).toBe(1);
+    expect(report.buildId).toBe(manifest.buildId);
+    expect(report.latestBuildId).toBe(manifest.buildId);
+    expect(report.program.playbackRate).toBe(1);
+    expect(report.program.currentTimeSec).toBeGreaterThan(0);
+    expect(report.controller).toMatchObject({
+      phase: "playing",
+      frameEvidence: "verified",
+      intentId: null,
+    });
+    expect(report.trace.length).toBeGreaterThan(0);
+    expect(report.trace.length).toBeLessThanOrEqual(120);
+    expect(copied!.length).toBeLessThanOrEqual(64 * 1024);
+    expect(copied).not.toContain(mediaId);
+    expect(copied).not.toContain(roomUrl.split("/").at(-1));
+    expect(copied).not.toMatch(
+      /https?:\/\/|Bearer |__Host-sw_session|csrfToken/,
+    );
+
+    await viewer.page.evaluate(() => {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: {
+          writeText: () =>
+            Promise.reject(
+              new DOMException(
+                "Local test clipboard denied",
+                "NotAllowedError",
+              ),
+            ),
+        },
+      });
+    });
+    await copy.click();
+    const fallback = viewer.page.getByRole("textbox", { name: "脱敏播放报告" });
+    await expect(fallback).toBeVisible();
+    await expect(fallback).toHaveJSProperty("readOnly", true);
+    const fallbackReport = JSON.parse(await fallback.inputValue()) as {
+      buildId: string;
+      program: { currentTimeSec: number };
+    };
+    expect(fallbackReport.buildId).toBe(manifest.buildId);
+    expect(fallbackReport.program.currentTimeSec).toBeGreaterThanOrEqual(
+      report.program.currentTimeSec,
+    );
+    await expect
+      .poll(async () => (await latestFrame(viewer.page))?.mediaTime ?? -1)
+      .toBeGreaterThan(baseline.currentTime + 1);
+    await viewer.page.screenshot({
+      path: testInfo.outputPath("in-room-report-fallback.png"),
+      fullPage: true,
+    });
+
+    const nextBuild =
+      manifest.buildId === "f".repeat(64) ? "e".repeat(64) : "f".repeat(64);
+    // The isolated local stack serves the actual generated identity file. Use
+    // a real server-side update rather than page.route: WebKit service-worker
+    // controlled pages can bypass that interception. Keep the worker enabled,
+    // preserve every media request and restore the original bytes in finally.
+    versionReplaced = true;
+    await writeFile(
+      versionPath,
+      JSON.stringify({ schemaVersion: 1, buildId: nextBuild }),
+    );
+    // Respect the real 15-second version-check throttle. This does not replace
+    // timers or alter the player clock; pageshow only asks for a fresh identity.
+    await viewer.page.waitForTimeout(16_000);
+    await viewer.page.evaluate(() =>
+      window.dispatchEvent(new Event("pageshow")),
+    );
+    await expect(
+      viewer.page.getByRole("status", { name: "播放器版本" }),
+    ).toContainText(`已有新版 ${nextBuild.slice(0, 12)}`);
+    await expect(
+      viewer.page.getByRole("button", {
+        name: "刷新更新播放器",
+        exact: true,
+      }),
+    ).toBeVisible();
+    await expect
+      .poll(async () => (await latestFrame(viewer.page))?.mediaTime ?? -1)
+      .toBeGreaterThan(baseline.currentTime + 16);
+    expect(viewer.page.url()).toBe(roomUrl);
+    expect(documentNavigations).toBe(0);
+    expect(
+      await video.evaluate(
+        (element) =>
+          element.isConnected && element === document.querySelector("video"),
+      ),
+    ).toBe(true);
+    const final = await video.evaluate((element) => ({
+      atMs: performance.timeOrigin + performance.now(),
+      currentTime: (element as HTMLVideoElement).currentTime,
+      paused: (element as HTMLVideoElement).paused,
+      playbackRate: (element as HTMLVideoElement).playbackRate,
+    }));
+    const disruptiveEvents = await viewer.page.evaluate(
+      (sinceMs) =>
+        (
+          (
+            window as unknown as {
+              __playerGateMediaEvents?: MediaEventObservation[];
+            }
+          ).__playerGateMediaEvents ?? []
+        ).filter(
+          (event) =>
+            event.observedAtMs >= sinceMs &&
+            ["seeking", "pause", "ratechange"].includes(event.event),
+        ),
+      baseline.atMs,
+    );
+    // Preserve the measurements before asserting: an actual restart or seek
+    // must retain its evidence, not just a later frame after it has recovered.
+    await testInfo.attach("in-room-report", {
+      body: copied!,
+      contentType: "application/json",
+    });
+    await testInfo.attach("report-update-continuity", {
+      body: JSON.stringify(
+        {
+          manifest,
+          nextBuild,
+          baseline,
+          final,
+          documentNavigations,
+          disruptiveEvents,
+        },
+        null,
+        2,
+      ),
+      contentType: "application/json",
+    });
+    expect(final.paused).toBe(false);
+    expect(final.playbackRate).toBe(1);
+    expect(
+      Math.abs(
+        final.currentTime -
+          baseline.currentTime -
+          (final.atMs - baseline.atMs) / 1000,
+      ),
+    ).toBeLessThan(0.5);
+    expect(disruptiveEvents).toEqual([]);
+    expect(viewer.evidence.pageErrors).toEqual([]);
+    await viewer.page.screenshot({
+      path: testInfo.outputPath("in-room-update-notice.png"),
+      fullPage: true,
+    });
+  } finally {
+    if (versionReplaced) await writeFile(versionPath, originalVersion);
+    await attachEvidence(testInfo, "report-host", host);
+    await attachEvidence(testInfo, "report-viewer", viewer);
+    await closeExistingRoom(host.page).catch(() => undefined);
+    await host.context.close();
+    await viewer.context.close();
+  }
+});
+
 test("mobile WebKit keeps a continuous 35-second playback window stable", async ({
   browser,
   browserName,
@@ -467,7 +748,9 @@ test("mobile WebKit keeps a continuous 35-second playback window stable", async 
     const observation = await viewer.page.evaluate(async () => {
       const video = document.querySelector("video");
       if (!video) throw new Error("Missing video in mobile steady-state gate");
-      const beganAtMs = performance.timeOrigin + performance.now();
+      const beganMonotonicMs = performance.now();
+      const beganAtMs = performance.timeOrigin + beganMonotonicMs;
+      const deadlineMs = beganMonotonicMs + 35_000;
       const samples: Array<{
         observedAtMs: number;
         currentTime: number;
@@ -501,11 +784,23 @@ test("mobile WebKit keeps a continuous 35-second playback window stable", async 
       sample();
       await new Promise<void>((resolve) => {
         const interval = window.setInterval(sample, 250);
-        window.setTimeout(() => {
+        const finish = () => {
+          const remainingMs = deadlineMs - performance.now();
+          if (remainingMs > 0) {
+            // Timers can fire just before their nominal delay after coarse
+            // clock quantization. Extend the measurement; never reduce the
+            // required 35-second observation or its playback assertions.
+            window.setTimeout(finish, Math.ceil(remainingMs) + 1);
+            return;
+          }
           window.clearInterval(interval);
           sample();
           resolve();
-        }, 35_000);
+        };
+        window.setTimeout(
+          finish,
+          Math.ceil(deadlineMs - performance.now()) + 1,
+        );
       });
       const endedAtMs = performance.timeOrigin + performance.now();
       const observed = window as unknown as {
@@ -590,7 +885,10 @@ test("mobile WebKit keeps a continuous 35-second playback window stable", async 
     expect(eventCounts.waiting).toBe(0);
     expect(eventCounts.stalled).toBe(0);
     expect(eventCounts.pause).toBe(0);
-    expect(eventCounts.ratechange).toBeLessThanOrEqual(2);
+    expect(eventCounts.ratechange).toBe(0);
+    expect(
+      observation.samples.every((sample) => sample.playbackRate === 1),
+    ).toBe(true);
     expect(
       observation.samples.every(
         (sample) =>
@@ -894,8 +1192,22 @@ async function driftFromAuthority(
   const latest = evidence.snapshots.at(-1);
   const transport = latest?.snapshot.transport;
   if (!frame || !latest || !transport) return Number.POSITIVE_INFINITY;
-  const serverFrameTime =
-    frame.observedAtMs + latest.snapshot.serverNowMs - latest.receivedAtMs;
+  // A snapshot's Node-side receive timestamp includes browser/automation event
+  // delivery delay and can underestimate a slow startup's real residual. Use
+  // independently observed low-RTT clock exchanges, just like the long-window
+  // gate, and the frame's expected display timestamp rather than a setter.
+  const clocks = evidence.clocks
+    .filter(
+      (sample) => Number.isFinite(sample.offsetMs) && sample.roundTripMs >= 0,
+    )
+    .sort((left, right) => left.roundTripMs - right.roundTripMs)
+    .slice(0, 3);
+  if (clocks.length === 0) return Number.POSITIVE_INFINITY;
+  const offsetMs = quantile(
+    clocks.map((sample) => sample.offsetMs),
+    0.5,
+  );
+  const serverFrameTime = frame.expectedDisplayAtMs + offsetMs;
   if (serverFrameTime < transport.anchoredAtServerMs)
     return Number.POSITIVE_INFINITY;
   const target =

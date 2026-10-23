@@ -1,10 +1,8 @@
 /* global self, caches */
-const CACHE = "simplewatch-shell-v1";
-const SHELL = ["/", "/manifest.webmanifest"];
-
+// Authenticated online playback gains nothing from an old offline HTML shell.
+// Retire only our shell caches; leave all requests to the browser.
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));
-  self.skipWaiting();
+  event.waitUntil(self.skipWaiting());
 });
 self.addEventListener("activate", (event) => {
   event.waitUntil(
@@ -12,44 +10,12 @@ self.addEventListener("activate", (event) => {
       .keys()
       .then((keys) =>
         Promise.all(
-          keys.filter((key) => key !== CACHE).map((key) => caches.delete(key)),
+          keys
+            .filter((key) => key.startsWith("simplewatch-shell-"))
+            .map((key) => caches.delete(key)),
         ),
-      ),
-  );
-  self.clients.claim();
-});
-self.addEventListener("fetch", (event) => {
-  const url = new URL(event.request.url);
-  const forbidden = [
-    "/api/",
-    "/media-files/",
-    "/subtitles/",
-    "/files/",
-    "/program/",
-    "/rtc",
-  ];
-  if (
-    event.request.method !== "GET" ||
-    url.origin !== self.location.origin ||
-    forbidden.some((prefix) => url.pathname.startsWith(prefix))
-  ) {
-    return;
-  }
-  event.respondWith(
-    fetch(event.request)
-      .then((response) => {
-        if (response.ok && response.type === "basic") {
-          const copy = response.clone();
-          void caches
-            .open(CACHE)
-            .then((cache) => cache.put(event.request, copy));
-        }
-        return response;
-      })
-      .catch(() =>
-        caches
-          .match(event.request)
-          .then((response) => response ?? caches.match("/")),
-      ),
+      )
+      .then(() => self.clients.claim()),
   );
 });
+// No fetch listener, no navigation fallback and no automatic page reload.

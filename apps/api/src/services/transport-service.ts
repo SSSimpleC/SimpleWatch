@@ -48,6 +48,9 @@ export class TransportService {
   private readonly obsEncryptionKey: Buffer;
   private readonly webhookReceiver: WebhookReceiver;
   private readonly liveMetricSamples = new Map<string, SourceMetricSample>();
+  private pathsRequest: Promise<{ items?: unknown[] }> | null = null;
+  private metricsRequest: Promise<{ text: string; atMs: number }> | null = null;
+  private metricsCache: { text: string; atMs: number } | null = null;
 
   public constructor(
     private readonly database: AppDatabase,
@@ -200,12 +203,7 @@ export class TransportService {
     const checkedAt = new Date(this.now()).toISOString();
     const path = this.getLivePath(roomId);
     try {
-      const response = await fetch(
-        new URL("/v3/paths/list", this.options.mediamtxControlUrl),
-        { signal: AbortSignal.timeout(1500) },
-      );
-      if (!response.ok) throw new Error(`MediaMTX HTTP ${response.status}`);
-      const payload = (await response.json()) as { items?: unknown[] };
+      const payload = await this.getLivePaths();
       const item = (payload.items ?? []).find((candidate) => {
         if (!candidate || typeof candidate !== "object") return false;
         return (candidate as { name?: unknown }).name === path;
@@ -217,6 +215,7 @@ export class TransportService {
           }
         | undefined;
       if (!item?.ready || !item.source) {
+        this.liveMetricSamples.delete(path);
         return {
           state: "offline",
           hasVideo: false,
@@ -243,7 +242,7 @@ export class TransportService {
       ).length;
       const hasVideo = videoTrackCount > 0;
       const hasAudio = audioTrackCount > 0;
-      const quality = await this.getSourceQuality(path).catch(
+      const quality = await this.getSourceQuality(path, item.source).catch(
         (): SourceQuality => ({
           sourceBitrateMbps: null,
           sourcePacketLossPercent: null,
@@ -274,7 +273,39 @@ export class TransportService {
     }
   }
 
-  private async getSourceQuality(path: string): Promise<SourceQuality> {
+  private async getLivePaths(): Promise<{ items?: unknown[] }> {
+    if (this.pathsRequest) return this.pathsRequest;
+    const request = (async () => {
+      const response = await fetch(
+        new URL("/v3/paths/list", this.options.mediamtxControlUrl),
+        { signal: AbortSignal.timeout(1500) },
+      );
+      if (!response.ok) throw new Error(`MediaMTX HTTP ${response.status}`);
+      return (await response.json()) as { items?: unknown[] };
+    })();
+    this.pathsRequest = request;
+    try {
+      return await request;
+    } finally {
+      this.pathsRequest = null;
+    }
+  }
+
+  private async getMetrics(): Promise<{ text: string; atMs: number }> {
+    if (this.metricsRequest) return this.metricsRequest;
+    const age = this.metricsCache ? this.now() - this.metricsCache.atMs : -1;
+    if (this.metricsCache && age >= 0 && age < 2_000) return this.metricsCache;
+    const request = this.fetchMetrics();
+    this.metricsRequest = request;
+    try {
+      this.metricsCache = await request;
+      return this.metricsCache;
+    } finally {
+      this.metricsRequest = null;
+    }
+  }
+
+  private async fetchMetrics(): Promise<{ text: string; atMs: number }> {
     const metricsUrl = new URL(this.options.mediamtxControlUrl);
     metricsUrl.port = "9998";
     metricsUrl.pathname = "/metrics";
@@ -283,47 +314,96 @@ export class TransportService {
       signal: AbortSignal.timeout(1500),
     });
     if (!response.ok) throw new Error(`MediaMTX metrics ${response.status}`);
-    const metrics = await response.text();
+    return { text: await response.text(), atMs: this.now() };
+  }
+
+  private async getSourceQuality(
+    path: string,
+    source: unknown,
+  ): Promise<SourceQuality> {
+    // v1.18.2 exposes the actual publisher at paths[].source.id; path alone can
+    // include an old publisher and every reader. Missing identity is unknown.
+    const publisher = source as { type?: unknown; id?: unknown };
+    if (
+      publisher?.type !== "webRTCSession" ||
+      typeof publisher.id !== "string" ||
+      !publisher.id
+    ) {
+      this.liveMetricSamples.delete(path);
+      return unknownSourceQuality();
+    }
+    const metrics = await this.getMetrics();
     const current = {
-      atMs: this.now(),
-      bytes: sumPrometheusMetric(
-        metrics,
+      publisherId: publisher.id,
+      atMs: metrics.atMs,
+      bytes: publisherMetric(
+        metrics.text,
         "webrtc_sessions_inbound_bytes",
         path,
+        publisher.id,
       ),
-      packets: sumPrometheusMetric(
-        metrics,
+      packets: publisherMetric(
+        metrics.text,
         "webrtc_sessions_inbound_rtp_packets",
         path,
+        publisher.id,
       ),
-      lost: sumPrometheusMetric(
-        metrics,
+      lost: publisherMetric(
+        metrics.text,
         "webrtc_sessions_inbound_rtp_packets_lost",
         path,
+        publisher.id,
       ),
     };
     const previous = this.liveMetricSamples.get(path);
-    if (previous && current.atMs - previous.atMs < 800) return previous.quality;
+    if (
+      previous?.publisherId === current.publisherId &&
+      current.atMs === previous.atMs
+    )
+      return previous.quality;
 
-    let quality: SourceQuality = {
-      sourceBitrateMbps: null,
-      sourcePacketLossPercent: null,
-      sourceHealth: "unknown",
-    };
-    if (previous && current.atMs > previous.atMs) {
+    let quality = unknownSourceQuality();
+    if (
+      previous &&
+      previous.publisherId === current.publisherId &&
+      current.atMs > previous.atMs &&
+      current.atMs - previous.atMs <= 15_000 &&
+      current.bytes !== null &&
+      current.packets !== null &&
+      current.lost !== null &&
+      previous.bytes !== null &&
+      previous.packets !== null &&
+      previous.lost !== null
+    ) {
       const elapsedSeconds = (current.atMs - previous.atMs) / 1000;
       const bytesDelta = current.bytes - previous.bytes;
       const packetsDelta = current.packets - previous.packets;
       const lostDelta = current.lost - previous.lost;
       if (bytesDelta >= 0 && packetsDelta >= 0 && lostDelta >= 0) {
         const denominator = packetsDelta + lostDelta;
-        const loss = denominator > 0 ? (lostDelta / denominator) * 100 : 0;
+        const loss = denominator > 0 ? (lostDelta / denominator) * 100 : null;
         quality = {
           sourceBitrateMbps: (bytesDelta * 8) / elapsedSeconds / 1_000_000,
           sourcePacketLossPercent: loss,
-          sourceHealth: loss > 3 ? "poor" : loss > 1 ? "degraded" : "good",
+          sourceHealth:
+            loss === null
+              ? "unknown"
+              : loss > 3
+                ? "poor"
+                : loss > 1
+                  ? "degraded"
+                  : bytesDelta > 0
+                    ? "good"
+                    : "unknown",
         };
       }
+    }
+    if (
+      this.liveMetricSamples.size >= 128 &&
+      !this.liveMetricSamples.has(path)
+    ) {
+      const first = this.liveMetricSamples.keys().next().value;
+      if (first !== undefined) this.liveMetricSamples.delete(first);
     }
     this.liveMetricSamples.set(path, { ...current, quality });
     return quality;
@@ -567,28 +647,55 @@ interface SourceQuality {
 }
 
 interface SourceMetricSample {
+  readonly publisherId: string;
   readonly atMs: number;
-  readonly bytes: number;
-  readonly packets: number;
-  readonly lost: number;
+  readonly bytes: number | null;
+  readonly packets: number | null;
+  readonly lost: number | null;
   readonly quality: SourceQuality;
 }
 
-function sumPrometheusMetric(
+function unknownSourceQuality(): SourceQuality {
+  return {
+    sourceBitrateMbps: null,
+    sourcePacketLossPercent: null,
+    sourceHealth: "unknown",
+  };
+}
+
+function publisherMetric(
   text: string,
   metric: string,
   path: string,
-): number {
-  let total = 0;
+  publisherId: string,
+): number | null {
+  let result: number | null = null;
   for (const line of text.split("\n")) {
+    if (!line.startsWith(`${metric}{`)) continue;
+    const end = line.indexOf("}");
+    if (end < 0) continue;
+    const labels = new Map(
+      Array.from(
+        line
+          .slice(metric.length + 1, end)
+          .matchAll(/(?:^|,)\s*(\w+)="((?:[^"\\]|\\.)*)"/g),
+        (match) => [match[1], match[2]],
+      ),
+    );
     if (
-      !line.startsWith(`${metric}{`) ||
-      !line.includes(`path="${path}"`) ||
-      !line.includes('state="publish"')
+      labels.get("path") !== path ||
+      labels.get("id") !== publisherId ||
+      labels.get("state") !== "publish"
     )
       continue;
-    const value = Number(line.slice(line.lastIndexOf(" ") + 1));
-    if (Number.isFinite(value)) total += value;
+    const value = Number(
+      line
+        .slice(end + 1)
+        .trim()
+        .split(/\s+/)[0],
+    );
+    if (!Number.isFinite(value) || value < 0 || result !== null) return null;
+    result = value;
   }
-  return total;
+  return result;
 }

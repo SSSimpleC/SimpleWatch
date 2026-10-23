@@ -100,9 +100,7 @@ export async function processProbeJob(
     (!compatibility.fastStart ||
       !compatibility.container?.split(",").includes("mp4") ||
       (compatibility.video.codec === "hevc" &&
-        compatibility.video.codecTag?.toLowerCase() !== "hvc1") ||
-      compatibility.audio.codec !== "aac" ||
-      (compatibility.audio.channels ?? 0) > 2);
+        compatibility.video.codecTag?.toLowerCase() !== "hvc1"));
   if (resolve(source) === resolve(finalPath)) {
     // 上次处理已完成文件移动，但结果响应可能在网络中丢失。保留现有
     // 安全路径并重新计算结果，使同一任务能够幂等提交。
@@ -176,6 +174,23 @@ export async function remuxForBrowser(
   },
   ffmpegPath = "ffmpeg",
 ): Promise<void> {
+  await execFileAsync(
+    ffmpegPath,
+    buildRemuxArgs(source, destination, compatibility),
+    {
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+      windowsHide: true,
+    },
+  );
+}
+
+/** Stream copy only. Unsupported muxing must fail without an encoder fallback. */
+export function buildRemuxArgs(
+  source: string,
+  destination: string,
+  compatibility: { readonly video: { readonly codec: string | null } },
+): string[] {
   const args = [
     "-v",
     "error",
@@ -188,20 +203,12 @@ export async function remuxForBrowser(
     "0:a:0?",
     "-c:v",
     "copy",
+    "-c:a",
+    "copy",
   ];
-  if (
-    compatibility.audio.codec === "aac" &&
-    (compatibility.audio.channels ?? 0) <= 2
-  )
-    args.push("-c:a", "copy");
-  else args.push("-c:a", "aac", "-ac", "2", "-ar", "48000");
   if (compatibility.video.codec === "hevc") args.push("-tag:v", "hvc1");
   args.push("-movflags", "+faststart", destination);
-  await execFileAsync(ffmpegPath, args, {
-    encoding: "utf8",
-    maxBuffer: 4 * 1024 * 1024,
-    windowsHide: true,
-  });
+  return args;
 }
 
 export function processSubtitleJob(

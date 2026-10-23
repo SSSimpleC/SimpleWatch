@@ -36,6 +36,13 @@ createRoot(document.querySelector("#root")!).render(
 if ("serviceWorker" in navigator && import.meta.env.PROD) {
   window.addEventListener(
     "load",
-    () => void navigator.serviceWorker.register("/sw.js"),
+    () =>
+      void navigator.serviceWorker
+        .register("/sw.js", { updateViaCache: "none" })
+        .then((registration) => registration.update())
+        .catch(() => {
+          // Installation is optional; online playback must still work when the
+          // browser disables service workers or rejects their registration.
+        }),
   );
 }

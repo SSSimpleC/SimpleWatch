@@ -10,9 +10,9 @@
   },
   "pnpm": {
     "overrides": {
-      "brace-expansion@5": "5.0.9",
-      "fast-uri@3": "3.1.5",
-      "fast-uri@4": "4.1.2"
+      "brace-expansion@5": "5.0.12",
+      "fast-uri@3": "3.1.8",
+      "fast-uri@4": "4.1.5"
     },
     "onlyBuiltDependencies": [
       "argon2",
@@ -29,6 +29,9 @@
     "build:server": "node tools/build/build-server.mjs",
     "build:production": "pnpm build:web && pnpm build:server",
     "test:unit": "vitest run packages",
+    "test:web": "vitest run apps/web/test",
+    "test:player:prepare": "node tools/testing/player-prepare.mjs",
+    "test:player": "tsc --noEmit -p tests/player-e2e/tsconfig.json && pnpm build:web && node tools/testing/player-run.mjs",
     "test:ids": "node tools/testing/validate-test-ids.mjs",
     "test:coverage": "pnpm test:media && vitest run --config vitest.coverage.config.ts --coverage",
     "audit:prod": "node tools/security/audit-bulk.mjs",
@@ -47,7 +50,7 @@
     "openapi:generate": "pnpm --filter @simplewatch/api openapi:generate",
     "openapi:check": "pnpm --filter @simplewatch/api openapi:check",
     "plan:lint": "node tools/plan-lint.mjs",
-    "verify": "pnpm env:check && pnpm plan:lint && pnpm test:ids && pnpm lint && pnpm format:check && pnpm typecheck && pnpm build:production && pnpm test:unit && pnpm test:integration && pnpm test:security && pnpm test:coverage && pnpm test:media && pnpm test:worker && pnpm test:edge && pnpm test:range && pnpm test:compose && pnpm test:rtc && pnpm test:backup && pnpm release:manifest && pnpm openapi:check && pnpm test:e2e"
+    "verify": "pnpm env:check && pnpm plan:lint && pnpm test:ids && pnpm lint && pnpm format:check && pnpm typecheck && pnpm build:production && pnpm test:unit && pnpm test:web && pnpm test:integration && pnpm test:security && pnpm test:coverage && pnpm test:media && pnpm test:worker && pnpm test:edge && pnpm test:range && pnpm test:compose && pnpm test:rtc && pnpm test:backup && pnpm release:manifest && pnpm openapi:check && pnpm test:e2e && pnpm test:player"
   },
   "devDependencies": {
     "@eslint/js": "9.39.1",

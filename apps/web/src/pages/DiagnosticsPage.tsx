@@ -1,28 +1,38 @@
 import { useState } from "react";
 import { Link } from "react-router";
+import { PLAYER_BUILD } from "../player-build.js";
+import {
+  browserReportStorage,
+  readPlayerReportStorage,
+  serializePlayerReport,
+} from "../player-report.js";
 
 export function DiagnosticsPage() {
   const [copied, setCopied] = useState(false);
-  const connection = (
-    navigator as Navigator & {
-      connection?: { effectiveType?: string; downlink?: number; rtt?: number };
-    }
-  ).connection;
-  const report = {
-    generatedAt: new Date().toISOString(),
+  const [fallbackReport, setFallbackReport] = useState("");
+  const report = serializePlayerReport({
+    buildId: PLAYER_BUILD,
     online: navigator.onLine,
-    effectiveType: connection?.effectiveType ?? "unknown",
-    downlinkMbps: connection?.downlink ?? null,
-    rttMs: connection?.rtt ?? null,
-    userAgent: navigator.userAgent.replace(/\([^)]*\)/g, "(redacted)"),
-    roomState:
-      sessionStorage.getItem("simplewatch.room-state") ?? "not-connected",
-    programState:
-      sessionStorage.getItem("simplewatch.program-diagnostics") ??
-      "not-playing",
-    liveState:
-      sessionStorage.getItem("simplewatch.live-diagnostics") ?? "not-live",
-  };
+    visibility: document.visibilityState,
+    ...readPlayerReportStorage(browserReportStorage()),
+  });
+  function copyReport() {
+    const fallback = () => {
+      setCopied(false);
+      setFallbackReport(report);
+    };
+    try {
+      void navigator.clipboard
+        .writeText(report)
+        .then(() => {
+          setCopied(true);
+          setFallbackReport("");
+        })
+        .catch(fallback);
+    } catch {
+      fallback();
+    }
+  }
   return (
     <main className="console-shell settings-shell">
       <Link to="/" className="brand-mark">
@@ -33,32 +43,32 @@ export function DiagnosticsPage() {
         <h1>连接诊断</h1>
         <dl className="diagnostic-grid">
           <dt>浏览器在线</dt>
-          <dd>{report.online ? "是" : "否"}</dd>
-          <dt>网络类型</dt>
-          <dd>{report.effectiveType}</dd>
-          <dt>估算 RTT</dt>
-          <dd>{report.rttMs ?? "—"} ms</dd>
-          <dt>下行</dt>
-          <dd>{report.downlinkMbps ?? "—"} Mbps</dd>
-          <dt>房间状态</dt>
-          <dd>{report.roomState}</dd>
-          <dt>节目状态</dt>
-          <dd>{report.programState}</dd>
-          <dt>直播链路</dt>
-          <dd>{report.liveState}</dd>
+          <dd>{navigator.onLine ? "是" : "否"}</dd>
+          <dt>播放器版本</dt>
+          <dd>{PLAYER_BUILD.slice(0, 12)}</dd>
         </dl>
-        <button
-          onClick={() =>
-            void navigator.clipboard
-              .writeText(JSON.stringify(report, null, 2))
-              .then(() => setCopied(true))
-              .catch(() => setCopied(false))
-          }
-        >
+        <p>
+          这里显示离开房间前的本机快照；连续播放排查请优先在房间内“播放诊断”直接复制，避免中断现场。
+        </p>
+        <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+          {report}
+        </pre>
+        <button onClick={copyReport}>
           {copied ? "已复制脱敏报告" : "复制脱敏报告"}
         </button>
+        {fallbackReport && (
+          <textarea
+            aria-label="脱敏播放报告"
+            readOnly
+            value={fallbackReport}
+            rows={8}
+            style={{ width: "100%" }}
+            onFocus={(event) => event.currentTarget.select()}
+          />
+        )}
         <p className="muted-copy">
-          报告不包含 Cookie、JWT、房间密码、SDP 或 ICE 候选。
+          报告不包含账户、房间或影片标识、文件路径、URL、Cookie、JWT、SDP 或 ICE
+          候选；不会自动上传。
         </p>
       </section>
     </main>

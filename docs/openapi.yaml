@@ -3549,6 +3549,39 @@ paths:
                     type: integer
                     minimum: 0
                     maximum: 9007199254740991
+                  capabilities:
+                    type: object
+                    properties:
+                      commandAck:
+                        type: boolean
+                      playbackStatus:
+                        type: boolean
+                    required:
+                      - commandAck
+                      - playbackStatus
+                    additionalProperties: false
+                  cause:
+                    type: object
+                    properties:
+                      commandId:
+                        type: string
+                        format: uuid
+                        pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                      kind:
+                        type: string
+                        enum:
+                          - select-vod
+                          - select-live
+                          - restore-vod
+                          - play
+                          - pause
+                          - seek
+                          - set-rate
+                          - activate-queue-item
+                    required:
+                      - commandId
+                      - kind
+                    additionalProperties: false
                 required:
                   - roomId
                   - revision
@@ -3692,6 +3725,39 @@ paths:
                         type: integer
                         minimum: 0
                         maximum: 9007199254740991
+                      capabilities:
+                        type: object
+                        properties:
+                          commandAck:
+                            type: boolean
+                          playbackStatus:
+                            type: boolean
+                        required:
+                          - commandAck
+                          - playbackStatus
+                        additionalProperties: false
+                      cause:
+                        type: object
+                        properties:
+                          commandId:
+                            type: string
+                            format: uuid
+                            pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                          kind:
+                            type: string
+                            enum:
+                              - select-vod
+                              - select-live
+                              - restore-vod
+                              - play
+                              - pause
+                              - seek
+                              - set-rate
+                              - activate-queue-item
+                        required:
+                          - commandId
+                          - kind
+                        additionalProperties: false
                     required:
                       - roomId
                       - revision
@@ -3816,6 +3882,7 @@ paths:
     patch: *a1
     put: *a1
     post: *a1
+    query: *a1
   /api/v1/admin/session:
     get: &a2
       responses:
@@ -3828,6 +3895,7 @@ paths:
     patch: *a2
     put: *a2
     post: *a2
+    query: *a2
   /api/v1/admin/logout:
     get: &a3
       responses:
@@ -3840,6 +3908,7 @@ paths:
     patch: *a3
     put: *a3
     post: *a3
+    query: *a3
   /api/v1/admin/active-room/host-session:
     get: &a4
       responses:
@@ -3852,6 +3921,7 @@ paths:
     patch: *a4
     put: *a4
     post: *a4
+    query: *a4
   /api/v1/rooms/active/join:
     get: &a5
       responses:
@@ -3864,6 +3934,7 @@ paths:
     patch: *a5
     put: *a5
     post: *a5
+    query: *a5
   /api/v1/media:
     get:
       responses:

@@ -15,6 +15,7 @@ import {
   envelopeSchema,
   kickMemberRequestSchema,
   playbackProgressSchema,
+  playbackStatusSchema,
   activeRoomSummarySchema,
   roomCommandRequestSchema,
   roomSnapshotSchema,
@@ -91,6 +92,7 @@ const clockPingEnvelopeSchema = envelopeSchema(
 );
 const commandEnvelopeSchema = envelopeSchema(roomCommandRequestSchema);
 const playbackProgressEnvelopeSchema = envelopeSchema(playbackProgressSchema);
+const playbackStatusEnvelopeSchema = envelopeSchema(playbackStatusSchema);
 
 export interface BuildAppOptions {
   readonly databasePath: string;
@@ -176,7 +178,7 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
     options.trashRoot ?? "tmp/trash",
     now,
   );
-  const hub = new RoomHub();
+  const hub = new RoomHub(now);
   const adminEvents = new AdminEventHub(now);
   const edgeAdminService = new EdgeAdminService(
     database,
@@ -358,7 +360,16 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
 
   const webRoot = resolve(options.webRoot ?? "dist/web");
   if (existsSync(webRoot)) {
-    await app.register(fastifyStatic, { root: webRoot, wildcard: false });
+    await app.register(fastifyStatic, {
+      root: webRoot,
+      wildcard: false,
+      setHeaders(response, path) {
+        if (
+          /(?:^|[/\\])(?:index\.html|sw\.js|player-version\.json)$/.test(path)
+        )
+          response.header("Cache-Control", "no-store");
+      },
+    });
     app.get("/*", (request, reply) => {
       if (
         request.url.startsWith("/api/") ||
@@ -366,11 +377,13 @@ export async function buildApp(options: BuildAppOptions): Promise<BuiltApp> {
       ) {
         throw new AppError(404, "NOT_FOUND", "资源不存在");
       }
+      reply.header("Cache-Control", "no-store");
       return reply.sendFile("index.html", { maxAge: 0, immutable: false });
     });
   }
 
   app.addHook("onClose", (_instance, done) => {
+    hub.dispose();
     if (database.open) database.close();
     done();
   });
@@ -940,19 +953,46 @@ function registerWebSocketRoute(
       }
 
       roomService.touch(identity);
-      const remove = hub.add(identity.roomId, identity.memberId, socket);
+      const connectedMemberId = identity.memberId;
+      const authorize = (): boolean => {
+        try {
+          const current = roomService.authenticate(
+            getAccountCookie(request),
+            identity.roomId,
+          );
+          if (current.memberId !== connectedMemberId)
+            throw forbidden("席位已变化");
+          identity = current;
+          return true;
+        } catch {
+          socket.close(4001, "session invalid");
+          return false;
+        }
+      };
+      const playbackAccess = {
+        role: identity.role,
+        nickname: identity.nickname,
+        authorize,
+      };
+      const remove = hub.add(
+        identity.roomId,
+        identity.memberId,
+        socket,
+        playbackAccess,
+      );
       let windowStartedAt = now();
       let messagesInWindow = 0;
       let lastPongAt = now();
       const heartbeat = setInterval(() => {
         if (now() - lastPongAt >= 60_000) {
-          socket.close(4001, "heartbeat timeout");
+          socket.close(4000, "heartbeat timeout");
           return;
         }
         socket.ping();
       }, 20_000);
       heartbeat.unref();
       socket.on("pong", () => {
+        if (!authorize()) return;
         lastPongAt = now();
         roomService.touch(identity);
       });
@@ -962,7 +1002,9 @@ function registerWebSocketRoute(
       });
       socket.on("message", (data: RawData) => {
         let rejectedCommandId: string | undefined;
+        let isPlaybackStatus = false;
         const receivedAtMs = now();
+        if (!authorize()) return;
         roomService.touch(identity);
         if (receivedAtMs - windowStartedAt >= 1000) {
           windowStartedAt = receivedAtMs;
@@ -975,13 +1017,66 @@ function registerWebSocketRoute(
         }
 
         try {
-          const raw: unknown = JSON.parse(rawDataToText(data));
+          const rawText = rawDataToText(data);
+          const raw: unknown = JSON.parse(rawText);
           if (isEnvelopeType(raw, "room.hello")) {
+            const requestId = z
+              .object({ id: z.string().uuid() })
+              .safeParse(raw);
             const snapshot = roomService.getSnapshot(identity.roomId);
-            hub.broadcast(
+            sendEnvelope(
+              socket,
               identity.roomId,
-              createEnvelope(identity.roomId, "room.snapshot", snapshot, now),
+              "room.snapshot",
+              snapshot,
+              now,
+              requestId.success ? requestId.data.id : undefined,
             );
+            const hello = z
+              .object({
+                payload: z.object({ playbackStatus: z.boolean().optional() }),
+              })
+              .safeParse(raw);
+            if (hello.success && hello.data.payload.playbackStatus) {
+              hub.publishPlaybackSummary(identity.roomId, socket);
+            }
+            return;
+          }
+
+          if (isEnvelopeType(raw, "playback.status")) {
+            isPlaybackStatus = true;
+            if (Buffer.byteLength(rawText, "utf8") > 4096) {
+              throw new AppError(
+                413,
+                "PLAYBACK_STATUS_TOO_LARGE",
+                "播放观测消息超过 4KiB",
+              );
+            }
+            const observation = playbackStatusEnvelopeSchema.safeParse(raw);
+            if (
+              !observation.success ||
+              observation.data.roomId !== identity.roomId
+            ) {
+              throw new AppError(
+                400,
+                "INVALID_PLAYBACK_STATUS",
+                "播放观测消息无效",
+              );
+            }
+            if (
+              !hub.recordPlaybackStatus(
+                identity.roomId,
+                identity.memberId,
+                observation.data.payload,
+                playbackAccess,
+              )
+            ) {
+              throw new AppError(
+                429,
+                "PLAYBACK_STATUS_RATE_LIMITED",
+                "播放观测每秒最多一次",
+              );
+            }
             return;
           }
 
@@ -1007,14 +1102,38 @@ function registerWebSocketRoute(
             commandMessage.data.type === "room.command"
           ) {
             rejectedCommandId = commandMessage.data.payload.commandId;
+            if (commandMessage.data.roomId !== identity.roomId)
+              throw forbidden("房间不匹配");
+            const previousRevision = roomService.getSnapshot(
+              identity.roomId,
+            ).revision;
             const snapshot = roomService.applyCommand(
               identity,
               commandMessage.data.payload,
             );
-            hub.broadcast(
+            const currentSnapshot =
+              snapshot.revision > previousRevision
+                ? snapshot
+                : roomService.getSnapshot(identity.roomId);
+            sendEnvelope(
+              socket,
               identity.roomId,
-              createEnvelope(identity.roomId, "room.snapshot", snapshot, now),
+              "room.command.applied",
+              {
+                commandId: rejectedCommandId,
+                revision: snapshot.revision,
+                snapshot,
+                currentSnapshot,
+              },
+              now,
             );
+            // A retry receives its original receipt, but must never replay old state to peers.
+            if (snapshot.revision > previousRevision) {
+              hub.broadcast(
+                identity.roomId,
+                createEnvelope(identity.roomId, "room.snapshot", snapshot, now),
+              );
+            }
             return;
           }
 
@@ -1046,7 +1165,9 @@ function registerWebSocketRoute(
           sendEnvelope(
             socket,
             identity.roomId,
-            "room.command.rejected",
+            isPlaybackStatus
+              ? "playback.status.rejected"
+              : "room.command.rejected",
             {
               commandId: rejectedCommandId,
               code: appError.code,
@@ -1126,6 +1247,7 @@ function createEnvelope(
   type: string,
   payload: unknown,
   now: () => number,
+  replyTo?: string,
 ) {
   return {
     v: 1 as const,
@@ -1134,6 +1256,7 @@ function createEnvelope(
     roomId,
     sentAtMs: now(),
     payload,
+    ...(replyTo ? { replyTo } : {}),
   };
 }
 
@@ -1143,8 +1266,11 @@ function sendEnvelope(
   type: string,
   payload: unknown,
   now: () => number,
+  replyTo?: string,
 ): void {
-  socket.send(JSON.stringify(createEnvelope(roomId, type, payload, now)));
+  socket.send(
+    JSON.stringify(createEnvelope(roomId, type, payload, now, replyTo)),
+  );
 }
 
 function isEnvelopeType(value: unknown, type: string): boolean {

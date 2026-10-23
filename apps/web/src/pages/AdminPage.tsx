@@ -556,7 +556,7 @@ export function AdminPage() {
                     <strong>选择影片</strong>
                     <small>
                       可选择 MP4、MKV、MOV
-                      等常见视频；服务器只重封装和必要的音频转换，不重编码视频
+                      等常见视频；服务器仅按需原样复制音视频流重封装，不进行音频或视频转码，播放能力取决于设备与原始编码
                     </small>
                   </label>
                   {uploadProgress && (

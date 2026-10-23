@@ -13,6 +13,7 @@ export default tseslint.config(
       "coverage/**",
       "dist/**",
       "node_modules/**",
+      "output/**",
       "playwright-report/**",
       "test-data/**",
       "test-results/**",
@@ -22,10 +23,10 @@ export default tseslint.config(
   eslint.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked.map((config) => ({
     ...config,
-    files: ["**/*.ts"],
+    files: ["**/*.ts", "apps/web/src/pages/RoomPage.tsx"],
   })),
   {
-    files: ["**/*.ts"],
+    files: ["**/*.ts", "apps/web/src/pages/RoomPage.tsx"],
     languageOptions: {
       parserOptions: {
         projectService: true,

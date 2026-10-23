@@ -23,6 +23,7 @@
  * @property {string} user - username.
  * @property {string} pass - password.
  * @property {string} token - token.
+ * @property {boolean} [autoRetry=true] - disable when the application owns bounded retries and credentials.
  * @property {OnError} onError - called when there's an error.
  * @property {OnTrack} onTrack - called when there's a track available.
  * @property {OnDataChannel} onDataChannel - called when there's a data channel available.
@@ -43,6 +44,7 @@ class MediaMTXWebRTCReader {
     this.offerData = null;
     this.sessionUrl = null;
     this.queuedCandidates = [];
+    this.requestAbort = null;
     this.#getNonAdvertisedCodecs();
   }
 
@@ -53,12 +55,22 @@ class MediaMTXWebRTCReader {
     this.state = 'closed';
 
     if (this.pc !== null) {
+      this.pc.ontrack = null;
+      this.pc.onconnectionstatechange = null;
+      this.pc.onicecandidate = null;
+      this.pc.ondatachannel = null;
       this.pc.close();
+      this.pc = null;
     }
 
     if (this.restartTimeout !== null) {
       clearTimeout(this.restartTimeout);
+      this.restartTimeout = null;
     }
+    this.requestAbort?.abort();
+    this.requestAbort = null;
+    this.#deleteSession();
+    this.queuedCandidates = [];
   }
 
   /** Return the active peer connection for read-only diagnostics. */
@@ -351,31 +363,31 @@ class MediaMTXWebRTCReader {
 
   #handleError(err) {
     if (this.state === 'running') {
+      // Change state before closing the peer: close events must not recursively schedule retries.
+      this.state = this.conf.autoRetry === false ? 'failed' : 'restarting';
       if (this.pc !== null) {
+        this.pc.ontrack = null;
+        this.pc.onconnectionstatechange = null;
+        this.pc.onicecandidate = null;
+        this.pc.ondatachannel = null;
         this.pc.close();
         this.pc = null;
       }
-
+      this.requestAbort?.abort();
       this.offerData = null;
-
-      if (this.sessionUrl !== null) {
-        fetch(this.sessionUrl, {
-          method: 'DELETE',
-        });
-        this.sessionUrl = null;
+      this.#deleteSession();
+      this.queuedCandidates = [];
+      if (this.conf.autoRetry !== false) {
+        this.restartTimeout = window.setTimeout(() => {
+          this.restartTimeout = null;
+          if (this.state !== 'restarting') return;
+          this.state = 'running';
+          this.#start();
+        }, this.retryPause);
       }
 
-      this.queuedCandidates = [];
-      this.state = 'restarting';
-
-      this.restartTimeout = window.setTimeout(() => {
-        this.restartTimeout = null;
-        this.state = 'running';
-        this.#start();
-      }, this.retryPause);
-
       if (this.conf.onError !== undefined) {
-        this.conf.onError(`${err}, retrying in some seconds`);
+        this.conf.onError(this.conf.autoRetry === false ? String(err) : `${err}, retrying in some seconds`);
       }
     } else if (this.state === 'getting_codecs') {
       this.state = 'failed';
@@ -409,6 +421,7 @@ class MediaMTXWebRTCReader {
   }
 
   #start() {
+    this.requestAbort = new AbortController();
     this.#requestICEServers()
       .then((iceServers) => this.#setupPeerConnection(iceServers))
       .then((offer) => this.#sendOffer(offer))
@@ -432,6 +445,7 @@ class MediaMTXWebRTCReader {
   #requestICEServers() {
     return fetch(this.conf.url, {
       method: 'OPTIONS',
+      signal: AbortSignal.any([this.requestAbort.signal, AbortSignal.timeout(10000)]),
       headers: {
         ...this.#authHeader(),
       },
@@ -453,15 +467,8 @@ class MediaMTXWebRTCReader {
     const direction = 'recvonly';
     this.pc.addTransceiver('video', { direction });
     this.pc.addTransceiver('audio', { direction });
-    for (const receiver of this.pc.getReceivers()) {
-      if ('jitterBufferTarget' in receiver) {
-        try {
-          receiver.jitterBufferTarget = 100;
-        } catch (_) {
-          // Browsers may expose the property before accepting assignments.
-        }
-      }
-    }
+    // Leave the browser's adaptive jitter buffer in control. Zero or a forced
+    // target is not an end-to-end latency guarantee and can reduce stability.
 
     // using data channels requires creating a data channel locally
     this.pc.createDataChannel('');
@@ -488,6 +495,9 @@ class MediaMTXWebRTCReader {
 
     return fetch(this.conf.url, {
       method: 'POST',
+      // Allow a late 201 to return its Location after close, then delete it below.
+      // Still bound the handshake so a stalled POST cannot leave the UI connecting forever.
+      signal: AbortSignal.timeout(10000),
       headers: {
         ...this.#authHeader(),
         'Content-Type': 'application/sdp',
@@ -506,7 +516,17 @@ class MediaMTXWebRTCReader {
             throw new Error(`bad status code ${res.status}`);
         }
 
-        this.sessionUrl = new URL(res.headers.get('location'), this.conf.url).toString();
+        const location = res.headers.get('location');
+        if (!location) throw new Error('WHEP session location missing');
+        const session = new URL(location, this.conf.url);
+        if (session.origin !== new URL(this.conf.url).origin) {
+          throw new Error('WHEP session location origin mismatch');
+        }
+        this.sessionUrl = session.toString();
+        if (this.state !== 'running') {
+          this.#deleteSession();
+          throw new Error('closed');
+        }
 
         return res.text();
       });
@@ -548,8 +568,10 @@ class MediaMTXWebRTCReader {
   }
 
   #sendLocalCandidates(candidates) {
+    if (this.state !== 'running' || this.sessionUrl === null) return;
     fetch(this.sessionUrl, {
       method: 'PATCH',
+      signal: AbortSignal.any([this.requestAbort.signal, AbortSignal.timeout(10000)]),
       headers: {
         'Content-Type': 'application/trickle-ice-sdpfrag',
         'If-Match': '*',
@@ -588,14 +610,28 @@ class MediaMTXWebRTCReader {
   }
 
   #onTrack(evt) {
+    if (this.state !== 'running') return;
     if (this.conf.onTrack !== undefined) {
       this.conf.onTrack(evt);
     }
   }
 
   #onDataChannel(evt) {
+    if (this.state !== 'running') return;
     if (this.conf.onDataChannel !== undefined) {
       this.conf.onDataChannel(evt);
+    }
+  }
+
+  #deleteSession() {
+    const sessionUrl = this.sessionUrl;
+    this.sessionUrl = null;
+    if (sessionUrl !== null) {
+      void fetch(sessionUrl, {
+        method: 'DELETE',
+        headers: this.#authHeader(),
+        signal: AbortSignal.timeout(1500),
+      }).catch(() => { /* Best effort; server also removes a closed peer. */ });
     }
   }
 }

@@ -9,6 +9,7 @@ dist/
 coverage/
 playwright-report/
 test-results/
+output/playwright/
 .local/
 .serena/
 .env.local

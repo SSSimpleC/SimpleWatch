@@ -1,8 +1,10 @@
 import {
+  devices,
   expect,
   test,
   type Browser,
   type BrowserContext,
+  type BrowserContextOptions,
   type Page,
   type TestInfo,
 } from "@playwright/test";
@@ -17,11 +19,20 @@ interface PresentedFrame {
   mediaTime: number;
   presentedFrames: number;
   observedAtMs: number;
+  expectedDisplayAtMs: number;
   paused: boolean;
+}
+
+interface MediaEventObservation {
+  event: string;
+  observedAtMs: number;
+  mediaTime: number;
+  playbackRate: number;
 }
 
 interface Evidence {
   snapshots: Array<{ receivedAtMs: number; snapshot: RoomSnapshot }>;
+  clocks: Array<{ offsetMs: number; roundTripMs: number }>;
   mediaResponses: Array<{
     path: string;
     status: number;
@@ -388,6 +399,221 @@ test("page-local comparisons preserve authenticated media and can return to norm
   }
 });
 
+test("mobile WebKit keeps a continuous 35-second playback window stable", async ({
+  browser,
+  browserName,
+}, testInfo) => {
+  // Device emulation exercises the real touch/mobile page path, not iOS's
+  // AVFoundation pipeline. The deterministic controller gate and real-device
+  // acceptance remain separate requirements.
+  test.skip(
+    browserName !== "webkit",
+    "This gate explicitly exercises mobile WebKit",
+  );
+  const host = await createClient(browser);
+  const viewer = await createClient(browser, { ...devices["iPhone 13"] });
+  try {
+    await login(host.page, "Host");
+    await closeExistingRoom(host.page);
+    await host.page.getByRole("button", { name: /开启放映室/ }).click();
+    await host.page.getByRole("button", { name: "进入主持房间" }).click();
+    await host.page
+      .getByLabel("选择点播影片")
+      .selectOption({ label: "sync-player-fixture.mp4" });
+    await login(viewer.page, "Simple");
+    for (const page of [host.page, viewer.page]) {
+      await expect(page.locator("video")).toHaveAttribute(
+        "src",
+        `/api/v1/media/${mediaId}/content`,
+      );
+      await page
+        .getByRole("button", { name: "启用节目声音", exact: true })
+        .click();
+    }
+    await seekWithKeyboard(host.page, 5);
+    await expect
+      .poll(async () =>
+        Math.abs(((await latestFrame(viewer.page))?.mediaTime ?? -100) - 5),
+      )
+      .toBeLessThan(0.15);
+    await host.page
+      .getByRole("button", { name: "▶ 播放", exact: true })
+      .click();
+    // Exclude initial decoding and the explicit test seek. Once this window
+    // starts, no command, media assignment or recovery action is injected.
+    await expect
+      .poll(async () => (await latestFrame(viewer.page))?.mediaTime ?? -1)
+      .toBeGreaterThan(6);
+    await expect(viewer.page.locator("video")).toHaveJSProperty(
+      "seeking",
+      false,
+    );
+    const authoritative = viewer.evidence.snapshots.at(-1)?.snapshot;
+    expect(authoritative?.transport?.state).toBe("playing");
+    if (!authoritative?.transport) throw new Error("Missing playing authority");
+    await expect.poll(() => viewer.evidence.clocks.length).toBeGreaterThan(0);
+    const clockSamples = viewer.evidence.clocks
+      .filter(
+        (sample) => Number.isFinite(sample.offsetMs) && sample.roundTripMs >= 0,
+      )
+      .sort((left, right) => left.roundTripMs - right.roundTripMs)
+      .slice(0, 3);
+    const offsetMs = quantile(
+      clockSamples.map((sample) => sample.offsetMs),
+      0.5,
+    );
+    expect(Number.isFinite(offsetMs)).toBe(true);
+
+    const observation = await viewer.page.evaluate(async () => {
+      const video = document.querySelector("video");
+      if (!video) throw new Error("Missing video in mobile steady-state gate");
+      const beganAtMs = performance.timeOrigin + performance.now();
+      const samples: Array<{
+        observedAtMs: number;
+        currentTime: number;
+        playbackRate: number;
+        paused: boolean;
+        seeking: boolean;
+        readyState: number;
+        bufferedAheadSec: number;
+        visibility: string;
+      }> = [];
+      const sample = () => {
+        let bufferedAheadSec = 0;
+        for (let i = 0; i < video.buffered.length; i += 1) {
+          if (
+            video.buffered.start(i) <= video.currentTime &&
+            video.buffered.end(i) >= video.currentTime
+          )
+            bufferedAheadSec = video.buffered.end(i) - video.currentTime;
+        }
+        samples.push({
+          observedAtMs: performance.timeOrigin + performance.now(),
+          currentTime: video.currentTime,
+          playbackRate: video.playbackRate,
+          paused: video.paused,
+          seeking: video.seeking,
+          readyState: video.readyState,
+          bufferedAheadSec,
+          visibility: document.visibilityState,
+        });
+      };
+      sample();
+      await new Promise<void>((resolve) => {
+        const interval = window.setInterval(sample, 250);
+        window.setTimeout(() => {
+          window.clearInterval(interval);
+          sample();
+          resolve();
+        }, 35_000);
+      });
+      const endedAtMs = performance.timeOrigin + performance.now();
+      const observed = window as unknown as {
+        __playerGateFrames?: PresentedFrame[];
+        __playerGateMediaEvents?: MediaEventObservation[];
+      };
+      return {
+        beganAtMs,
+        endedAtMs,
+        samples,
+        frames: (observed.__playerGateFrames ?? []).filter(
+          (frame) =>
+            frame.observedAtMs >= beganAtMs && frame.observedAtMs <= endedAtMs,
+        ),
+        events: (observed.__playerGateMediaEvents ?? []).filter(
+          (event) =>
+            event.observedAtMs >= beganAtMs && event.observedAtMs <= endedAtMs,
+        ),
+      };
+    });
+    const transport = authoritative.transport;
+    const frameDriftSec = observation.frames.map((frame) => {
+      const target =
+        transport.positionSec +
+        ((frame.expectedDisplayAtMs + offsetMs - transport.anchoredAtServerMs) /
+          1000) *
+          transport.rate;
+      return target - frame.mediaTime;
+    });
+    const absoluteDrift = frameDriftSec.map(Math.abs);
+    const frameTimes = [
+      observation.beganAtMs,
+      ...observation.frames.map((frame) => frame.observedAtMs),
+      observation.endedAtMs,
+    ];
+    const frameGapsMs = frameTimes
+      .slice(1)
+      .map((time, index) => time - frameTimes[index]!);
+    const eventCounts = Object.fromEntries(
+      ["seeking", "seeked", "waiting", "stalled", "ratechange", "pause"].map(
+        (event) => [
+          event,
+          observation.events.filter((entry) => entry.event === event).length,
+        ],
+      ),
+    );
+    const summary = {
+      durationMs: observation.endedAtMs - observation.beganAtMs,
+      frameCount: observation.frames.length,
+      driftP95Sec: quantile(absoluteDrift, 0.95),
+      driftMaxSec: Math.max(...absoluteDrift),
+      maximumFrameGapMs: Math.max(...frameGapsMs),
+      frameGapsOver125Ms: frameGapsMs.filter((gap) => gap > 125).length,
+      eventCounts,
+      clockSamples,
+      offsetMs,
+    };
+    // Attach the whole window before any assertion, so a failed distribution or
+    // stall assertion cannot hide the measurements behind a later good frame.
+    await testInfo.attach("mobile-continuous-window", {
+      body: JSON.stringify(
+        {
+          summary,
+          authority: authoritative,
+          ...observation,
+          frameDriftSec,
+          frameGapsMs,
+        },
+        null,
+        2,
+      ),
+      contentType: "application/json",
+    });
+    expect(summary.durationMs).toBeGreaterThanOrEqual(35_000);
+    expect(observation.samples.length).toBeGreaterThanOrEqual(120);
+    expect(summary.frameCount).toBeGreaterThan(850);
+    expect(summary.driftP95Sec).toBeLessThan(0.5);
+    expect(summary.driftMaxSec).toBeLessThan(0.75);
+    expect(summary.maximumFrameGapMs).toBeLessThan(250);
+    expect(summary.frameGapsOver125Ms).toBeLessThanOrEqual(1);
+    expect(eventCounts.seeking).toBe(0);
+    expect(eventCounts.waiting).toBe(0);
+    expect(eventCounts.stalled).toBe(0);
+    expect(eventCounts.pause).toBe(0);
+    expect(eventCounts.ratechange).toBeLessThanOrEqual(2);
+    expect(
+      observation.samples.every(
+        (sample) =>
+          !sample.paused && !sample.seeking && sample.visibility === "visible",
+      ),
+    ).toBe(true);
+    expect(viewer.evidence.snapshots.at(-1)?.snapshot.revision).toBe(
+      authoritative.revision,
+    );
+    expect(viewer.evidence.pageErrors).toEqual([]);
+    expect(host.evidence.pageErrors).toEqual([]);
+    await viewer.page.screenshot({
+      path: testInfo.outputPath("mobile-continuous-final.png"),
+    });
+  } finally {
+    await attachEvidence(testInfo, "steady-host", host);
+    await attachEvidence(testInfo, "steady-mobile-viewer", viewer);
+    await closeExistingRoom(host.page).catch(() => undefined);
+    await host.context.close();
+    await viewer.context.close();
+  }
+});
+
 async function login(page: Page, username: "Host" | "Simple"): Promise<void> {
   await page.goto("/");
   await page.waitForLoadState("networkidle");
@@ -510,15 +736,18 @@ async function seekWithPointer(page: Page, position: number): Promise<void> {
 
 async function createClient(
   browser: Browser,
+  contextOptions: BrowserContextOptions = {},
 ): Promise<{ context: BrowserContext; page: Page; evidence: Evidence }> {
   const context = await browser.newContext({
     baseURL: origin,
     ignoreHTTPSErrors: true,
     viewport: { width: 1280, height: 900 },
+    ...contextOptions,
   });
   const page = await context.newPage();
   const evidence: Evidence = {
     snapshots: [],
+    clocks: [],
     mediaResponses: [],
     pageErrors: [],
   };
@@ -542,6 +771,25 @@ async function createClient(
           type: string;
           payload: RoomSnapshot | { currentSnapshot: RoomSnapshot };
         };
+        if (message.type === "clock.pong") {
+          const pong = message.payload as unknown as {
+            clientSentAtMs: number;
+            serverReceivedAtMs: number;
+            serverSentAtMs: number;
+          };
+          const receivedAtMs = Date.now();
+          evidence.clocks.push({
+            offsetMs:
+              (pong.serverReceivedAtMs -
+                pong.clientSentAtMs +
+                (pong.serverSentAtMs - receivedAtMs)) /
+              2,
+            roundTripMs:
+              receivedAtMs -
+              pong.clientSentAtMs -
+              (pong.serverSentAtMs - pong.serverReceivedAtMs),
+          });
+        }
         const snapshot =
           message.type === "room.snapshot"
             ? (message.payload as RoomSnapshot)
@@ -562,9 +810,14 @@ async function createClient(
       mediaTime: number;
       presentedFrames: number;
       observedAtMs: number;
+      expectedDisplayAtMs: number;
       paused: boolean;
     }> = [];
-    Object.assign(window, { __playerGateFrames: frames });
+    const events: MediaEventObservation[] = [];
+    Object.assign(window, {
+      __playerGateFrames: frames,
+      __playerGateMediaEvents: events,
+    });
     const scan = () => {
       for (const video of document.querySelectorAll("video")) {
         if (
@@ -573,11 +826,32 @@ async function createClient(
         )
           continue;
         observed.add(video);
+        for (const event of [
+          "seeking",
+          "seeked",
+          "waiting",
+          "stalled",
+          "ratechange",
+          "playing",
+          "pause",
+        ]) {
+          video.addEventListener(event, () => {
+            events.push({
+              event,
+              observedAtMs: performance.timeOrigin + performance.now(),
+              mediaTime: video.currentTime,
+              playbackRate: video.playbackRate,
+            });
+            if (events.length > 2000) events.splice(0, events.length - 2000);
+          });
+        }
         const frame = (now: number, metadata: VideoFrameCallbackMetadata) => {
           frames.push({
             mediaTime: metadata.mediaTime,
             presentedFrames: metadata.presentedFrames,
             observedAtMs: performance.timeOrigin + now,
+            expectedDisplayAtMs:
+              performance.timeOrigin + metadata.expectedDisplayTime,
             paused: video.paused,
           });
           if (frames.length > 2000) frames.splice(0, frames.length - 2000);
@@ -593,6 +867,14 @@ async function createClient(
     scan();
   });
   return { context, page, evidence };
+}
+
+function quantile(values: readonly number[], fraction: number): number {
+  const sorted = [...values].sort((left, right) => left - right);
+  return (
+    sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)] ??
+    Number.POSITIVE_INFINITY
+  );
 }
 
 async function latestFrame(page: Page): Promise<PresentedFrame | null> {

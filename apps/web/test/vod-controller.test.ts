@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   MonotonicServerClock,
   VodPlaybackController,
+  type VodControllerAction,
   type VodMediaState,
   type VodPresentedFrame,
   type VodSnapshot,
@@ -40,6 +41,10 @@ function fixture(
     media.paused = true;
   });
   const setPrimingMuted = vi.fn();
+  const setPlaybackRate = vi.fn((rate: number) => {
+    media.playbackRate = rate;
+  });
+  const onAction = vi.fn<(action: VodControllerAction) => void>();
   const clock = new MonotonicServerClock(() => now, 100_000);
   const controller = new VodPlaybackController({
     comparisonMode: options.commandOnly ? "host-only" : "normal",
@@ -49,11 +54,10 @@ function fixture(
       play,
       pause,
       setPrimingMuted,
-      setPlaybackRate: (rate) => {
-        media.playbackRate = rate;
-      },
+      setPlaybackRate,
     },
     clock,
+    onAction,
   });
   controller.setEnabled(true);
   function snapshot(
@@ -105,6 +109,8 @@ function fixture(
     play,
     pause,
     setPrimingMuted,
+    setPlaybackRate,
+    onAction,
     clock,
     snapshot,
     frame,
@@ -114,6 +120,223 @@ function fixture(
 }
 
 describe("VOD playback controller", () => {
+  it("does not turn quantized media-time observations into frame-frequency rate writes", () => {
+    const f = fixture();
+    f.controller.acceptSnapshot(f.snapshot(1, 10, "playing", 0, "seek"));
+    f.finish(10.04);
+    for (let i = 1; i <= 600; i += 1) {
+      const position = 10 + i / 30 - 0.6;
+      f.media.currentTime = Math.max(10.04, Math.floor(position * 10) / 10);
+      f.frame(Math.max(10.04, position));
+      f.advance(1000 / 30);
+    }
+    expect(f.setPlaybackRate.mock.calls.length).toBeLessThanOrEqual(3);
+    expect(f.setPlaybackRate.mock.calls.map(([rate]) => rate)).toEqual([1.05]);
+  });
+
+  it.each([
+    { costMs: 200, ahead: false },
+    { costMs: 300, ahead: false },
+    { costMs: 200, ahead: true },
+    { costMs: 300, ahead: true },
+  ])(
+    "converges over ninety seconds with waiting and $costMs ms rate cost (ahead=$ahead)",
+    ({ costMs, ahead }) => {
+      let now = 0;
+      let decoderBlockedUntil = 0;
+      let position = 10;
+      let frames = 1;
+      const rates: number[] = [];
+      const rateWriteTimes: number[] = [];
+      const seeks: number[] = [];
+      const media: MutableMedia = {
+        currentTime: position,
+        duration: 300,
+        readyState: 4,
+        seeking: false,
+        paused: true,
+        playbackRate: 1,
+        bufferedAheadSec: 30,
+        frameEvidenceSupported: true,
+        frame: { mediaTime: position, presentedFrames: frames },
+      };
+      const controller = new VodPlaybackController({
+        clock: new MonotonicServerClock(() => now, 100_000),
+        media: {
+          read: () => ({ ...media }),
+          seek: (target) => {
+            seeks.push(target);
+            position = target;
+            media.currentTime = target;
+          },
+          play: () => {
+            media.paused = false;
+          },
+          pause: () => {
+            media.paused = true;
+          },
+          setPrimingMuted: () => undefined,
+          setPlaybackRate: (rate) => {
+            rates.push(rate);
+            media.playbackRate = rate;
+            decoderBlockedUntil = now + costMs;
+            rateWriteTimes.push(now);
+            media.readyState = 2;
+            // DOM waiting is asynchronous; notify on the next simulated event loop.
+          },
+        },
+      });
+      controller.setEnabled(true);
+      controller.acceptSnapshot({
+        revision: 1,
+        mediaId: "costly-rate-film",
+        commandKind: "seek",
+        transport: {
+          state: "playing",
+          positionSec: 10,
+          rate: 1,
+          anchoredAtServerMs: 100_000,
+        },
+      });
+      // A real seek needs 1.5 seconds to decode the first frame. No synthetic RTT
+      // error or network starvation is necessary to expose the feedback loop.
+      now = 1500;
+      position = ahead ? 12.96 : 10.04;
+      media.currentTime = position;
+      media.frame = { mediaTime: position, presentedFrames: ++frames };
+      controller.notifyMediaEvent("frame", media.frame);
+      for (let i = 1; i <= 2700; i += 1) {
+        now = 1500 + (i * 1000) / 30;
+        if (now < decoderBlockedUntil) controller.notifyMediaEvent("waiting");
+        else if (media.readyState === 2) {
+          media.readyState = 4;
+          controller.notifyMediaEvent("playing");
+        }
+        if (!media.paused && now >= decoderBlockedUntil) {
+          position += media.playbackRate / 30;
+          media.frame = { mediaTime: position, presentedFrames: ++frames };
+        }
+        media.currentTime = Math.floor(position * 10) / 10;
+        controller.notifyMediaEvent("frame", media.frame);
+      }
+      expect(rates).toEqual([ahead ? 0.95 : 1.05, 1]);
+      expect(rateWriteTimes.every((time) => time < 60_000)).toBe(true);
+      expect(seeks).toHaveLength(0);
+      expect(controller.getStatus().error).toBeNull();
+      expect(Math.abs(controller.getStatus().driftSec!)).toBeLessThan(0.5);
+      expect(media.playbackRate).toBe(1);
+    },
+  );
+
+  it("holds base rate after waiting until decoded frames and forward buffer are stable", () => {
+    const f = fixture();
+    f.controller.acceptSnapshot(f.snapshot(1, 10, "playing", 0, "seek"));
+    f.finish(10.04);
+    f.media.readyState = 2;
+    f.controller.notifyMediaEvent("waiting");
+    f.advance(6000);
+    expect(f.seek).toHaveBeenCalledTimes(1);
+    expect(f.setPlaybackRate).not.toHaveBeenCalled();
+    f.media.readyState = 4;
+    f.controller.notifyMediaEvent("playing");
+    f.advance(2000);
+    expect(f.seek).toHaveBeenCalledTimes(1);
+    expect(f.setPlaybackRate).not.toHaveBeenCalled();
+    // An explicit Host seek must still execute while automatic correction is gated.
+    f.controller.acceptSnapshot(f.snapshot(2, 80, "playing", 750, "seek"));
+    f.advance(749);
+    expect(f.seek).toHaveBeenCalledTimes(1);
+    f.advance(1);
+    expect(f.seek).toHaveBeenLastCalledWith(80);
+  });
+
+  it("bounds automatic hard seeks across intents without suppressing a later Host seek", () => {
+    const f = fixture();
+    f.controller.acceptSnapshot(f.snapshot(1, 10, "playing", 0, "seek"));
+    f.finish(10.04);
+    for (let i = 1; i <= 2700; i += 1) {
+      const seconds = i / 30;
+      f.media.currentTime = Math.max(10.04, 10 + seconds - 5);
+      f.media.seeking = false;
+      f.frame(f.media.currentTime);
+      f.advance(1000 / 30);
+      if (f.media.seeking) f.finish(f.media.currentTime + 0.04);
+    }
+    expect(f.seek).toHaveBeenCalledTimes(2);
+    const before = f.seek.mock.calls.length;
+    f.controller.acceptSnapshot(f.snapshot(2, 160, "playing", 750, "seek"));
+    f.advance(750);
+    expect(f.seek.mock.calls.length).toBe(before + 1);
+    expect(f.seek).toHaveBeenLastCalledWith(160);
+    f.finish(160.04);
+    f.controller.acceptSnapshot(f.snapshot(3, 160, "playing", 750, "seek"));
+    f.advance(750);
+    f.frame(160.08);
+    expect(f.controller.getStatus()).toMatchObject({
+      activeRevision: 3,
+      phase: "playing",
+      error: null,
+    });
+  });
+
+  it("keeps a fully buffered final 1.4 seconds playing without correction or false buffering", () => {
+    const f = fixture();
+    f.controller.acceptSnapshot(f.snapshot(1, 298.6, "playing", 0, "seek"));
+    f.finish(298.64);
+    for (let i = 1; i <= 40; i += 1) {
+      f.media.currentTime = 298.64 + i / 30;
+      f.media.bufferedAheadSec = 300 - f.media.currentTime;
+      f.frame(f.media.currentTime);
+      f.advance(1000 / 30);
+      expect(f.controller.getStatus().phase).toBe("playing");
+    }
+    expect(f.seek).toHaveBeenCalledTimes(1);
+    expect(f.setPlaybackRate).not.toHaveBeenCalled();
+  });
+
+  it.each(["low-buffer", "hidden", "pause"] as const)(
+    "restores base rate exactly once for %s and discards stale correction history",
+    (reason) => {
+      const f = fixture();
+      f.controller.acceptSnapshot(f.snapshot(1, 10, "playing", 0, "seek"));
+      f.finish(10.04);
+      for (let i = 1; i <= 120; i += 1) {
+        f.media.currentTime = Math.max(10.04, 10 + i / 30 - 0.8);
+        f.frame(f.media.currentTime);
+        f.advance(1000 / 30);
+      }
+      expect(f.media.playbackRate).toBe(1.05);
+      if (reason === "low-buffer") f.media.bufferedAheadSec = 0.05;
+      if (reason === "hidden") f.controller.setVisible(false);
+      if (reason === "pause")
+        f.controller.acceptSnapshot(
+          f.snapshot(2, f.media.currentTime, "paused"),
+        );
+      for (let i = 0; i < 10; i += 1) f.advance(100);
+      expect(f.setPlaybackRate.mock.calls.map(([rate]) => rate)).toEqual([
+        1.05, 1,
+      ]);
+      expect(f.seek).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("distinguishes initial alignment, automatic correction and explicit Host seek actions", () => {
+    const f = fixture();
+    f.controller.acceptSnapshot(f.snapshot(1, 10, "paused", 0, "seek"));
+    f.finish(10);
+    f.advance(6000);
+    f.media.currentTime = 15;
+    f.controller.tick();
+    f.finish(10);
+    f.controller.acceptSnapshot(f.snapshot(2, 30, "paused", 750, "seek"));
+    f.advance(750);
+    expect(f.onAction.mock.calls.map(([action]) => action.reason)).toEqual([
+      "alignment",
+      "automatic",
+      "explicit",
+    ]);
+  });
+
   it("keeps the explicit comparison at 1x without correcting accumulated drift", () => {
     const f = fixture({ commandOnly: true });
     f.controller.acceptSnapshot(f.snapshot(1, 10, "playing", 0, "seek"));
@@ -656,21 +879,25 @@ describe("VOD playback controller", () => {
     expect(f.seek).not.toHaveBeenCalled();
     f.media.seeking = false;
     f.controller.tick();
-    expect(f.seek).toHaveBeenCalledTimes(1);
+    expect(f.seek).not.toHaveBeenCalled();
   });
 
-  it("uses at most ten-percent rate correction and restores the authoritative rate", () => {
+  it("uses a stable five-percent rate and restores authoritative pause and speed", () => {
     const f = fixture();
     f.controller.acceptSnapshot(f.snapshot(0, 0));
     f.controller.acceptSnapshot(f.snapshot(1, 0, "playing"));
-    f.advance(2_000);
-    expect(f.media.playbackRate).toBe(1.1);
-    f.media.currentTime = 2;
-    f.controller.tick();
+    for (let i = 1; i <= 120; i += 1) {
+      f.media.currentTime = Math.max(0, i / 30 - 0.8);
+      f.frame(f.media.currentTime);
+      f.advance(1000 / 30);
+    }
+    expect(f.media.playbackRate).toBe(1.05);
+    f.controller.acceptSnapshot(f.snapshot(2, f.media.currentTime, "paused"));
     expect(f.media.playbackRate).toBe(1);
-    f.media.currentTime = 3.5;
-    f.controller.tick();
-    expect(f.media.playbackRate).toBe(0.9);
+    const faster = f.snapshot(3, f.media.currentTime, "playing");
+    faster.transport.rate = 1.5;
+    f.controller.acceptSnapshot(faster);
+    expect(f.media.playbackRate).toBe(1.5);
     expect(f.seek).not.toHaveBeenCalled();
   });
 

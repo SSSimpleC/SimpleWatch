@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import { mediaErrorMessage, vodPhaseLabel } from "../src/player-ui.js";
+import {
+  allowsVodControl,
+  DiagnosticsWriteGate,
+  playbackComparisonLabel,
+  vodSyncSummary,
+} from "../src/vod-diagnostics.js";
 
 describe("player error explanations", () => {
   it.each([
@@ -44,5 +50,37 @@ describe("player error explanations", () => {
     expect(vodPhaseLabel("seeking")).toContain("同步");
     expect(vodPhaseLabel("buffering")).toContain("缓冲");
     expect(vodPhaseLabel("error")).toContain("重试");
+  });
+});
+
+describe("VOD synchronization diagnostics", () => {
+  it("distinguishes every page-local comparison and fences native control", () => {
+    expect(playbackComparisonLabel("normal")).toBe("正常同步");
+    expect(playbackComparisonLabel("native")).toContain("不参与同步");
+    expect(playbackComparisonLabel("host-only")).toContain("固定1×");
+    expect(allowsVodControl("normal")).toBe(true);
+    expect(allowsVodControl("host-only")).toBe(true);
+    expect(allowsVodControl("native")).toBe(false);
+  });
+
+  it("reports lag and lead instead of equating playback with synchronized frames", () => {
+    expect(vodSyncSummary(1.234)).toBe("落后权威进度 1.23s，尚未同步");
+    expect(vodSyncSummary(-2.456)).toBe("超前权威进度 2.46s，尚未同步");
+    expect(vodSyncSummary(0.5)).toBe("播放位置偏差 500 ms");
+    expect(vodSyncSummary(-0.109)).toBe("播放位置偏差 -109 ms");
+    expect(vodSyncSummary(0)).not.toMatch(/成功|已同步|帧/);
+    expect(vodSyncSummary(null)).toContain("待测");
+    expect(vodSyncSummary(Number.NaN)).toContain("待测");
+  });
+
+  it("bounds diagnostic persistence to one write per second even at frame cadence", () => {
+    const gate = new DiagnosticsWriteGate();
+    let writes = 0;
+    for (let time = 0; time < 5000; time += 10)
+      if (gate.shouldWrite(time)) writes += 1;
+    expect(writes).toBe(5);
+    expect(gate.shouldWrite(Number.NaN)).toBe(false);
+    expect(gate.shouldWrite(5000)).toBe(true);
+    expect(gate.shouldWrite(5000)).toBe(false);
   });
 });

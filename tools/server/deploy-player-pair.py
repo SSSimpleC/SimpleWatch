@@ -16,8 +16,8 @@ import sys
 import time
 
 BASELINE = Path("/opt/simplewatch/releases/20260801-120900-crossmount-86930ec")
-PREVIOUS_PAIR = Path("/opt/simplewatch/releases/20261022-player-da98dd2cc28c/ops/compose.player.json")
-OLD_IMAGE = "sha256:e8f1471d98cb61902596c9d3027bbe7fb76ae537003e1b8a68b6b0b0b1981941"
+PREVIOUS_PAIR = Path("/opt/simplewatch/releases/20261023-player-d7871aaf0c31/ops/compose.player.json")
+OLD_IMAGE = "sha256:887d17f5ba6c0cea3d454eaef04a373fad68ed4ef97fa2409b7076228d4b38c5"
 release = Path(sys.argv[1]).resolve()
 if release.parent != Path("/opt/simplewatch/releases") or not re.fullmatch(r"20261023-player-[0-9a-f]{12}", release.name):
     raise RuntimeError("Unexpected release target")

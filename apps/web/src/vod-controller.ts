@@ -95,6 +95,7 @@ export interface VodStatus {
 interface SeekIntent {
   readonly id: number;
   readonly explicit: boolean;
+  readonly reason: "explicit" | "automatic" | "alignment";
   startedAtMs: number;
   attempts: number;
   issuedTargetSec: number | null;
@@ -122,6 +123,21 @@ export interface VodControllerOptions {
   readonly media: VodMediaAdapter;
   readonly clock: VodClock;
   readonly onStatus?: (status: VodStatus) => void;
+  readonly onAction?: (action: VodControllerAction) => void;
+}
+
+export interface VodControllerAction {
+  readonly kind: "seek" | "rate";
+  readonly reason:
+    | "explicit"
+    | "automatic"
+    | "alignment"
+    | "transport"
+    | "recovery"
+    | "drift";
+  readonly atMs: number;
+  readonly targetSec?: number;
+  readonly rate?: number;
 }
 
 /** All media effects pass through one controller. Call tick on the existing
@@ -138,6 +154,18 @@ export class VodPlaybackController {
   private nextIntentId = 0;
   private lastHardSeekMs = Number.NEGATIVE_INFINITY;
   private softCooldownUntilMs = 0;
+  private lastCorrectionSampleMs = Number.NEGATIVE_INFINITY;
+  private filteredDriftSec: number | null = null;
+  private correctionDirection: -1 | 0 | 1 = 0;
+  private correctionChangedAtMs = Number.NEGATIVE_INFINITY;
+  private lastRateWriteMs = Number.NEGATIVE_INFINITY;
+  private progressPosition: number | null = null;
+  private progressFrameCount: number | null = null;
+  private lastProgressMs: number | null = null;
+  private stableSinceMs: number | null = null;
+  private waitingSinceMs: number | null = null;
+  private hardDriftSinceMs: number | null = null;
+  private automaticSeekTimes: number[] = [];
   private blocked = false;
   private blockedAtMs: number | null = null;
   private error: string | null = null;
@@ -288,6 +316,15 @@ export class VodPlaybackController {
     event: VodMediaEvent,
     frame?: VodPresentedFrame,
   ): void {
+    if (event === "waiting") {
+      this.waitingSinceMs ??= this.options.clock.monotonicNowMs();
+      this.stableSinceMs = null;
+      const media = this.options.media.read();
+      this.progressPosition = this.supportsFrames(media)
+        ? (this.frame(media)?.mediaTime ?? null)
+        : media.currentTime;
+      this.progressFrameCount = this.frame(media)?.presentedFrames ?? null;
+    }
     if (
       event === "frame" &&
       frame &&
@@ -328,12 +365,19 @@ export class VodPlaybackController {
     const serverNow = this.options.clock.serverNowMs();
     const now = this.options.clock.monotonicNowMs();
     let newIntent = false;
+    let newIntentReason: SeekIntent["reason"] = "explicit";
     while (
       this.pending[0] &&
       this.pending[0].transport.anchoredAtServerMs <= serverNow
     ) {
       const applied = this.pending.shift()!;
       const first = this.active === null;
+      if (this.active && this.active.transport.rate !== applied.transport.rate)
+        this.resetCorrection(
+          this.options.media.read(),
+          applied.transport.rate,
+          now,
+        );
       this.active = applied;
       const commandKey = applied.commandId ?? `revision:${applied.revision}`;
       const explicit = ["seek", "select-vod", "restore-vod"].includes(
@@ -342,12 +386,13 @@ export class VodPlaybackController {
       if (first || (explicit && commandKey !== this.lastIntentCommandKey)) {
         this.lastIntentCommandKey = commandKey;
         newIntent = true;
+        newIntentReason = first ? "alignment" : "explicit";
       }
     }
     if (newIntent) {
       this.error = null;
       this.intent = null;
-      if (this.enabled) this.beginIntent(true);
+      if (this.enabled) this.beginIntent(true, newIntentReason);
     }
     if (this.pausedPrime) {
       if (this.pausedPrime.revision !== this.active?.revision)
@@ -373,6 +418,8 @@ export class VodPlaybackController {
       : active.transport;
     const drift = target - media.currentTime;
     if (!this.visible) {
+      this.resetCorrection(media, transport.rate, now);
+      this.resetProgress();
       this.publish("buffering", target, drift);
       return;
     }
@@ -395,43 +442,185 @@ export class VodPlaybackController {
       return;
     }
     if (media.seeking) {
+      this.resetProgress();
       this.publish("seeking", target, drift);
       return;
     }
     if (
       media.readyState < 2 ||
-      (transport.state === "playing" && media.bufferedAheadSec < 0.1)
+      (transport.state === "playing" &&
+        media.bufferedAheadSec < 0.1 &&
+        !bufferedToEnd(media))
     ) {
-      this.restoreRate(media, transport.rate);
+      this.resetCorrection(media, transport.rate, now);
+      this.resetProgress();
       this.publish("buffering", target, drift);
       return;
     }
     if (
-      this.options.comparisonMode !== "host-only" &&
-      Math.abs(drift) > (transport.state === "paused" ? 0.15 : 2) &&
-      now - this.lastHardSeekMs >= 5_000
+      transport.state === "paused" ||
+      this.options.comparisonMode === "host-only"
     ) {
-      this.beginIntent(false);
-      this.advanceIntent(media, target, drift, now);
+      this.resetCorrection(media, transport.rate, now);
+      this.resetProgress();
+      if (
+        transport.state === "paused" &&
+        this.options.comparisonMode !== "host-only" &&
+        Math.abs(drift) > 0.15 &&
+        now - this.lastHardSeekMs >= 5_000
+      ) {
+        this.beginIntent(false, "automatic");
+        this.advanceIntent(media, target, drift, now);
+        return;
+      }
+    } else if (this.correctSteadyPlayback(media, transport, target, drift, now))
       return;
-    }
-    if (
-      this.options.comparisonMode !== "host-only" &&
-      transport.state === "playing" &&
-      Math.abs(drift) > 0.15 &&
-      now >= this.softCooldownUntilMs
-    ) {
-      const adjustment = Math.max(-0.1, Math.min(0.1, drift / 10));
-      this.restoreRate(media, transport.rate * (1 + adjustment));
-    } else this.restoreRate(media, transport.rate);
     this.publish(transport.state, target, drift);
   }
 
-  private beginIntent(explicit: boolean): void {
+  /** Frame callbacks supply evidence, not a new playbackRate on every frame. */
+  private correctSteadyPlayback(
+    media: VodMediaState,
+    transport: TransportAnchor,
+    target: number,
+    drift: number,
+    now: number,
+  ): boolean {
+    const frame = this.frame(media);
+    const position = this.supportsFrames(media)
+      ? (frame?.mediaTime ?? null)
+      : media.currentTime;
+    const count = frame?.presentedFrames ?? null;
+    const advanced =
+      position !== null &&
+      this.progressPosition !== null &&
+      position > this.progressPosition + 0.001 &&
+      (!this.supportsFrames(media) || count !== this.progressFrameCount);
+    if (advanced) {
+      if (this.lastProgressMs === null || now - this.lastProgressMs > 750)
+        this.stableSinceMs = now;
+      this.lastProgressMs = now;
+      this.waitingSinceMs = null;
+      this.stableSinceMs ??= now;
+    } else if (this.lastProgressMs !== null && now - this.lastProgressMs > 750)
+      this.stableSinceMs = null;
+    this.progressPosition = position;
+    this.progressFrameCount = count;
+    const ending =
+      bufferedToEnd(media) && media.duration - media.currentTime <= 1.5;
+    const sufficientBuffer =
+      media.readyState >= 3 && (media.bufferedAheadSec >= 1.5 || ending);
+    const prolongedWait =
+      this.waitingSinceMs !== null && now - this.waitingSinceMs >= 1000;
+    const stalled =
+      this.lastProgressMs !== null && now - this.lastProgressMs >= 1000;
+    if (!sufficientBuffer || prolongedWait || stalled) {
+      // A rate change itself can briefly emit waiting. Do not immediately undo
+      // it and cause a second decoder/audio restart; low buffer is not exempt.
+      const ownShortRecovery =
+        media.readyState >= 2 &&
+        media.bufferedAheadSec >= 1.5 &&
+        now - this.lastRateWriteMs < 1000;
+      if (!ownShortRecovery) this.resetCorrection(media, transport.rate, now);
+      this.stableSinceMs = null;
+      this.hardDriftSinceMs = null;
+      this.publish("buffering", target, drift);
+      return true;
+    }
+    if (ending) {
+      // A fully buffered short tail is healthy playback, not network starvation.
+      // Do not initiate another catch-up just before the native ended event.
+      this.resetCorrection(media, transport.rate, now);
+      this.hardDriftSinceMs = null;
+      return false;
+    }
+    if (
+      this.waitingSinceMs !== null ||
+      this.stableSinceMs === null ||
+      now - this.stableSinceMs < 1500 ||
+      now < this.softCooldownUntilMs
+    ) {
+      this.hardDriftSinceMs = null;
+      return false;
+    }
+    if (now - this.lastCorrectionSampleMs < 500) return false;
+    this.lastCorrectionSampleMs = now;
+    this.filteredDriftSec =
+      this.filteredDriftSec === null
+        ? drift
+        : this.filteredDriftSec * 0.5 + drift * 0.5;
+    const filtered = this.filteredDriftSec;
+    if (Math.abs(filtered) > 4) this.hardDriftSinceMs ??= now;
+    else this.hardDriftSinceMs = null;
+    this.automaticSeekTimes = this.automaticSeekTimes.filter(
+      (at) => now - at < 120_000,
+    );
+    if (
+      this.hardDriftSinceMs !== null &&
+      now - this.hardDriftSinceMs >= 3000 &&
+      now - this.lastHardSeekMs >= 30_000 &&
+      this.automaticSeekTimes.length === 0
+    ) {
+      this.automaticSeekTimes.push(now);
+      this.beginIntent(false, "automatic");
+      this.advanceIntent(media, target, drift, now);
+      return true;
+    }
+    if (now - this.correctionChangedAtMs < 2000) return false;
+    let direction = this.correctionDirection;
+    // The wide hysteresis includes a 200–300ms decoder restart cost when the
+    // rate returns to 1x; otherwise returning to normal starts another cycle.
+    if (direction === 0 && Math.abs(filtered) > 0.45)
+      direction = filtered > 0 ? 1 : -1;
+    else if (
+      (direction === 1 && filtered <= 0.05) ||
+      (direction === -1 && filtered >= -0.05)
+    )
+      direction = 0;
+    if (direction !== this.correctionDirection) {
+      this.correctionDirection = direction;
+      this.correctionChangedAtMs = now;
+      this.restoreRate(media, transport.rate * (1 + direction * 0.05), "drift");
+    }
+    return false;
+  }
+
+  private resetProgress(): void {
+    this.progressPosition = null;
+    this.progressFrameCount = null;
+    this.lastProgressMs = null;
+    this.stableSinceMs = null;
+    this.waitingSinceMs = null;
+    this.hardDriftSinceMs = null;
+  }
+
+  private resetCorrection(
+    media: VodMediaState,
+    baseRate: number,
+    now: number,
+  ): void {
+    this.correctionDirection = 0;
+    this.filteredDriftSec = null;
+    this.lastCorrectionSampleMs = now;
+    this.correctionChangedAtMs = now;
+    this.restoreRate(media, baseRate, "recovery");
+  }
+
+  private beginIntent(
+    explicit: boolean,
+    reason: SeekIntent["reason"] = explicit ? "explicit" : "alignment",
+  ): void {
     const media = this.options.media.read();
+    this.resetCorrection(
+      media,
+      this.active?.transport.rate ?? 1,
+      this.options.clock.monotonicNowMs(),
+    );
+    this.resetProgress();
     this.intent = {
       id: ++this.nextIntentId,
       explicit,
+      reason,
       startedAtMs: this.options.clock.monotonicNowMs(),
       attempts: 0,
       issuedTargetSec: null,
@@ -559,6 +748,7 @@ export class VodPlaybackController {
     const tolerance = transport.state === "paused" ? 0.15 : 2;
     if (
       this.options.comparisonMode !== "host-only" &&
+      intent.explicit &&
       Math.abs(drift) > tolerance
     ) {
       if (intent.attempts < 2 && !media.seeking) {
@@ -574,6 +764,8 @@ export class VodPlaybackController {
     this.frameVerified = frameEvidence;
     this.stopPausedPrime();
     this.softCooldownUntilMs = now + 2_000;
+    this.resetCorrection(media, transport.rate, now);
+    this.resetProgress();
     this.restoreRate(media, transport.rate);
     this.publish(transport.state, target, drift);
   }
@@ -595,6 +787,12 @@ export class VodPlaybackController {
     this.lastHardSeekMs = now;
     this.restoreRate(media, this.active!.transport.rate);
     try {
+      this.options.onAction?.({
+        kind: "seek",
+        reason: intent.reason,
+        atMs: now,
+        targetSec: target,
+      });
       this.options.media.seek(target);
     } catch {
       this.error = "seek-request-failed";
@@ -667,9 +865,24 @@ export class VodPlaybackController {
     }
   }
 
-  private restoreRate(media: VodMediaState, rate: number): void {
-    if (Math.abs(media.playbackRate - rate) > 0.001)
+  private restoreRate(
+    media: VodMediaState,
+    rate: number,
+    reason: VodControllerAction["reason"] = "transport",
+  ): void {
+    if (
+      Math.abs(media.playbackRate - rate) > 0.001 &&
+      Math.abs(this.options.media.read().playbackRate - rate) > 0.001
+    ) {
+      this.lastRateWriteMs = this.options.clock.monotonicNowMs();
+      this.options.onAction?.({
+        kind: "rate",
+        reason,
+        atMs: this.lastRateWriteMs,
+        rate,
+      });
       this.options.media.setPlaybackRate(rate);
+    }
   }
 
   private stopPausedPrime(): void {
@@ -730,6 +943,13 @@ export class VodPlaybackController {
     this.playPending = false;
     this.lastHardSeekMs = Number.NEGATIVE_INFINITY;
     this.softCooldownUntilMs = 0;
+    this.lastCorrectionSampleMs = Number.NEGATIVE_INFINITY;
+    this.filteredDriftSec = null;
+    this.correctionDirection = 0;
+    this.correctionChangedAtMs = Number.NEGATIVE_INFINITY;
+    this.lastRateWriteMs = Number.NEGATIVE_INFINITY;
+    this.automaticSeekTimes = [];
+    this.resetProgress();
     this.presentedFrame = null;
     this.frameVerified = false;
     this.lastIntentCommandKey = null;
@@ -783,6 +1003,14 @@ function atMediaEnd(media: VodMediaState, target: number): boolean {
     media.duration > 0 &&
     target >= media.duration - 0.01 &&
     media.currentTime >= media.duration - 0.01
+  );
+}
+
+function bufferedToEnd(media: VodMediaState): boolean {
+  return (
+    Number.isFinite(media.duration) &&
+    media.duration > 0 &&
+    media.currentTime + media.bufferedAheadSec >= media.duration - 0.02
   );
 }
 

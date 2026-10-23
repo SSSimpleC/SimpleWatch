@@ -41,6 +41,13 @@ import {
   type VodMediaEvent,
 } from "../vod-controller.js";
 import { mediaErrorMessage, vodPhaseLabel } from "../player-ui.js";
+import {
+  allowsVodControl,
+  DiagnosticsWriteGate,
+  playbackComparisonLabel,
+  vodSyncSummary,
+  type PlaybackComparison,
+} from "../vod-diagnostics.js";
 export { classifyViewerHealth, type LiveViewerStats } from "../live-stats.js";
 import { averageBitrateMbps, isHighLoadVod } from "../media-performance.js";
 import { loadPreferences, savePreferences } from "../preferences.js";
@@ -58,8 +65,6 @@ import {
 import { useSession } from "../store.js";
 import { DepartureDecisionDialog } from "./room/DepartureDecisionDialog.js";
 import { HostProgramQueue } from "./room/HostProgramQueue.js";
-
-type PlaybackComparison = "normal" | "native" | "host-only";
 
 export function RoomPage() {
   const { roomId = "" } = useParams();
@@ -104,6 +109,7 @@ export function RoomPage() {
     presentedFrames: number;
   } | null>(null);
   const frameGenerationRef = useRef(0);
+  const frameObservedAtMsRef = useRef<number | null>(null);
   const frameCancelRef = useRef<(() => void) | null>(null);
   const frameModeRef = useRef<RoomSnapshot["mode"] | null>(null);
   const roomIdRef = useRef(roomId);
@@ -120,6 +126,17 @@ export function RoomPage() {
   const lastVodUiRef = useRef(0);
   const commandQueueRef = useRef<RoomCommandQueue | null>(null);
   const traceRef = useRef<Array<Record<string, string | number | null>>>([]);
+  const traceDirtyRef = useRef(false);
+  const traceWriteGateRef = useRef(new DiagnosticsWriteGate());
+  const diagnosticsWriteGateRef = useRef(new DiagnosticsWriteGate());
+  const vodEffectsRef = useRef({
+    seekWrites: 0,
+    rateWrites: 0,
+    explicitSeeks: 0,
+    automaticSeeks: 0,
+    alignmentSeeks: 0,
+    lastAction: null as string | null,
+  });
   const stallCountRef = useRef(0);
   const seekingRef = useRef(false);
   const seekDraftRef = useRef<number | null>(null);
@@ -245,6 +262,10 @@ export function RoomPage() {
     liveRetryBlockedRef.current = false;
     liveRecoveryRef.current = new LiveFreezeRecovery();
     traceRef.current = [];
+    traceDirtyRef.current = false;
+    traceWriteGateRef.current = new DiagnosticsWriteGate();
+    diagnosticsWriteGateRef.current = new DiagnosticsWriteGate();
+    resetVodEffectCounters();
     playbackComparisonRef.current = "normal";
     setPlaybackComparison("normal");
     setJoined(false);
@@ -585,7 +606,11 @@ export function RoomPage() {
       if (socket?.readyState === WebSocket.OPEN) scheduleClockBurst(socket, 3);
     }, 30_000);
     const recalibrate = () => {
-      getVodController().setVisible(document.visibilityState !== "hidden");
+      if (
+        latestSnapshotRef.current?.mode === "vod" &&
+        allowsVodControl(playbackComparisonRef.current)
+      )
+        getVodController().setVisible(document.visibilityState !== "hidden");
       if (document.visibilityState === "hidden") {
         liveRecoveryRef.current.shouldRecover({
           generation: liveReaderGenerationRef.current,
@@ -636,6 +661,7 @@ export function RoomPage() {
     const timer = window.setInterval(() => {
       commandQueueRef.current?.tick();
       if (latestSnapshotRef.current?.mode === "vod") reconcileVod("periodic");
+      persistPlayerTrace();
     }, 250);
     return () => window.clearInterval(timer);
   }, [joined, roomId]);
@@ -656,6 +682,7 @@ export function RoomPage() {
     const sourceObject = video?.srcObject;
     frameModeRef.current = mode ?? null;
     frameRef.current = null;
+    frameObservedAtMsRef.current = null;
     liveHasFrameRef.current = false;
     if (
       !video ||
@@ -681,6 +708,7 @@ export function RoomPage() {
         mediaTime: metadata.mediaTime,
         presentedFrames: metadata.presentedFrames,
       };
+      frameObservedAtMsRef.current = performance.now();
       if (
         latestSnapshotRef.current?.mode === "vod" &&
         playbackComparisonRef.current !== "native"
@@ -761,6 +789,7 @@ export function RoomPage() {
     event: string,
     commandId?: string,
     revision?: number,
+    details: Record<string, string | number | null> = {},
   ) {
     const current = latestSnapshotRef.current;
     traceRef.current = [
@@ -775,16 +804,57 @@ export function RoomPage() {
         targetSec: vodStatusRef.current?.targetSec ?? null,
         presentedTimeSec: frameRef.current?.mediaTime ?? null,
         connectionGeneration: socketGenerationRef.current,
+        ...(current?.mode === "vod"
+          ? {
+              comparisonMode: playbackComparisonRef.current,
+              playbackRate: videoRef.current?.playbackRate ?? null,
+              bufferedAheadSec: videoRef.current
+                ? round(bufferedAhead(videoRef.current), 2)
+                : null,
+              readyState: videoRef.current?.readyState ?? null,
+              presentedFrames: frameRef.current?.presentedFrames ?? null,
+              frameAgeMs:
+                frameObservedAtMsRef.current === null
+                  ? null
+                  : Math.round(
+                      performance.now() - frameObservedAtMsRef.current,
+                    ),
+            }
+          : {}),
+        ...details,
       },
     ];
+    traceDirtyRef.current = true;
+    persistPlayerTrace();
+  }
+
+  function persistPlayerTrace() {
+    if (!traceDirtyRef.current) return;
+    if (
+      latestSnapshotRef.current?.mode === "vod" &&
+      !traceWriteGateRef.current.shouldWrite(performance.now())
+    )
+      return;
     try {
       sessionStorage.setItem(
         "simplewatch.playback-trace",
         JSON.stringify(traceRef.current),
       );
+      traceDirtyRef.current = false;
     } catch {
       /* Diagnostics must not prevent playback when storage is unavailable. */
     }
+  }
+
+  function resetVodEffectCounters() {
+    vodEffectsRef.current = {
+      seekWrites: 0,
+      rateWrites: 0,
+      explicitSeeks: 0,
+      automaticSeeks: 0,
+      alignmentSeeks: 0,
+      lastAction: null,
+    };
   }
 
   function getCommandQueue(): RoomCommandQueue {
@@ -898,6 +968,8 @@ export function RoomPage() {
       frameCancelRef.current?.();
       frameGenerationRef.current += 1;
       frameRef.current = null;
+      frameObservedAtMsRef.current = null;
+      resetVodEffectCounters();
       vodControllerRef.current?.reset();
       seekDraftRef.current = null;
       seekingRef.current = false;
@@ -936,6 +1008,22 @@ export function RoomPage() {
       comparisonMode:
         playbackComparisonRef.current === "host-only" ? "host-only" : "normal",
       clock: serverClockRef.current,
+      onAction: (action) => {
+        const effects = vodEffectsRef.current;
+        effects.lastAction = `${action.kind}:${action.reason}`;
+        if (action.kind === "seek") {
+          if (action.reason === "explicit") effects.explicitSeeks += 1;
+          if (action.reason === "automatic") effects.automaticSeeks += 1;
+          if (action.reason === "alignment") effects.alignmentSeeks += 1;
+        }
+        recordPlayerEvent("controller-action", undefined, undefined, {
+          actionKind: action.kind,
+          actionReason: action.reason,
+          actionAtMs: action.atMs,
+          requestedTargetSec: action.targetSec ?? null,
+          requestedRate: action.rate ?? null,
+        });
+      },
       media: {
         read: () => {
           const video = videoRef.current;
@@ -956,11 +1044,21 @@ export function RoomPage() {
         seek: (seconds) => {
           const video = videoRef.current;
           if (!video) throw new Error("video-element-unavailable");
-          recordPlayerEvent("seek-requested");
+          vodEffectsRef.current.seekWrites += 1;
+          recordPlayerEvent("seek-requested", undefined, undefined, {
+            requestedTargetSec: seconds,
+          });
           video.currentTime = seconds;
         },
         setPlaybackRate: (rate) => {
-          if (videoRef.current) videoRef.current.playbackRate = rate;
+          const video = videoRef.current;
+          if (!video) return;
+          vodEffectsRef.current.rateWrites += 1;
+          recordPlayerEvent("rate-requested", undefined, undefined, {
+            previousRate: video.playbackRate,
+            requestedRate: rate,
+          });
+          video.playbackRate = rate;
         },
         play: () => videoRef.current?.play(),
         pause: () => videoRef.current?.pause(),
@@ -1208,7 +1306,6 @@ export function RoomPage() {
   }
 
   function reconcileVod(event: string) {
-    if (playbackComparisonRef.current === "native") return;
     const video = videoRef.current;
     const currentSnapshot = latestSnapshotRef.current;
     const transport = currentSnapshot?.transport;
@@ -1220,9 +1317,28 @@ export function RoomPage() {
       video.dataset.mediaId !== currentSnapshot.media.id
     )
       return;
+    const events: Record<string, VodMediaEvent> = {
+      "loaded-metadata": "loadedmetadata",
+      "loaded-data": "loadeddata",
+      seeking: "seeking",
+      seeked: "seeked",
+      waiting: "waiting",
+      playing: "playing",
+      error: "error",
+    };
+    const mediaEvent = events[event];
+    if (mediaEvent || event === "can-play")
+      recordPlayerEvent(`media-${mediaEvent ?? "canplay"}`);
+    if (!allowsVodControl(playbackComparisonRef.current)) {
+      if (event !== "periodic") writeProgramDiagnostics(video, event);
+      return;
+    }
     const controller = getVodController();
     if (document.visibilityState === "hidden") controller.setVisible(false);
     if (!programEnabledRef.current) controller.setEnabled(false);
+    // A repeated snapshot can run tick(). Mark waiting before that call, or
+    // automatic correction could seek once before the recovery guard is set.
+    if (mediaEvent === "waiting") controller.notifyMediaEvent("waiting");
     controller.acceptSnapshot({
       revision: currentSnapshot.revision,
       mediaId: currentSnapshot.media.id,
@@ -1236,20 +1352,9 @@ export function RoomPage() {
     });
     controller.setVisible(document.visibilityState !== "hidden");
     controller.setEnabled(programEnabledRef.current);
-    const events: Record<string, VodMediaEvent> = {
-      "loaded-metadata": "loadedmetadata",
-      "loaded-data": "loadeddata",
-      seeking: "seeking",
-      seeked: "seeked",
-      waiting: "waiting",
-      playing: "playing",
-      error: "error",
-    };
-    const mediaEvent = events[event];
-    if (mediaEvent) {
-      recordPlayerEvent(`media-${mediaEvent}`);
+    if (mediaEvent && mediaEvent !== "waiting") {
       controller.notifyMediaEvent(mediaEvent);
-    } else controller.tick();
+    } else if (!mediaEvent) controller.tick();
     if (event !== "periodic") writeProgramDiagnostics(video, event);
   }
 
@@ -1667,6 +1772,7 @@ export function RoomPage() {
     vodControllerRef.current?.setEnabled(false);
     vodControllerRef.current?.reset();
     vodControllerRef.current = null;
+    resetVodEffectCounters();
     playbackComparisonRef.current = mode;
     programEnabledRef.current = false;
     setProgramEnabled(false);
@@ -1690,6 +1796,12 @@ export function RoomPage() {
     event: string,
     buffered = bufferedAhead(video),
   ) {
+    const current = latestSnapshotRef.current;
+    if (
+      current?.mode === "vod" &&
+      !diagnosticsWriteGateRef.current.shouldWrite(performance.now())
+    )
+      return;
     try {
       const quality = video.getVideoPlaybackQuality?.();
       sessionStorage.setItem(
@@ -1697,7 +1809,7 @@ export function RoomPage() {
         JSON.stringify({
           updatedAt: new Date().toISOString(),
           event,
-          mode: snapshot?.mode ?? "idle",
+          mode: current?.mode ?? "idle",
           codec: media.data?.video.codec ?? null,
           resolution:
             media.data?.video.width && media.data.video.height
@@ -1713,6 +1825,20 @@ export function RoomPage() {
           muted: video.muted,
           volume: video.volume,
           playbackRate: video.playbackRate,
+          ...(current?.mode === "vod"
+            ? {
+                effects: vodEffectsRef.current,
+                positionDriftSec: vodStatusRef.current?.driftSec ?? null,
+                presentedTimeSec: frameRef.current?.mediaTime ?? null,
+                frameAgeMs:
+                  frameObservedAtMsRef.current === null
+                    ? null
+                    : Math.round(
+                        performance.now() - frameObservedAtMsRef.current,
+                      ),
+                readyStateMeaning: "2=仅当前数据，3=未来数据，4=足够数据",
+              }
+            : {}),
           stalls: stallCountRef.current,
           droppedFrames: quality?.droppedVideoFrames ?? null,
           totalFrames: quality?.totalVideoFrames ?? null,
@@ -1937,7 +2063,7 @@ export function RoomPage() {
           )}
           {snapshot?.mode === "vod" && highLoadVod && media.data && (
             <div className="program-warning high-load-warning" role="status">
-              <strong>高负载原片</strong>
+              <strong>原片播放提示</strong>
               <span>
                 {media.data.video.width ?? "?"}×{media.data.video.height ?? "?"}{" "}
                 · {bitrateMbps.toFixed(1)}
@@ -1946,9 +2072,8 @@ export function RoomPage() {
               <span>
                 当前 {onlinePlaybackEndpoints} 个在线端理论聚合约{" "}
                 {aggregateBitrateMbps.toFixed(1)}{" "}
-                Mbps。服务器不会转码；若主持端卡顿而其他端流畅，通常是该终端的网络或
-                {media.data.video.codec === "hevc" ? " H.265 硬件解码" : "解码"}
-                能力不足。
+                Mbps。服务器不会转码。单端卡顿需要分别核对缓冲、解码和同步控制动作，
+                不能仅凭设备差异认定硬件不足，也不能仅凭 RTT 判断播放是否流畅。
               </span>
             </div>
           )}
@@ -2014,6 +2139,16 @@ export function RoomPage() {
               onProgress={(event) =>
                 updateProgramMetrics(event.currentTarget, "progress")
               }
+              onRateChange={(event) => {
+                recordPlayerEvent("rate-observed");
+                writeProgramDiagnostics(event.currentTarget, "rate-change");
+              }}
+              onStalled={(event) => {
+                // A stalled download can coexist with playable buffered data.
+                // Observe it; only waiting invokes playback recovery protection.
+                recordPlayerEvent("media-stalled");
+                writeProgramDiagnostics(event.currentTarget, "stalled");
+              }}
               onPlaying={(event) => {
                 updateProgramMetrics(event.currentTarget, "playing");
                 reconcileVod("playing");
@@ -2215,6 +2350,15 @@ export function RoomPage() {
                   ? "原生对照：请点击视频原生播放按钮，不接收房间播放控制。"
                   : vodPhaseLabel(vodStatus?.phase)}
               </span>
+              <span>
+                {" · "}当前模式：{playbackComparisonLabel(playbackComparison)}
+              </span>
+              {playbackComparison !== "native" && (
+                <span>
+                  {" · "}
+                  {vodSyncSummary(vodStatus?.driftSec)}
+                </span>
+              )}
               {vodStatus?.frameEvidence === "unavailable" && (
                 <small>此浏览器未提供逐帧证据，同步状态需结合画面确认。</small>
               )}
@@ -2251,6 +2395,11 @@ export function RoomPage() {
                   仅当前页面生效，刷新恢复正常；切换后请手动点击播放或启用节目声音。媒体会话、观影权限、签名和
                   Range 鉴权保持不变。
                 </p>
+                <p>
+                  SYNC =
+                  权威播放位置减本机播放位置，正数表示落后、负数表示超前；RTT =
+                  控制消息往返时间。正在播放不等于已经同步，数值也不代替实际画面验收。
+                </p>
                 {playbackComparison === "host-only" && (
                   <p role="status">
                     固定1×对照已启用：只做初次对齐和Host明确跳转；关闭速度微调、漂移自动定位、自动补偿及静音解码恢复。请Host保持1×。此模式允许偏差积累，不作为同步验收通过。
@@ -2260,6 +2409,17 @@ export function RoomPage() {
                   本机音频/速度：静音 {videoRef.current?.muted ? "是" : "否"} ·
                   音量 {Math.round((videoRef.current?.volume ?? 0) * 100)}% ·
                   实际倍速 {videoRef.current?.playbackRate.toFixed(3) ?? "—"}×
+                </p>
+                <p>
+                  本模式操作计数：速度写入 {vodEffectsRef.current.rateWrites} ·
+                  定位写入 {vodEffectsRef.current.seekWrites}（明确指令{" "}
+                  {vodEffectsRef.current.explicitSeeks} / 自动纠偏{" "}
+                  {vodEffectsRef.current.automaticSeeks} / 初次对齐{" "}
+                  {vodEffectsRef.current.alignmentSeeks}）
+                </p>
+                <p>
+                  最近操作 {vodEffectsRef.current.lastAction ?? "无"} · 前方缓冲{" "}
+                  {bufferedAheadSec.toFixed(2)}s
                 </p>
               </div>
             )}

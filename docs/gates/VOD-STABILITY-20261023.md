@@ -93,3 +93,5 @@ WebKit [Bug 163433](https://bugs.webkit.org/show_bug.cgi?id=163433) 有 iOS 调�
 北京时间 2026-10-23 16:22:43 最后只读预检仍为 `quiet=false`、活动房间 1 个，其他写入/处理/直播计数为 0；线上 App/Worker 仍为 `887d17f5…`。遵照不能中断现有房间的边界，本轮不执行远端构建或重启发布，不关闭/修改房间。快照保存于 `output/playwright/vod-stability-cloud-final-20261023.json`。
 
 下一次恢复先确认房间空闲，然后从干净本地提交生成/核对候选包，按当前配对脚本验证、备份并只更新 App/Worker；成功上线前，用户刷新仍会拿到旧控制器。没有证据前不得将真实 iPhone/iPad 稳定性或 OBS 标为完成。
+
+本地应用提交：`3c2509a`；未推送、未合并。已从干净提交生成 126 文件的 production 候选包（仅标记构建来源，不表示已部署）：`artifacts/releases/20261023-player-389c88e47253-bPzV0k/20261023-player-389c88e47253.tar.gz`。源码清单 SHA-256 为 `389c88e47253260f1cd5c29be5fa40eedc649de2bd19731e14eacfdff0c2b26f`，归档 SHA-256 为 `f8f270f62b081cfb3c0b5a3b67b27dfd7d41dfd8708317d33c7e00c1ab13cb99`。没有上传该候选包，也没有构建/切换其云端镜像。

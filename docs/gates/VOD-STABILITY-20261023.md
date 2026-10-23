@@ -43,7 +43,7 @@ WebKit [Bug 163433](https://bugs.webkit.org/show_bug.cgi?id=163433) 有 iOS 调�
 
 ## 状态
 
-本地修复与完整回归已通过，发布前仍需确认房间空闲。未发布这一轮修复，未修改线上影片/数据库/账户，未开始 OBS。
+本地修复与完整回归已通过。用户关闭房间并授权发布后，2026-10-23 16:37:04（北京时间）已在确认空闲的前提下仅更新 App/Worker，公网资源与鉴权复核通过。账户、影片清单和数据库结构未变。真实 iPhone/iPad 连续播放验收仍待用户执行，未开始 OBS；详细发布回执见文末。
 
 ## 已落地的修复
 
@@ -92,6 +92,28 @@ WebKit [Bug 163433](https://bugs.webkit.org/show_bug.cgi?id=163433) 有 iOS 调�
 
 北京时间 2026-10-23 16:22:43 最后只读预检仍为 `quiet=false`、活动房间 1 个，其他写入/处理/直播计数为 0；线上 App/Worker 仍为 `887d17f5…`。遵照不能中断现有房间的边界，本轮不执行远端构建或重启发布，不关闭/修改房间。快照保存于 `output/playwright/vod-stability-cloud-final-20261023.json`。
 
-下一次恢复先确认房间空闲，然后从干净本地提交生成/核对候选包，按当前配对脚本验证、备份并只更新 App/Worker；成功上线前，用户刷新仍会拿到旧控制器。没有证据前不得将真实 iPhone/iPad 稳定性或 OBS 标为完成。
+上述 16:22 的阻断要求下一次恢复先确认房间空闲，然后从干净本地提交生成/核对候选包，按配对脚本验证、备份并只更新 App/Worker。该条件已在下述发布中满足；没有证据前仍不得将真实 iPhone/iPad 稳定性或 OBS 标为完成。
 
-本地应用提交：`3c2509a`；未推送、未合并。已从干净提交生成 126 文件的 production 候选包（仅标记构建来源，不表示已部署）：`artifacts/releases/20261023-player-389c88e47253-bPzV0k/20261023-player-389c88e47253.tar.gz`。源码清单 SHA-256 为 `389c88e47253260f1cd5c29be5fa40eedc649de2bd19731e14eacfdff0c2b26f`，归档 SHA-256 为 `f8f270f62b081cfb3c0b5a3b67b27dfd7d41dfd8708317d33c7e00c1ab13cb99`。没有上传该候选包，也没有构建/切换其云端镜像。
+本地应用提交：`3c2509a`；未推送、未合并。已从干净提交生成 126 文件的 production 候选包：`artifacts/releases/20261023-player-389c88e47253-bPzV0k/20261023-player-389c88e47253.tar.gz`。源码清单 SHA-256 为 `389c88e47253260f1cd5c29be5fa40eedc649de2bd19731e14eacfdff0c2b26f`，归档 SHA-256 为 `f8f270f62b081cfb3c0b5a3b67b27dfd7d41dfd8708317d33c7e00c1ab13cb99`。16:22 收尾时尚未上传或构建，之后按下述授权完成发布。
+
+## 2026-10-23 空闲维护发布回执
+
+用户明确告知房间已关闭，并授权检查空闲后发布。独立只读审计确认候选 126 个源文件与当前工作区、`3c2509a` 提交及归档逐一一致；后续 `3f9fe4a` 仅为文档提交，没有应用源码漂移。
+
+- 发布前再次检查：活动房间、上传、预留上传空间、媒体/Outbox/Agent/传输/淘汰任务、直播、语音、SFTP 写入、可写媒体文件描述符均为 0；唯一 Worker 为 idle，六个容器状态正常。
+- 远端构建限制为 0.6 CPU、1GiB 内存；镜像内 Node `24.18.0`、Fastify `5.12.7`、FFmpeg `5.1.9-0+deb12u1` 与预期一致，未执行任何媒体转码。
+- 发布目录：`/opt/simplewatch/releases/20261023-player-389c88e47253`。
+- 新 App/Worker 镜像：`sha256:aaa92b1d87d952687468eaeef163633823fdcc6c517544d7c44e325369aed54e`。
+- 切换完成时间：2026-10-23 16:37:04（北京时间）。App/Worker 均 healthy，公网 `/health/ready` 为 ready。
+- 仅 Compose 中两项 image 发生变化；Caddy、tusd、MediaMTX、LiveKit 的容器 ID 和完整配置哈希均与维护前一致。六个容器 restart=0、OOM=false。
+- 一致性 SQLite 备份仅留在云端 `ops/predeploy.sqlite3`，完整性和外键检查通过，未复制到本地。12 项迁移校验和未变，accounts/media/subtitles/schema_migrations 保护清单哈希相同；仍为 6 个账户、2 条影片。
+- 严格 TLS 公网校验：7 个静态资源字节哈希与新容器内文件一致，包含新稳定性诊断标记；HSTS 和 nosniff 正常。4 个未认证 API/媒体请求仍返回 401 `UNAUTHORIZED`，没有放开鉴权。
+- 发布后最终快照仍为空闲，未启动 OBS、未修改家庭服务器或硬盘；没有推送或合并 Git。
+
+运行时的完整栈指针仍为 `/opt/simplewatch/releases/20260801-120900-crossmount-86930ec`，**不能单独用该旧 Compose 重建容器**。本次有效配置包括原基线、`20261023-player-d7871aaf0c31/ops/compose.player.json` 和新的 `20261023-player-389c88e47253/ops/compose.player.json`。后续维护以新目录 `ops/deployed.json` 的 `maintenanceCommand` 为准；下一轮发布必须先识别当前新镜像，不能直接复用仍断言上一版镜像的本轮脚本。
+
+已保留上一版 `sha256:887d17f5ba6c0cea3d454eaef04a373fad68ed4ef97fa2409b7076228d4b38c5` 和 d787 配对覆盖文件，回滚命令记入 `ops/deployed.json`。回滚仅重建 App/Worker，不恢复数据库、不回滚影片、不改变另外四个容器。
+
+本地证据：`artifacts/releases/20261023-player-389c88e47253-bPzV0k/` 中的 `build-cloud.log`、`deploy-cloud.log`、`tooling-manifest.json`、`before.json`、`inventory-before.json`、`runtime-check.json`、`deployed.json`、`final-snapshot.json`、`runtime-state.txt` 和 `public-smoke.json`。未把云端数据库、环境变量或凭据复制到这些证据中。
+
+真机验收仍待进行：Mac、iPhone、iPad 刷新后进入同一房间，确认「正常同步」而非 A/B 对照模式，先以 1× 连续播放 1–2 分钟，再验证 Host 向前/向后拖动。检查音画连续性、SYNC 是否持续扩大和自动定位/调速操作次数；部署成功和桌面 WebKit 通过不代表真实 iOS 问题已经解决。

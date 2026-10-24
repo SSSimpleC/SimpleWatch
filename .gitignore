@@ -10,6 +10,7 @@ coverage/
 playwright-report/
 test-results/
 output/playwright/
+output/availability-*/
 .local/
 .serena/
 .env.local

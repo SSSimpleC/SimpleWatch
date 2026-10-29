@@ -49,7 +49,7 @@ tools/environment/run-dev pnpm verify
 - [家庭片库按需传输运行手册](docs/operations/EDGE-MEDIA-PIPELINE.md)
 - [P0–P9 门禁矩阵](docs/gates/P0-P9-GATE-MATRIX.md)
 - [正式部署前测试用例](tests/docs/PREDEPLOY-TEST-CASES.md)
-- [语音频道改造与验收](docs/gates/VOICE-CHANNEL-20261026.md)（开发中，未发布；真机与持续容量待验收）
+- [语音频道改造与验收](docs/gates/VOICE-CHANNEL-20261026.md)（2026-10-29候选版已上线；原声单声道、Apple真机与30分钟通话待验收）
 
 ## 安全说明
 
@@ -61,4 +61,4 @@ tools/environment/run-dev pnpm verify
 
 这是点播正常播放链路的阶段验收，不代表全部功能或可用性已完成：退出/关房后的旧媒体请求、API 等待超时及跨标签页鉴权一致性仍待处理，Mac 间歇访问困难尚未完整定因；真实 OBS 直播也未验收。本轮里程碑归档只更新文档与本地诊断目录忽略规则，不改应用运行逻辑或线上服务。
 
-历史服务器 IP 阶段记录不代表当前语音分支已经完整通过或上线。当前版本的自动化、Apple 真机、持续容量与发布状态分别以[语音验收记录](docs/gates/VOICE-CHANNEL-20261026.md)和[P0–P9 门禁矩阵](docs/gates/P0-P9-GATE-MATRIX.md)为准；正式域名、可信证书与 TURN 等历史规划不属于本轮新增实施范围。
+语音候选版已获用户授权并于2026-10-29仅配对更新App/Worker；候选上线不代表Apple真机和持续容量已验收。当前版本的自动化、真机与发布状态分别以[语音验收记录](docs/gates/VOICE-CHANNEL-20261026.md)和[P0–P9 门禁矩阵](docs/gates/P0-P9-GATE-MATRIX.md)为准；正式域名、可信证书与 TURN 等历史规划不属于本轮新增实施范围。

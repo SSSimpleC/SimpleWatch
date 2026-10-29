@@ -1,10 +1,34 @@
 # 语音频道改造与验收 — 2026-10-26
 
-状态：候选版已获发布授权，准备上线。原声单声道、Apple 真机听感及五人30分钟通话移至上线后验收，不标记为已通过。
+状态：候选版已于2026-10-29 11:11（Asia/Shanghai）上线。原声单声道、Apple 真机听感及五人30分钟通话移至上线后验收，不标记为已通过。
+
+## 候选发布记录 — 2026-10-29
+
+- 应用提交：`535024fa2261a98bb1b75b5320e2a4b26f1205c4`，分支 `feat/voice-channel-20261026`。
+- 发布目录：`/opt/simplewatch/releases/20261029-voice-f6f70839b872`；线上构建标识为 `f6f70839b872a062e40425da79c96a46a3ba9f8d2aa5955091745aec11d98c5c`。
+- 线上标识散列完整发布清单，本地无清单构建标识 `f4a319ed…` 散列前端相关源码。打包前重新计算后者与已通过回归的本地构建完全一致；144个源码文件在云端逐项SHA-256校验通过，不能混淆两个摘要口径。
+- 镜像：`sha256:3d1e86378caebe5bd0a7e2c77a107930c1b028b71e977abc6af99b2007e371ec`。构建限制1核CPU、1536MiB内存，没有重复整套测试。
+- 切换前两次完整空闲检查通过：房间、上传、各类处理/转运/清退任务、直播与语音会话、SFTP进程、媒体可写描述符均0，Worker idle；检查错误0。
+- 仅使用 `up -d --no-deps --no-build --pull never app worker` 切换App/Worker。两者healthy、重启计数0；Caddy、tusd、MediaMTX、LiveKit的容器ID、镜像和配置摘要前后完全一致。
+- 6个账户、2条媒体及字幕、12个迁移的受保护清单摘要未变，没有数据库迁移。新一致性备份为发布目录内 `ops/predeploy.sqlite3`，权限0600、10,817,536字节，完整性与外键检查通过。
+- 公网TLS校验正常，readiness为ready，8个前端静态文件与容器内SHA-256一致；HTML、Service Worker与版本入口均no-store；未登录的会话、媒体库和管理房间接口仍返回401/UNAUTHORIZED。
+- 证据：本机 `artifacts/releases/20261029-voice-f6f70839b872-40vo63/ops/` 下的 `deployed.json`、`before.json`、`runtime-check.json`、`public-smoke.json`；远端同发布目录的 `ops/` 保留部署回执和备份。私有产物不提交Git。
+
+回滚仅还原App/Worker旧镜像，不回滚数据库、不删媒体。旧镜像 `sha256:1225dd27251152b47cc368dc5c087c6974f016bd1fe6cb2b9463fde55d06e3b8` 和旧配对配置继续保留；需维护时先确认空闲再执行：
+
+```bash
+docker compose -p simplewatch-server \
+  --env-file /opt/simplewatch/releases/20260801-120900-crossmount-86930ec/.env.server \
+  -f /opt/simplewatch/releases/20260801-120900-crossmount-86930ec/infra/compose/compose.server-ip.yaml \
+  -f /opt/simplewatch/releases/20261023-player-961e5f022858/ops/compose.player.json \
+  up -d --no-deps --no-build --pull never app worker
+```
+
+继续维护本候选版时，应在旧Compose输入后追加本候选 `ops/compose.player.json`；不能只用完整栈基线命令而意外降级。准确命令也记录于 `deployed.json` 的 `maintenanceCommand`/`rollbackCommand`。
 
 ### 2026-10-29 最终收尾状态
 
-用户已明确接受候选版先上线并推送GitHub，原声单声道、Apple真机和30分钟通话留到上线后验收。发布前重新检查服务器空闲，只更新App/Worker并保留旧镜像、配对配置和新一致性数据库备份；不再重复整套测试。应用候选构建为 `f4a319ed892e8d18451a0674dc98403b29ff9e2a0e4528e39e8d293e0daa6999`；部署结果在后续发布记录中补充。
+用户已明确接受候选版先上线并推送GitHub，原声单声道、Apple真机和30分钟通话留到上线后验收。发布前重新检查服务器空闲，只更新App/Worker并保留旧镜像、配对配置和新一致性数据库备份；不再重复整套测试。本地回归构建为 `f4a319ed892e8d18451a0674dc98403b29ff9e2a0e4528e39e8d293e0daa6999`；部署结果见上方发布记录。
 
 - 前端286项、API/集成120项、Worker23项、共享包35项、家庭代理19项、安全功能12项通过；生产依赖审计176包无已知漏洞。后台覆盖率208项通过，语句/行85.92%、分支77.43%、函数88.96%。类型、lint、格式、OpenAPI一致性检查通过。
 - 同一构建的三浏览器播放器正式回归13项通过、2项平台跳过；历史WebKit无音轨小seek风险仍保留。稳定报告：`output/playwright/player-history/f4a319ed-20261029/report.json`。
@@ -74,7 +98,7 @@
 | Mac/iPhone Edge/iPad Edge 真机            | 待用户实测，不允许用桌面 WebKit 模拟替代                                                                       |
 | Android 厂商音效                          | 无真机；本期仅标准兼容与降级，明确未验收                                                                       |
 | 五人至少 30 分钟观影+通话、生产资源       | 待执行                                                                                                         |
-| 线上配对 App/Worker 发布及回滚证据        | 用户已授权候选发布；执行前须即时空闲检查、新备份并保留旧配对镜像                                               |
+| 线上配对 App/Worker 发布及回滚证据        | 已于10月29日11:11完成，仅更新App/Worker，空闲检查、备份和公网smoke通过；旧配对镜像及回滚命令保留               |
 
 安全审计：2026-10-29 升级前发现9条安装命中、5个不同公告（Zod1项high，fast-uri4项中低风险各影响两个版本）。用户在本轮明确批准最小升级后，仅将5个workspace的Zod固定到4.6.7、fast-uri override固定到3.1.9/4.2.3；没有同时升级Fastify、pnpm或服务端LiveKit。使用项目Conda与pnpm store安装，锁文件同步；`audit:prod`复查176个生产包，无已知漏洞，类型与前后端构建通过。本地修补不等于已上线。[Zod 4.6.7](https://github.com/colinhacks/zod/releases/tag/v4.6.7)、[fast-uri 3.1.9](https://github.com/fastify/fast-uri/releases/tag/v3.1.9)、[fast-uri 4.2.3](https://github.com/fastify/fast-uri/releases/tag/v4.2.3)。
 

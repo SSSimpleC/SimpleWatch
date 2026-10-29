@@ -561,7 +561,7 @@ function registerUnifiedApiRoutes(
         sameSite: "strict",
         path: "/",
       });
-      reply.header("Clear-Site-Data", '"cache", "cookies", "storage"');
+      reply.header("Clear-Site-Data", '"cache", "cookies"');
       reply.status(204);
       return null;
     },
@@ -810,6 +810,11 @@ function registerUnifiedApiRoutes(
             memberId: z.string().uuid(),
             csrfToken: z.string(),
             serverNow: z.iso.datetime(),
+            account: z.object({
+              id: z.string().uuid(),
+              username: z.string(),
+              role: z.enum(["host", "viewer"]),
+            }),
           }),
         },
       },
@@ -820,12 +825,18 @@ function registerUnifiedApiRoutes(
         request.params.roomId,
       );
       roomService.touch(identity);
+      const account = authService.authenticate(getAccountCookie(request));
       reply.header("Cache-Control", "no-store");
       return {
         snapshot: roomService.getSnapshot(identity.roomId),
         memberId: identity.memberId,
         csrfToken: roomService.rotateCsrf(identity),
         serverNow: new Date(now()).toISOString(),
+        account: {
+          id: account.account_id,
+          username: account.username,
+          role: account.role,
+        },
       };
     },
   );
@@ -974,6 +985,19 @@ function registerWebSocketRoute(
         nickname: identity.nickname,
         authorize,
       };
+      // A newly connected seat must become visible to existing viewers even
+      // when the Host has not issued a playback command. Keep the playback
+      // revision/transport unchanged; this is the existing public snapshot.
+      // The connecting socket obtains its own correlated snapshot via hello.
+      hub.broadcast(
+        identity.roomId,
+        createEnvelope(
+          identity.roomId,
+          "room.snapshot",
+          roomService.getSnapshot(identity.roomId),
+          now,
+        ),
+      );
       const remove = hub.add(
         identity.roomId,
         identity.memberId,

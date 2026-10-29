@@ -140,8 +140,23 @@ export class RoomHub {
   public broadcast(roomId: string, payload: unknown): void {
     const serialized = JSON.stringify(payload);
     for (const connection of this.sockets.get(roomId) ?? []) {
-      if (connection.socket.readyState === OPEN_STATE)
+      if (connection.socket.readyState !== OPEN_STATE) continue;
+      let authorized = false;
+      try {
+        authorized = connection.access?.authorize() ?? true;
+      } catch {
+        // A failed revalidation must not leak a snapshot or block other seats.
+      }
+      if (!authorized) {
+        closeSocketSafely(connection.socket, 4001, "session invalid");
+        continue;
+      }
+      try {
         connection.socket.send(serialized);
+      } catch {
+        // A broken peer must not prevent delivery to the remaining room.
+        closeSocketSafely(connection.socket, 1011, "send failed");
+      }
     }
   }
 
@@ -161,5 +176,17 @@ export class RoomHub {
     for (const connection of this.sockets.get(roomId) ?? []) {
       connection.socket.close(code, reason);
     }
+  }
+}
+
+function closeSocketSafely(
+  socket: SocketLike,
+  code: number,
+  reason: string,
+): void {
+  try {
+    socket.close(code, reason);
+  } catch {
+    // A socket already failing to close is still excluded from this send.
   }
 }

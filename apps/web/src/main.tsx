@@ -9,6 +9,7 @@ import { DiagnosticsPage } from "./pages/DiagnosticsPage.js";
 import { RoomPage } from "./pages/RoomPage.js";
 import { SettingsPage } from "./pages/SettingsPage.js";
 import { AdminDataBoundary } from "./admin-data.js";
+import { SessionLifecycleBoundary } from "./SessionLifecycleBoundary.js";
 import "./styles.css";
 
 const queryClient = new QueryClient({
@@ -20,6 +21,7 @@ createRoot(document.querySelector("#root")!).render(
     <QueryClientProvider client={queryClient}>
       <AdminDataBoundary />
       <BrowserRouter>
+        <SessionLifecycleBoundary />
         <Routes>
           <Route path="/" element={<HomePage />} />
           <Route path="/join/:inviteToken" element={<HomePage />} />

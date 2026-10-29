@@ -15,6 +15,9 @@ import { buildApp } from "../../apps/api/src/app.ts";
 const repository = resolve(import.meta.dirname, "../..");
 const origin = "https://127.0.0.1:18443";
 const apiPort = 13943;
+const voiceGate = process.env.SIMPLEWATCH_VOICE_GATE === "1";
+const voiceKey = "local-voice-gate-key";
+const voiceSecret = "local-voice-gate-secret-not-production-32-bytes";
 const caddy =
   process.env.PLAYER_CADDY_BIN ??
   resolve(repository, ".cache/caddy-2.11.4/caddy");
@@ -43,7 +46,9 @@ const app = await buildApp({
   databasePath: join(runRoot, "player.sqlite3"),
   migrationsPath: resolve(repository, "migrations"),
   publicOrigin: origin,
-  webRoot: resolve(repository, "dist/web"),
+  webRoot: resolve(
+    process.env.PLAYER_GATE_WEB_ROOT ?? resolve(repository, "dist/web"),
+  ),
   mediaRoot,
   uploadRoot: join(runRoot, "uploads"),
   inboxRoot: join(runRoot, "inbox"),
@@ -52,6 +57,13 @@ const app = await buildApp({
   internalHookToken: internalToken,
   contentSigningSecret: "local-player-gate-signing-secret-not-production",
   authFailureDelay: () => Promise.resolve(),
+  ...(voiceGate
+    ? {
+        livekitApiKey: voiceKey,
+        livekitApiSecret: voiceSecret,
+        livekitUrl: `${origin.replace("https:", "wss:")}/rtc`,
+      }
+    : {}),
 });
 await app.authService.provisionAccounts([
   {
@@ -64,6 +76,13 @@ await app.authService.provisionAccounts([
     role: "viewer",
     password: "player-viewer-test-password-24-characters",
   },
+  ...(voiceGate
+    ? ["FJ233", "Conflict", "Fpliy"].map((username) => ({
+        username,
+        role: "viewer",
+        password: "player-viewer-test-password-24-characters",
+      }))
+    : []),
 ]);
 app.database
   .prepare(
@@ -121,6 +140,20 @@ ${origin} {
     Cache-Control no-store
   }
   route {
+    ${voiceGate ? "handle_path /rtc* {\n      reverse_proxy 127.0.0.1:17880\n    }" : ""}
+    ${
+      voiceGate
+        ? `handle /__test/voice-audio-gate.js {
+      rewrite * /voice-audio-gate.js
+      root * ${JSON.stringify(runRoot)}
+      file_server
+    }`
+        : `@no_sfu {
+      method POST
+      path /api/v1/rooms/*/credentials
+    }
+    respond @no_sfu "{\\"error\\":{\\"code\\":\\"VOICE_UNAVAILABLE\\",\\"message\\":\\"No SFU in isolated VOD gate\\"}}" 503`
+    }
     @media path /media-files/*
     @media_bad_method {
       path /media-files/*
@@ -160,29 +193,168 @@ execFileSync(
   ["validate", "--config", config, "--adapter", "caddyfile"],
   { env: processEnv, stdio: "pipe" },
 );
+if (voiceGate) {
+  const { build } = await import("esbuild");
+  const harness = join(runRoot, "voice-audio-gate.js");
+  await build({
+    entryPoints: [
+      resolve(repository, "tools/testing/voice-browser-harness.mjs"),
+    ],
+    outfile: harness,
+    bundle: true,
+    platform: "browser",
+    format: "esm",
+    target: "es2022",
+  });
+}
 await app.app.listen({ host: "127.0.0.1", port: apiPort });
-const edge = spawn(
-  caddy,
-  ["run", "--config", config, "--adapter", "caddyfile"],
-  { env: processEnv, stdio: ["ignore", "inherit", "inherit"] },
-);
+let voiceProcess = null;
+let voiceWorkerTimer = null;
+let edge = null;
 let stopping = false;
 async function stop(code = 0) {
   if (stopping) return;
   stopping = true;
-  edge.kill("SIGTERM");
+  if (voiceWorkerTimer) clearInterval(voiceWorkerTimer);
+  voiceProcess?.kill("SIGTERM");
+  edge?.kill("SIGTERM");
   await app.app.close();
   process.exit(code);
 }
 process.once("SIGINT", () => void stop());
 process.once("SIGTERM", () => void stop());
-edge.once("error", (error) => {
-  console.error(error);
-  void stop(1);
-});
-edge.once("exit", (code) => {
-  if (!stopping) void stop(code ?? 1);
-});
-console.log(
-  `Player gate isolated stack: ${origin}; fixture=${mediaId}; evidence=${runRoot}`,
-);
+try {
+  if (voiceGate) {
+    const binary = process.env.VOICE_LIVEKIT_BIN;
+    if (!binary)
+      throw new Error(
+        "VOICE_LIVEKIT_BIN must point to the pinned local LiveKit 1.13.1 binary",
+      );
+    const version = execFileSync(binary, ["--version"], { encoding: "utf8" });
+    if (!/\bversion 1\.13\.1(?:\s|$)/.test(version))
+      throw new Error("Voice gate requires LiveKit 1.13.1");
+    const voiceConfig = join(runRoot, "livekit.yaml");
+    await writeFile(
+      voiceConfig,
+      `port: 17880
+bind_addresses: ["127.0.0.1"]
+rtc:
+  tcp_port: 0
+  udp_port: 17882
+  node_ip: 127.0.0.1
+  use_external_ip: false
+  enable_loopback_candidate: true
+  interfaces:
+    includes: [lo0]
+  ips:
+    includes: [127.0.0.1/32]
+keys:
+  ${voiceKey}: ${voiceSecret}
+webhook:
+  api_key: ${voiceKey}
+  urls: ["http://127.0.0.1:${apiPort}/api/v1/internal/livekit/webhook"]
+room:
+  auto_create: true
+  empty_timeout: 30
+  departure_timeout: 5
+  max_participants: 5
+  enabled_codecs:
+    - mime: audio/opus
+    - mime: video/vp8
+logging:
+  level: warn
+`,
+    );
+    voiceProcess = spawn(binary, ["--config", voiceConfig], {
+      stdio: ["ignore", "inherit", "inherit"],
+    });
+    voiceProcess.once("error", () => void stop(1));
+    voiceProcess.once("exit", (code) => {
+      if (!stopping) void stop(code ?? 1);
+    });
+    const { RoomServiceClient } = await import("livekit-server-sdk");
+    const { processOutboxItem, reconcileRtcParticipants } =
+      await import("../../apps/worker/src/process-outbox.ts");
+    const livekit = new RoomServiceClient(
+      "http://127.0.0.1:17880",
+      voiceKey,
+      voiceSecret,
+    );
+    let ready = false;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      try {
+        await livekit.listRooms();
+        ready = true;
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    if (!ready) throw new Error("Local LiveKit did not become ready");
+    let busy = false;
+    let nextReconciliation = 0;
+    voiceWorkerTimer = setInterval(() => {
+      if (busy) return;
+      busy = true;
+      void (async () => {
+        if (Date.now() >= nextReconciliation) {
+          nextReconciliation = Date.now() + 15_000;
+          await reconcileRtcParticipants(
+            livekit,
+            async (roomId, identities) => {
+              const response = await app.app.inject({
+                method: "POST",
+                url: "/api/v1/internal/rtc/validate-participants",
+                headers: { "x-internal-token": internalToken },
+                payload: { roomId, identities },
+              });
+              if (response.statusCode !== 200)
+                throw new Error("Voice lease reconciliation failed");
+              return response.json().invalidIdentities;
+            },
+          );
+        }
+        for (let processed = 0; processed < 20; processed += 1) {
+          const item = app.outboxService.claim("local-voice-gate");
+          if (!item) break;
+          try {
+            await processOutboxItem(item, {
+              livekit,
+              mediamtxControlUrl: "http://127.0.0.1:19997",
+            });
+            app.outboxService.complete(item.id, item.leaseToken);
+          } catch (error) {
+            app.outboxService.fail(
+              item.id,
+              item.leaseToken,
+              error instanceof Error ? error.message : "Voice outbox failed",
+            );
+          }
+        }
+      })()
+        .catch(() => console.error("Local voice gate worker failed"))
+        .finally(() => {
+          busy = false;
+        });
+    }, 250);
+  }
+  edge = spawn(caddy, ["run", "--config", config, "--adapter", "caddyfile"], {
+    env: processEnv,
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  edge.once("error", (error) => {
+    console.error(error);
+    void stop(1);
+  });
+  edge.once("exit", (code) => {
+    if (!stopping) void stop(code ?? 1);
+  });
+  console.log(
+    `Player gate isolated stack: ${origin}; fixture=${mediaId}; evidence=${runRoot}`,
+  );
+} catch (error) {
+  console.error(
+    error instanceof Error ? error.message : "Local gate startup failed",
+  );
+  await stop(1);
+}

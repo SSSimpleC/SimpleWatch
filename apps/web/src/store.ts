@@ -8,7 +8,7 @@ interface SessionState {
   setAdminCsrf(value: string | null): void;
   setRoomCsrf(this: void, value: string | null): void;
   setMemberId(this: void, value: string | null): void;
-  setAccount(value: SessionState["account"]): void;
+  setAccount(this: void, value: SessionState["account"]): void;
   clear(): void;
 }
 

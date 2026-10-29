@@ -22,6 +22,11 @@ import { forbidden, unauthorized } from "../errors.js";
 import { createOpaqueToken, hashToken } from "../security.js";
 import { enqueueMediaSessionKicks } from "./media-session-outbox.js";
 import type { RoomIdentity } from "./room-service.js";
+import {
+  getRtcLease,
+  isRtcIdentityActive,
+  rtcIdentity,
+} from "./rtc-identity.js";
 
 interface TransportOptions {
   readonly mediaJwtSecret: string;
@@ -84,14 +89,37 @@ export class TransportService {
   ) {
     this.requireActiveMember(identity.roomId, identity.memberId);
     if (purpose === "voice") {
+      const lease = getRtcLease(this.database, identity.memberId);
+      if (
+        !lease ||
+        lease.session_hash !== identity.sessionHash ||
+        lease.device_id !== identity.deviceId
+      )
+        throw unauthorized();
+      const voiceIdentity = rtcIdentity(lease);
+      if (
+        !isRtcIdentityActive(
+          this.database,
+          identity.roomId,
+          voiceIdentity,
+          this.now(),
+        )
+      ) {
+        throw unauthorized();
+      }
       const token = new AccessToken(
         this.options.livekitApiKey,
         this.options.livekitApiSecret,
         {
-          identity: identity.memberId,
+          identity: voiceIdentity,
           name: identity.nickname,
           ttl: "2m",
-          metadata: JSON.stringify({ roomId: identity.roomId }),
+          metadata: JSON.stringify({
+            version: 2,
+            roomId: identity.roomId,
+            memberId: identity.memberId,
+            accountId: identity.accountId,
+          }),
         },
       );
       token.addGrant({
@@ -106,6 +134,9 @@ export class TransportService {
         purpose,
         url: this.options.livekitUrl,
         token: await token.toJwt(),
+        identity: voiceIdentity,
+        memberId: identity.memberId,
+        accountId: identity.accountId,
         expiresAt: new Date(this.now() + 2 * 60_000).toISOString(),
       };
     }

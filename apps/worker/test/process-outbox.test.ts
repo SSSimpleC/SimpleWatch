@@ -34,7 +34,7 @@ describe("processOutboxItem", () => {
     expect(removeParticipant).toHaveBeenCalledWith(`voice:${roomId}`, memberId);
   });
 
-  it("removes participants missing from the authoritative membership snapshot", async () => {
+  it("validates participants after listing them and also cleans closed voice rooms", async () => {
     // Arrange
     const removeParticipant = vi.fn(() => Promise.resolve());
     const listParticipants = vi.fn(() =>
@@ -46,8 +46,13 @@ describe("processOutboxItem", () => {
 
     // Act
     const removed = await reconcileRtcParticipants(
-      [{ roomId, activeMemberIds: [memberId] }],
-      { listParticipants, removeParticipant },
+      {
+        listParticipants,
+        removeParticipant,
+        listRooms: () => Promise.resolve([{ name: `voice:${roomId}` }]),
+      },
+      (_roomId, identities) =>
+        Promise.resolve(identities.filter((identity) => identity !== memberId)),
     );
 
     // Assert
@@ -56,6 +61,62 @@ describe("processOutboxItem", () => {
       `voice:${roomId}`,
       "0198a1c2-4b20-7a11-8000-000000000003",
     );
+  });
+
+  it("uses the captured v2 identity and never resolves an old removal to the current device", async () => {
+    const identity = `v2:${memberId}:0198a1c2-4b20-7a11-8000-000000000004:1750000000000`;
+    const removeParticipant = vi.fn(() => Promise.resolve());
+    await processOutboxItem(
+      {
+        id: "old-owner",
+        kind: "rtc.remove-participant",
+        leaseToken: "lease",
+        payload: { roomId, memberId, rtcIdentity: identity },
+      },
+      {
+        livekit: { removeParticipant },
+        mediamtxControlUrl: "http://127.0.0.1:9997",
+      },
+    );
+    expect(removeParticipant).toHaveBeenCalledWith(`voice:${roomId}`, identity);
+  });
+
+  it("does not kick a newly acquired lease when enumeration races with takeover", async () => {
+    let owner = "old";
+    const removeParticipant = vi.fn(() => Promise.resolve());
+    const validate = vi.fn((_roomId: string, identities: string[]) =>
+      Promise.resolve(identities.filter((identity) => identity !== owner)),
+    );
+    const removed = await reconcileRtcParticipants(
+      {
+        listRooms: () =>
+          Promise.resolve([{ name: `voice:${roomId}` }, { name: "unrelated" }]),
+        listParticipants: () => {
+          owner = "new";
+          return Promise.resolve([{ identity: "old" }, { identity: "new" }]);
+        },
+        removeParticipant,
+      },
+      validate,
+    );
+    expect(validate).toHaveBeenCalledWith(roomId, ["old", "new"]);
+    expect(removed).toBe(1);
+    expect(removeParticipant).toHaveBeenCalledWith(`voice:${roomId}`, "old");
+  });
+
+  it("does not remove any participant when authoritative validation is unavailable", async () => {
+    const removeParticipant = vi.fn(() => Promise.resolve());
+    await expect(
+      reconcileRtcParticipants(
+        {
+          listRooms: () => Promise.resolve([{ name: `voice:${roomId}` }]),
+          listParticipants: () => Promise.resolve([{ identity: memberId }]),
+          removeParticipant,
+        },
+        () => Promise.reject(new Error("API unavailable")),
+      ),
+    ).rejects.toThrow("API unavailable");
+    expect(removeParticipant).not.toHaveBeenCalled();
   });
 
   it("kicks every recorded MediaMTX session and accepts an already-gone session", async () => {

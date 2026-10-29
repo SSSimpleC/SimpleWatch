@@ -19,6 +19,11 @@ import { createOpaqueToken, hashToken, verifyTokenHash } from "../security.js";
 import type { AccountSession } from "./auth-service.js";
 import { enqueueMediaSessionKicks } from "./media-session-outbox.js";
 import type { ProgramService } from "./program-service.js";
+import {
+  enqueueRtcRevocation,
+  getRtcLease,
+  rtcIdentity,
+} from "./rtc-identity.js";
 
 interface RoomSessionRow {
   readonly id_hash: string;
@@ -50,6 +55,7 @@ interface MediaRow {
 
 interface MemberRow {
   readonly member_id: string;
+  readonly account_id: string | null;
   readonly nickname: string;
   readonly role: "host" | "member";
   readonly last_seen_at: number;
@@ -167,6 +173,17 @@ export class RoomService {
     session: AccountSession,
     options: { readonly forceTakeover?: boolean } = {},
   ): AccountRoomEntry {
+    return this.database
+      .transaction(() =>
+        this.enterAccountRoomWithinTransaction(session, options),
+      )
+      .immediate();
+  }
+
+  private enterAccountRoomWithinTransaction(
+    session: AccountSession,
+    options: { readonly forceTakeover?: boolean },
+  ): AccountRoomEntry {
     const room = this.database
       .prepare(
         "SELECT id, max_members FROM rooms WHERE status = 'active' LIMIT 1",
@@ -209,63 +226,61 @@ export class RoomService {
 
     const timestamp = this.now();
     if (previous) {
-      const lease = this.database
-        .prepare(
-          "SELECT session_hash FROM room_device_leases WHERE member_id = ?",
-        )
-        .get(previous.member_id) as
-        | { readonly session_hash: string }
-        | undefined;
-      if (
-        lease &&
-        lease.session_hash !== session.id_hash &&
-        !options.forceTakeover
-      ) {
-        return {
-          state: "taken-over",
-          roomId: room.id,
-          memberId: previous.member_id,
-        };
-      }
-      this.database.transaction(() => {
-        this.database
-          .prepare(
-            `INSERT INTO room_device_leases(member_id, session_hash, device_id, acquired_at)
+      const member = previous;
+      return this.database
+        .transaction((): AccountRoomEntry => {
+          // The ownership decision and replacement are one write transaction.
+          const lease = getRtcLease(this.database, member.member_id);
+          const changedOwner = lease && lease.session_hash !== session.id_hash;
+          if (changedOwner && !options.forceTakeover) {
+            return {
+              state: "taken-over",
+              roomId: room.id,
+              memberId: member.member_id,
+            };
+          }
+          const epoch =
+            lease && !changedOwner
+              ? lease.acquired_at
+              : Math.max(timestamp, (lease?.acquired_at ?? 0) + 1);
+          this.database
+            .prepare(
+              `INSERT INTO room_device_leases(member_id, session_hash, device_id, acquired_at)
              VALUES (?, ?, ?, ?)
              ON CONFLICT(member_id) DO UPDATE SET
                session_hash = excluded.session_hash,
                device_id = excluded.device_id,
                acquired_at = excluded.acquired_at`,
-          )
-          .run(
-            previous.member_id,
-            session.id_hash,
-            session.device_id,
-            timestamp,
-          );
-        this.database
-          .prepare(
-            "UPDATE room_members SET last_seen_at = ? WHERE member_id = ?",
-          )
-          .run(timestamp, previous.member_id);
-        this.database
-          .prepare("DELETE FROM room_wait_queue WHERE account_id = ?")
-          .run(session.account_id);
-        if (lease && lease.session_hash !== session.id_hash) {
-          this.revokeMediaForTakeover(room.id, previous.member_id, timestamp);
-        }
-      })();
-      return {
-        state: "room",
-        roomId: room.id,
-        memberId: previous.member_id,
-        nickname: session.username,
-        role: previous.role,
-        tookOverSessionHash:
-          lease && lease.session_hash !== session.id_hash
-            ? lease.session_hash
-            : null,
-      };
+            )
+            .run(member.member_id, session.id_hash, session.device_id, epoch);
+          this.database
+            .prepare(
+              "UPDATE room_members SET last_seen_at = ? WHERE member_id = ?",
+            )
+            .run(timestamp, member.member_id);
+          this.database
+            .prepare("DELETE FROM room_wait_queue WHERE account_id = ?")
+            .run(session.account_id);
+          if (lease && changedOwner) {
+            this.revokeMediaForTakeover(room.id, member.member_id, timestamp);
+            enqueueRtcRevocation(this.database, {
+              roomId: room.id,
+              memberId: member.member_id,
+              identity: rtcIdentity(lease),
+              reason: "seat-taken-over",
+              timestamp,
+            });
+          }
+          return {
+            state: "room",
+            roomId: room.id,
+            memberId: member.member_id,
+            nickname: session.username,
+            role: member.role,
+            tookOverSessionHash: changedOwner ? lease.session_hash : null,
+          };
+        })
+        .immediate();
     }
 
     if (session.role === "host") {
@@ -340,40 +355,54 @@ export class RoomService {
   }
 
   public releaseAccountSession(session: AccountSession): void {
-    const lease = this.database
-      .prepare(
-        `SELECT l.member_id, m.room_id, m.role
+    this.database
+      .transaction(() => {
+        const lease = this.database
+          .prepare(
+            `SELECT l.member_id, m.room_id, m.role
          FROM room_device_leases l
          JOIN room_members m ON m.member_id = l.member_id
          WHERE l.session_hash = ?`,
-      )
-      .get(session.id_hash) as
-      | {
-          readonly member_id: string;
-          readonly room_id: string;
-          readonly role: "host" | "member";
-        }
-      | undefined;
-    if (!lease) return;
-    const timestamp = this.now();
-    this.database.transaction(() => {
-      this.database
-        .prepare("DELETE FROM room_device_leases WHERE member_id = ?")
-        .run(lease.member_id);
-      if (lease.role === "member") {
-        this.database
-          .prepare(
-            "UPDATE room_members SET left_at = ?, last_seen_at = ? WHERE member_id = ?",
           )
-          .run(timestamp, timestamp, lease.member_id);
-        this.revokeRealtimeAccess(
-          lease.room_id,
-          lease.member_id,
-          "account-logout",
-          timestamp,
-        );
-      }
-    })();
+          .get(session.id_hash) as
+          | {
+              readonly member_id: string;
+              readonly room_id: string;
+              readonly role: "host" | "member";
+            }
+          | undefined;
+        if (!lease) return;
+        const timestamp = this.now();
+        const rtcLease = getRtcLease(this.database, lease.member_id);
+        this.database
+          .prepare("DELETE FROM room_device_leases WHERE member_id = ?")
+          .run(lease.member_id);
+        if (lease.role === "member") {
+          this.database
+            .prepare(
+              "UPDATE room_members SET left_at = ?, last_seen_at = ? WHERE member_id = ?",
+            )
+            .run(timestamp, timestamp, lease.member_id);
+          this.revokeRealtimeAccess(
+            lease.room_id,
+            lease.member_id,
+            "account-logout",
+            timestamp,
+            rtcLease ? rtcIdentity(rtcLease) : lease.member_id,
+          );
+        } else {
+          // Host logging out must release voice without changing the existing
+          // long-lived OBS/program publishing lifecycle.
+          enqueueRtcRevocation(this.database, {
+            roomId: lease.room_id,
+            memberId: lease.member_id,
+            identity: rtcLease ? rtcIdentity(rtcLease) : lease.member_id,
+            reason: "account-logout",
+            timestamp,
+          });
+        }
+      })
+      .immediate();
   }
 
   public takeoverAccountRoom(session: AccountSession): AccountRoomEntry {
@@ -466,7 +495,7 @@ export class RoomService {
     csrfToken: string | undefined,
   ): void {
     if (!csrfToken || !verifyTokenHash(csrfToken, identity.csrfHash)) {
-      throw unauthorized("CSRF Token 无效");
+      throw new AppError(401, "CSRF_INVALID", "CSRF Token 无效");
     }
   }
 
@@ -489,7 +518,7 @@ export class RoomService {
     const state = this.getRoomState(roomId);
     const members = this.database
       .prepare(
-        `SELECT member_id, nickname, role, last_seen_at
+        `SELECT member_id, account_id, nickname, role, last_seen_at
          FROM room_members
          WHERE room_id = ? AND left_at IS NULL AND kicked_at IS NULL
          ORDER BY joined_at ASC`,
@@ -521,6 +550,7 @@ export class RoomService {
       hostMemberId: state.host_member_id,
       members: members.map((member) => ({
         id: member.member_id,
+        accountId: member.account_id,
         nickname: member.nickname,
         role: member.role,
         online: now - member.last_seen_at <= 60_000,
@@ -625,6 +655,7 @@ export class RoomService {
     }
     const now = this.now();
     this.database.transaction(() => {
+      const rtcLease = getRtcLease(this.database, identity.memberId);
       this.database
         .prepare(
           "UPDATE room_members SET left_at = ?, last_seen_at = ? WHERE member_id = ?",
@@ -648,6 +679,7 @@ export class RoomService {
         identity.memberId,
         "left",
         now,
+        rtcLease ? rtcIdentity(rtcLease) : identity.memberId,
       );
     })();
   }
@@ -670,6 +702,7 @@ export class RoomService {
         )
         .get(targetMemberId, identity.roomId);
       if (!target) throw notFound("目标成员不存在");
+      const rtcLease = getRtcLease(this.database, targetMemberId);
 
       this.database
         .prepare("UPDATE room_members SET kicked_at = ? WHERE member_id = ?")
@@ -715,6 +748,7 @@ export class RoomService {
         targetMemberId,
         reason?.trim() || "kicked",
         now,
+        rtcLease ? rtcIdentity(rtcLease) : targetMemberId,
       );
     })();
   }
@@ -724,6 +758,7 @@ export class RoomService {
     memberId: string,
     reason: string,
     now: number,
+    removedIdentity: string,
   ): void {
     this.database
       .prepare(
@@ -742,13 +777,13 @@ export class RoomService {
         (row) =>
           (row as { readonly mediamtx_session_id: string }).mediamtx_session_id,
       );
-    this.database
-      .prepare(
-        `INSERT INTO rtc_revocations(
-          id, room_id, member_id, identity, reason, revoked_at, cleared_at
-        ) VALUES (?, ?, ?, ?, ?, ?, NULL)`,
-      )
-      .run(revocationId, roomId, memberId, memberId, reason, now);
+    enqueueRtcRevocation(this.database, {
+      roomId,
+      memberId,
+      identity: removedIdentity,
+      reason,
+      timestamp: now,
+    });
     enqueueMediaSessionKicks(this.database, {
       roomId,
       memberId,
@@ -756,20 +791,6 @@ export class RoomService {
       dedupeKey: `mediamtx-kick:${revocationId}`,
       timestamp: now,
     });
-    this.database
-      .prepare(
-        `INSERT INTO service_outbox(
-          id, kind, dedupe_key, payload_json, state, attempts,
-          not_before, lease_until, last_error, created_at, completed_at
-        ) VALUES (?, 'rtc.remove-participant', ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL)`,
-      )
-      .run(
-        uuidv7(),
-        `rtc-remove:${revocationId}`,
-        JSON.stringify({ roomId, memberId }),
-        now,
-        now,
-      );
   }
 
   public updateRoom(
@@ -840,6 +861,15 @@ export class RoomService {
              WHERE room_id = ? AND left_at IS NULL AND kicked_at IS NULL`,
           )
           .all(roomId) as Array<{ readonly member_id: string }>;
+        const removedIdentities = new Map(
+          members.map((member) => {
+            const lease = getRtcLease(this.database, member.member_id);
+            return [
+              member.member_id,
+              lease ? rtcIdentity(lease) : member.member_id,
+            ];
+          }),
+        );
         const mediaSessionIds = this.database
           .prepare(
             `SELECT mediamtx_session_id FROM media_transport_sessions
@@ -901,28 +931,13 @@ export class RoomService {
           timestamp: now,
         });
         for (const member of members) {
-          const eventId = uuidv7();
-          this.database
-            .prepare(
-              `INSERT INTO rtc_revocations(
-                id, room_id, member_id, identity, reason, revoked_at, cleared_at
-              ) VALUES (?, ?, ?, ?, 'room-force-closed', ?, NULL)`,
-            )
-            .run(eventId, roomId, member.member_id, member.member_id, now);
-          this.database
-            .prepare(
-              `INSERT INTO service_outbox(
-                id, kind, dedupe_key, payload_json, state, attempts,
-                not_before, lease_until, last_error, created_at, completed_at
-              ) VALUES (?, 'rtc.remove-participant', ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL)`,
-            )
-            .run(
-              uuidv7(),
-              `rtc-force-close:${eventId}`,
-              JSON.stringify({ roomId, memberId: member.member_id }),
-              now,
-              now,
-            );
+          enqueueRtcRevocation(this.database, {
+            roomId,
+            memberId: member.member_id,
+            identity: removedIdentities.get(member.member_id)!,
+            reason: "room-force-closed",
+            timestamp: now,
+          });
         }
       }
     })();

@@ -12,7 +12,7 @@
     "@simplewatch/contracts": "workspace:*",
     "@simplewatch/sync": "workspace:*",
     "@tanstack/react-query": "5.101.2",
-    "livekit-client": "2.20.1",
+    "livekit-client": "2.23.0",
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "react-router": "8.3.0",

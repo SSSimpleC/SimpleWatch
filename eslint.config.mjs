@@ -7,6 +7,7 @@ export default tseslint.config(
     ignores: [
       ".cache/**",
       ".conda/**",
+      ".local/**",
       ".serena/**",
       "artifacts/**",
       "apps/web/src/vendor/mediamtx-reader.js",

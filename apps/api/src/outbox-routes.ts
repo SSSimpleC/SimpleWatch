@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { ZodTypeProvider } from "fastify-type-provider-zod";
 
-import { unauthorized } from "./errors.js";
+import { AppError, unauthorized } from "./errors.js";
 import type { OutboxService } from "./services/outbox-service.js";
 import { timingSafeEqual } from "node:crypto";
 
@@ -18,8 +18,36 @@ export function registerOutboxRoutes(
 
   app.get("/api/v1/internal/rtc/reconciliation-snapshot", (request) => {
     requireInternal(request, internalToken);
-    return { rooms: outboxService.getRtcReconciliationSnapshot() };
+    // A legacy Worker would compare v2 identities with member IDs and remove
+    // every new client. Fail closed during a paired App/Worker rollout.
+    throw new AppError(
+      410,
+      "RTC_SNAPSHOT_OBSOLETE",
+      "RTC 对账必须先枚举参与者，再调用实时租约校验接口",
+    );
   });
+
+  app.post(
+    "/api/v1/internal/rtc/validate-participants",
+    {
+      schema: {
+        body: z.object({
+          roomId: z.string().uuid(),
+          identities: z.array(z.string().min(1).max(512)).max(100),
+        }),
+        response: { 200: z.object({ invalidIdentities: z.array(z.string()) }) },
+      },
+    },
+    (request) => {
+      requireInternal(request, internalToken);
+      return {
+        invalidIdentities: outboxService.invalidRtcIdentities(
+          request.body.roomId,
+          request.body.identities,
+        ),
+      };
+    },
+  );
 
   app.post(
     "/api/v1/internal/outbox/claim",

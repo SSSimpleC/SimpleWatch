@@ -1,0 +1,481 @@
+.voice-panel {
+  --voice-surface: #191714;
+  --voice-paper: var(--paper, #e9e1d3);
+  --voice-ink: var(--ink, #11100e);
+  --voice-line: var(--line, #39342d);
+  --voice-accent: var(--amber, #e8a93f);
+  --voice-muted: #b7aea0;
+  min-width: 0;
+  color: var(--voice-paper);
+}
+.screen-layout:has(> .audience-panel > .voice-panel) {
+  align-items: start;
+}
+.screen-layout > .audience-panel:has(> .voice-panel) {
+  min-width: 0;
+}
+.voice-panel__body {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+}
+.voice-panel__desktop {
+  padding-top: 1.4rem;
+  border-top: 1px solid var(--voice-line);
+}
+.voice-panel__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+.voice-panel__header h2 {
+  font:
+    400 1.7rem "Iowan Old Style",
+    "Baskerville",
+    serif;
+  margin: 0.3rem 0 0;
+}
+.voice-panel__quality {
+  font-size: 0.62rem;
+  color: var(--voice-muted);
+  border: 1px solid var(--voice-line);
+  padding: 0.3rem;
+}
+.voice-panel__connection {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.74rem;
+}
+.voice-panel__connection i {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--voice-muted);
+  flex: 0 0 auto;
+}
+.voice-panel__connection i[data-connected="true"] {
+  background: var(--voice-accent);
+}
+.voice-panel__master,
+.voice-panel__channel {
+  padding: 0.9rem;
+  border: 1px solid var(--voice-line);
+  background: var(--voice-surface);
+  min-width: 0;
+}
+.voice-panel__channel[data-speaking="true"] {
+  border-left-color: var(--voice-accent);
+}
+.voice-panel__self {
+  border-left: 3px solid var(--voice-accent);
+}
+.voice-panel__channel-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  align-items: center;
+}
+.voice-panel__channel-heading h3 {
+  font-size: 0.9rem;
+  margin: 0.2rem 0;
+  overflow-wrap: anywhere;
+}
+.voice-panel__channel-tag,
+.voice-panel__channel-badge,
+.voice-panel__participant-state {
+  font-size: 0.62rem;
+  color: var(--voice-muted);
+}
+.voice-panel__channel-tag {
+  color: var(--voice-accent);
+}
+.voice-panel__channel-badge {
+  border: 1px solid var(--voice-line);
+  padding: 0.25rem 0.35rem;
+}
+.voice-panel__participant-state {
+  text-align: right;
+}
+.voice-panel__mic-state {
+  font-size: 0.73rem;
+  margin: 0.7rem 0;
+  line-height: 1.6;
+}
+.voice-panel button,
+.voice-panel select,
+.voice-settings button,
+.voice-settings select {
+  min-height: 44px;
+  font-size: 0.74rem;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.voice-panel button:hover:not(:disabled) {
+  transform: none;
+}
+.voice-panel__mic-switch {
+  width: 100%;
+}
+.voice-panel__mic-switch[aria-pressed="true"] {
+  background: var(--voice-accent);
+  border-color: var(--voice-accent);
+}
+.voice-panel__ptt {
+  width: 100%;
+  margin-top: 0.5rem;
+  touch-action: none;
+  user-select: none;
+}
+.voice-panel__ptt[aria-pressed="true"] {
+  background: var(--voice-accent);
+}
+.voice-panel__hint,
+.voice-panel__system-help p {
+  color: var(--voice-muted);
+  font-size: 0.68rem;
+  line-height: 1.75;
+  margin: 0.5rem 0 0;
+  overflow-wrap: anywhere;
+}
+.voice-panel__warning,
+.voice-panel__error {
+  color: var(--voice-accent);
+  font-size: 0.72rem;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.voice-panel__error {
+  border-left: 2px solid var(--rust, #a83f2f);
+  padding-left: 0.6rem;
+  margin: 0;
+}
+.voice-panel__unlock {
+  border: 1px solid var(--voice-accent);
+  padding: 0.8rem;
+}
+.voice-panel__unlock p {
+  margin: 0 0 0.6rem;
+  font-size: 0.75rem;
+  line-height: 1.6;
+}
+.voice-panel__unlock button {
+  width: 100%;
+}
+.voice-level {
+  margin-top: 0.7rem;
+  min-width: 0;
+}
+.voice-level label {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 0.73rem;
+  line-height: 1.5;
+}
+.voice-level output {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  color: var(--voice-paper, var(--paper));
+}
+.voice-level output small {
+  font-size: 0.62rem;
+}
+.voice-level[data-amplified="true"] output {
+  color: var(--voice-accent, var(--amber));
+}
+.voice-level__rail {
+  position: relative;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+}
+.voice-level__rail input {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0;
+  margin: 0;
+  accent-color: var(--voice-accent, var(--amber));
+  cursor: pointer;
+}
+.voice-level__unity {
+  position: absolute;
+  left: var(--voice-unity);
+  width: 1px;
+  height: 8px;
+  bottom: 1px;
+  background: var(--voice-muted, #b7aea0);
+  pointer-events: none;
+}
+.voice-level__scale {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  color: var(--voice-muted, #b7aea0);
+  font-size: 0.58rem;
+  padding-bottom: 0.35rem;
+}
+.voice-level__scale span:nth-child(2):not(:last-child) {
+  position: absolute;
+  transform: translateX(-25%);
+}
+.voice-panel__channel-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+.voice-panel__channel-actions button,
+.voice-panel__quiet-button {
+  background: transparent;
+  color: var(--voice-paper);
+  border-color: var(--voice-line);
+  padding: 0.5rem;
+  font-size: 0.66rem;
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.voice-panel__channel-actions button[aria-pressed="true"] {
+  color: var(--voice-accent);
+  border-color: var(--voice-accent);
+}
+.voice-panel__quiet-button {
+  width: 100%;
+  margin-top: 0.35rem;
+}
+.voice-panel__meter {
+  display: block;
+  width: 100%;
+  height: 0.55rem;
+  margin-top: 0.65rem;
+  accent-color: var(--voice-accent);
+}
+.voice-panel__meter::-webkit-meter-bar {
+  background: var(--voice-line);
+  border: 0;
+  border-radius: 0;
+}
+.voice-panel__meter::-webkit-meter-optimum-value {
+  background: var(--voice-accent);
+}
+.voice-panel__meter::-webkit-meter-suboptimum-value,
+.voice-panel__meter::-webkit-meter-even-less-good-value {
+  background: var(--rust, #a83f2f);
+}
+.voice-panel__meter::-moz-meter-bar {
+  background: var(--voice-accent);
+}
+.voice-panel__device {
+  display: block;
+  font-size: 0.72rem;
+  margin-top: 0.8rem;
+}
+.voice-panel select,
+.voice-settings select {
+  width: 100%;
+  min-width: 0;
+  margin-top: 0.45rem;
+  color: var(--voice-paper, var(--paper));
+  background: var(--voice-ink, var(--ink));
+  border: 1px solid var(--voice-line, var(--line));
+  padding: 0.5rem;
+}
+.voice-panel__others {
+  display: grid;
+  gap: 0.65rem;
+}
+.voice-panel__section-heading {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+}
+.voice-panel__section-heading small {
+  color: var(--voice-muted);
+}
+.voice-panel__advanced {
+  border-top: 1px solid var(--voice-line);
+  padding-top: 0.5rem;
+}
+.voice-panel__advanced > summary,
+.voice-panel__system-help > summary {
+  min-height: 44px;
+  cursor: pointer;
+  font-size: 0.74rem;
+  line-height: 1.6;
+  padding: 0.7rem 0;
+}
+.voice-panel__advanced > label {
+  font-size: 0.74rem;
+}
+.voice-panel__check {
+  display: flex;
+  min-height: 44px;
+  gap: 0.65rem;
+  align-items: center;
+  line-height: 1.5;
+  margin-top: 0.5rem;
+}
+.voice-panel__check input {
+  min-width: 20px;
+  min-height: 20px;
+  accent-color: var(--voice-accent, var(--amber));
+}
+.voice-panel__system-help {
+  margin-top: 0.5rem;
+}
+.voice-panel__diagnostics {
+  font-size: 0.66rem;
+}
+.voice-panel__diagnostics > div {
+  display: flex;
+  gap: 0.7rem;
+  justify-content: space-between;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--voice-line);
+}
+.voice-panel__diagnostics dd {
+  margin: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.voice-panel__compact,
+.voice-panel__drawer {
+  display: none;
+}
+.voice-panel__compact {
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.8rem 0;
+  border-top: 1px solid var(--voice-line);
+}
+.voice-panel__compact button {
+  padding: 0.7rem;
+}
+.voice-panel__compact button:first-child {
+  flex: 1 1 150px;
+  text-align: left;
+  background: var(--voice-surface);
+  color: var(--voice-paper);
+  border-color: var(--voice-line);
+}
+.voice-panel__compact small {
+  display: block;
+  font-size: 0.61rem;
+  color: var(--voice-muted);
+  margin-top: 0.25rem;
+}
+.voice-panel__drawer[open] {
+  display: block;
+  position: fixed;
+  inset: auto 1rem 1rem auto;
+  margin: 0;
+  width: min(420px, calc(100% - 2rem));
+  max-width: none;
+  max-height: 86dvh;
+  padding: 0;
+  color: var(--voice-paper);
+  background: var(--voice-ink);
+  border: 1px solid var(--voice-line);
+  overscroll-behavior: contain;
+}
+.voice-panel__drawer::backdrop {
+  background: #0009;
+}
+body:has(.voice-panel__drawer[open]) {
+  overflow: hidden;
+}
+.voice-panel__drawer-inner {
+  padding: 1rem 1rem max(1rem, env(safe-area-inset-bottom));
+}
+.voice-panel__close {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  background: var(--voice-ink);
+  color: var(--voice-paper);
+  border-color: var(--voice-line);
+  margin-bottom: 1rem;
+}
+/* Cinema mode hides the old seat list, not the user's microphone controls.
+ * Keep this compact row in normal flow so it cannot cover the video/scrubber. */
+.room-shell.theater-mode .audience-panel:has(> .voice-panel) {
+  display: block;
+}
+.room-shell.theater-mode
+  .audience-panel:has(> .voice-panel)
+  > :not(.voice-panel),
+.room-shell.theater-mode .voice-panel__desktop {
+  display: none;
+}
+.room-shell.theater-mode .voice-panel__compact {
+  display: flex;
+}
+.voice-settings {
+  --voice-muted: #b7aea0;
+  display: grid;
+  gap: 1rem;
+}
+.voice-settings .voice-level {
+  max-width: 560px;
+}
+.settings-panel.voice-settings > .voice-panel__check {
+  display: flex;
+  gap: 0.65rem;
+}
+.voice-settings .voice-panel__hint {
+  max-width: 660px;
+}
+.voice-settings__reset {
+  margin-top: 1rem;
+  justify-self: start;
+}
+@media (min-width: 761px) {
+  /* Only the expanded desktop mixer scrolls; the movie stays in the viewport. */
+  .room-shell:not(.theater-mode)
+    .screen-layout
+    > .audience-panel:has(> .voice-panel) {
+    position: sticky;
+    top: 1rem;
+    max-height: calc(100dvh - 9rem);
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+    scroll-padding-block: 8rem 1rem;
+  }
+  .voice-panel__desktop .voice-panel__microphone-quick {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    padding: 0.35rem 0 0.7rem;
+    background: var(--voice-surface);
+    border-bottom: 1px solid var(--voice-line);
+    box-shadow: 0 -1.1rem 0 var(--voice-surface);
+  }
+}
+@media (max-width: 760px) {
+  .voice-panel__desktop {
+    display: none;
+  }
+  .voice-panel__compact {
+    display: flex;
+  }
+  .voice-panel__drawer[open] {
+    inset: auto 0 0;
+    width: 100%;
+    border-radius: 16px 16px 0 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .voice-panel *,
+  .voice-settings * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

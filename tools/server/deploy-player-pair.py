@@ -16,10 +16,10 @@ import sys
 import time
 
 BASELINE = Path("/opt/simplewatch/releases/20260801-120900-crossmount-86930ec")
-PREVIOUS_PAIR = Path("/opt/simplewatch/releases/20261023-player-389c88e47253/ops/compose.player.json")
-OLD_IMAGE = "sha256:aaa92b1d87d952687468eaeef163633823fdcc6c517544d7c44e325369aed54e"
+PREVIOUS_PAIR = Path("/opt/simplewatch/releases/20261023-player-961e5f022858/ops/compose.player.json")
+OLD_IMAGE = "sha256:1225dd27251152b47cc368dc5c087c6974f016bd1fe6cb2b9463fde55d06e3b8"
 release = Path(sys.argv[1]).resolve()
-if release.parent != Path("/opt/simplewatch/releases") or not re.fullmatch(r"20261023-player-[0-9a-f]{12}", release.name):
+if release.parent != Path("/opt/simplewatch/releases") or not re.fullmatch(r"20261029-voice-[0-9a-f]{12}", release.name):
     raise RuntimeError("Unexpected release target")
 source = release / "source"
 ops = release / "ops"
@@ -101,14 +101,15 @@ const fastify=require('fastify/package.json').version;
 if(fastify!=='5.12.7') throw Error('Fastify patch missing');
 const packages=readdirSync('node_modules/.pnpm');
 for(const name of packages){
- if(name.startsWith('fast-uri@')&&!/^fast-uri@(3\\.1\\.8|4\\.1\\.5)$/.test(name)) throw Error('fast-uri patch missing');
+ if(name.startsWith('fast-uri@')&&!/^fast-uri@(3\\.1\\.9|4\\.2\\.3)$/.test(name)) throw Error('fast-uri patch missing');
+ if(name.startsWith('zod@')&&name!=='zod@4.6.7') throw Error('Zod patch missing');
  if(name.startsWith('brace-expansion@5.')&&name!=='brace-expansion@5.0.12') throw Error('brace patch missing');
 }
 const Database=require('better-sqlite3');const db=new Database(':memory:');db.exec('CREATE TABLE proof(v TEXT)');db.close();
 await require('argon2').hash('isolated-runtime-probe',{memoryCost:4096,timeCost:1,parallelism:1});
 execFileSync(process.execPath,['--check','dist/api.mjs']);
 execFileSync(process.execPath,['--check','dist/worker.mjs']);
-console.log(JSON.stringify({node:process.version,fastify,ffmpeg:execFileSync('ffmpeg',['-version'],{encoding:'utf8'}).split('\\n')[0]}));
+console.log(JSON.stringify({node:process.version,fastify,securityPackages:packages.filter(name=>/^(fast-uri|zod)@/.test(name)),ffmpeg:execFileSync('ffmpeg',['-version'],{encoding:'utf8'}).split('\\n')[0]}));
 """
 runtime = json.loads(run("docker", "run", "--rm", "--network", "none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--memory=192m", "--cpus=0.5", "--pids-limit=32", image, "node", "--input-type=module", "-e", probe))
 old_ffmpeg = run("docker", "exec", "simplewatch-server-app-1", "ffmpeg", "-version").splitlines()[0]

@@ -182,6 +182,7 @@ export type TransportAnchor = z.infer<typeof transportAnchorSchema>;
 
 export const roomMemberSchema = z.object({
   id: participantIdSchema,
+  accountId: z.string().uuid().nullable(),
   nickname: z.string().min(1).max(24),
   role: z.enum(["host", "member"]),
   online: z.boolean(),

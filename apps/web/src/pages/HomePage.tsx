@@ -10,6 +10,11 @@ import {
 } from "../api.js";
 import { purgeAdminQueries } from "../admin-data.js";
 import { useSession } from "../store.js";
+import { logoutAccount } from "../session-lifecycle.js";
+import {
+  currentSessionGeneration,
+  invalidateSessionOperations,
+} from "../session-generation.js";
 
 export function HomePage() {
   const navigate = useNavigate();
@@ -21,8 +26,24 @@ export function HomePage() {
   );
   const [checking, setChecking] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [takingOver, setTakingOver] = useState(false);
   const [message, setMessage] = useState("");
   const sourceRef = useRef<EventSource | null>(null);
+  const mountedRef = useRef(true);
+  const takeoverOperationRef = useRef(0);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      takeoverOperationRef.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    takeoverOperationRef.current += 1;
+    setTakingOver(false);
+  }, [account?.id]);
 
   function acceptSession(session: AccountSession) {
     if (session.account.role !== "host") purgeAdminQueries(queryClient);
@@ -45,18 +66,22 @@ export function HomePage() {
 
   useEffect(() => {
     let active = true;
-    void api<AccountSession>("/api/v1/auth/session")
+    const generation = currentSessionGeneration();
+    const abort = new AbortController();
+    void api<AccountSession>("/api/v1/auth/session", { signal: abort.signal })
       .then((session) => {
-        if (active) acceptSession(session);
+        if (active && generation === currentSessionGeneration())
+          acceptSession(session);
       })
       .catch(() => {
-        if (active) clear();
+        if (active && generation === currentSessionGeneration()) clear();
       })
       .finally(() => {
         if (active) setChecking(false);
       });
     return () => {
       active = false;
+      abort.abort();
     };
   }, []);
 
@@ -90,6 +115,7 @@ export function HomePage() {
     setSubmitting(true);
     setMessage("");
     const data = new FormData(form);
+    const generation = invalidateSessionOperations();
     try {
       const session = await api<AccountSession>("/api/v1/auth/login", {
         method: "POST",
@@ -99,7 +125,7 @@ export function HomePage() {
         }),
       });
       form.reset();
-      acceptSession(session);
+      if (generation === currentSessionGeneration()) acceptSession(session);
     } catch (error) {
       setMessage(error instanceof ApiError ? error.message : "登录失败");
     } finally {
@@ -109,30 +135,55 @@ export function HomePage() {
   }
 
   async function takeover() {
+    if (takingOver || submitting) return;
+    const accountId = useSession.getState().account?.id;
+    if (!accountId) return;
+    const generation = currentSessionGeneration();
+    const operation = ++takeoverOperationRef.current;
+    const current = () =>
+      mountedRef.current &&
+      operation === takeoverOperationRef.current &&
+      generation === currentSessionGeneration() &&
+      useSession.getState().account?.id === accountId;
+    setTakingOver(true);
+    setMessage("");
     try {
       const next = await api<AccountDestination>("/api/v1/room/takeover", {
         method: "POST",
         body: "{}",
+        signal: AbortSignal.timeout(10_000),
       });
+      if (!current()) return;
       setDestination(next);
       routeDestination(next);
     } catch (error) {
-      setMessage(error instanceof ApiError ? error.message : "接管席位失败");
+      if (current())
+        setMessage(error instanceof ApiError ? error.message : "接管席位失败");
+    } finally {
+      if (current()) setTakingOver(false);
     }
   }
 
   async function logout() {
-    const csrf = useSession.getState().adminCsrf;
-    if (csrf) {
-      await api<void>("/api/v1/auth/logout", {
-        method: "POST",
-        headers: { "x-csrf-token": csrf },
-        body: "{}",
-      }).catch(() => undefined);
+    if (submitting) return;
+    // An in-flight takeover may finish server-side, but must not navigate away
+    // while the user's subsequent logout is being completed.
+    takeoverOperationRef.current += 1;
+    setTakingOver(false);
+    setSubmitting(true);
+    setMessage("");
+    try {
+      await logoutAccount(queryClient);
+      setDestination(null);
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? `退出尚未完成：${error.message}`
+          : "退出尚未完成，请重试",
+      );
+    } finally {
+      setSubmitting(false);
     }
-    clear();
-    purgeAdminQueries(queryClient);
-    setDestination(null);
   }
 
   const waitingCopy = destination
@@ -175,13 +226,18 @@ export function HomePage() {
               </strong>
             )}
             {destination.state === "taken-over" && (
-              <button type="button" onClick={() => void takeover()}>
+              <button
+                type="button"
+                disabled={takingOver || submitting}
+                onClick={() => void takeover()}
+              >
                 在本设备接管席位
               </button>
             )}
             <button
               className="text-button"
               type="button"
+              disabled={submitting}
               onClick={() => void logout()}
             >
               退出账户

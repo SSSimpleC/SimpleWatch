@@ -13,6 +13,7 @@ import { v7 as uuidv7 } from "uuid";
 import { AccessToken } from "livekit-server-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RawData, WebSocket } from "ws";
+import { roomSnapshotSchema } from "@simplewatch/contracts";
 
 import { buildApp, type BuiltApp } from "../src/app.js";
 import { openDatabase } from "../src/database.js";
@@ -354,6 +355,7 @@ describe("SimpleWatch API", () => {
     expect(JSON.parse(queued[0]?.payload_json ?? "{}")).toEqual({
       roomId,
       memberId,
+      rtcIdentity: memberId,
     });
   });
 
@@ -1566,6 +1568,149 @@ describe("SimpleWatch API", () => {
     });
     socket.close();
   });
+
+  it("announces a newly connected member to existing seats without changing playback", async () => {
+    const room = await createRoom();
+    const identity = built.roomService.authenticate(
+      cookieValue(room.roomCookie),
+      room.roomId,
+    );
+    const mediaId = insertPublishedMedia("member-broadcast-playing", 90_000);
+    const selected = built.roomService.applyCommand(identity, {
+      commandId: uuidv7(),
+      expectedRevision: 0,
+      effectiveAtServerMs: 0,
+      command: { kind: "select-vod", mediaId },
+    });
+    const seeked = built.roomService.applyCommand(identity, {
+      commandId: uuidv7(),
+      expectedRevision: selected.revision,
+      effectiveAtServerMs: 0,
+      command: { kind: "seek", positionSec: 37 },
+    });
+    built.roomService.applyCommand(identity, {
+      commandId: uuidv7(),
+      expectedRevision: seeked.revision,
+      effectiveAtServerMs: 0,
+      command: { kind: "play" },
+    });
+    const host = await built.app.injectWS(`/api/v1/rooms/${room.roomId}/ws`, {
+      headers: {
+        cookie: room.roomCookie,
+        origin,
+        "sec-websocket-protocol": "simplewatch.v1",
+      },
+    });
+    const before = built.roomService.getSnapshot(room.roomId);
+    expect(before.members).toHaveLength(1);
+    expect(before).toMatchObject({
+      mode: "vod",
+      media: { id: mediaId },
+      transport: { state: "playing", positionSec: 37, rate: 1 },
+    });
+    const joined = await joinRoom("New voice member");
+    const memberId = joined.json<{ member: { id: string } }>().member.id;
+    const announcement = nextMessage(host);
+    const viewer = await built.app.injectWS(`/api/v1/rooms/${room.roomId}/ws`, {
+      headers: {
+        cookie: readCookie(joined, "__Host-sw_session"),
+        origin,
+        "sec-websocket-protocol": "simplewatch.v1",
+      },
+    });
+    try {
+      const message = await announcement;
+      expect(message).toMatchObject({
+        type: "room.snapshot",
+        roomId: room.roomId,
+        payload: {
+          revision: before.revision,
+          mode: before.mode,
+          transport: before.transport,
+        },
+      });
+      const snapshot = roomSnapshotSchema.parse(message.payload);
+      expect(snapshot.members).toHaveLength(2);
+      const added = snapshot.members.find((member) => member.id === memberId);
+      expect(added).toMatchObject({
+        id: memberId,
+        nickname: "New voice member",
+        online: true,
+      });
+      expect(typeof added?.accountId).toBe("string");
+      expect(message).not.toHaveProperty("replyTo");
+      expect(JSON.stringify(message)).not.toMatch(
+        /csrf_hash|csrfToken|session_hash|password_hash/,
+      );
+    } finally {
+      viewer.close();
+      host.close();
+    }
+  });
+
+  it.each(["logout", "revocation"] as const)(
+    "does not broadcast a new-member snapshot to an open socket after %s",
+    async (invalidation) => {
+      const room = await createRoom();
+      const previous = await joinRoom("Previous voice member");
+      const previousCookie = readCookie(previous, "__Host-sw_session");
+      const oldSocket = await built.app.injectWS(
+        `/api/v1/rooms/${room.roomId}/ws`,
+        {
+          headers: {
+            cookie: previousCookie,
+            origin,
+            "sec-websocket-protocol": "simplewatch.v1",
+          },
+        },
+      );
+      const oldMessages = vi.fn();
+      oldSocket.on("message", oldMessages);
+      const closed = new Promise<number>((resolveClose) => {
+        oldSocket.once("close", resolveClose);
+      });
+      let newSocket: WebSocket | undefined;
+      try {
+        if (invalidation === "logout") {
+          const response = await built.app.inject({
+            method: "POST",
+            url: "/api/v1/auth/logout",
+            headers: {
+              cookie: previousCookie,
+              origin,
+              "x-csrf-token": previous.json<{ csrfToken: string }>().csrfToken,
+            },
+          });
+          expect(response.statusCode).toBe(204);
+        } else {
+          built.authService.logout(cookieValue(previousCookie));
+        }
+        // No client messages or heartbeat are needed to detect the revocation.
+        const before = built.roomService.getSnapshot(room.roomId);
+        const joined = await joinRoom("Next voice member");
+        newSocket = await built.app.injectWS(
+          `/api/v1/rooms/${room.roomId}/ws`,
+          {
+            headers: {
+              cookie: readCookie(joined, "__Host-sw_session"),
+              origin,
+              "sec-websocket-protocol": "simplewatch.v1",
+            },
+          },
+        );
+        expect(await closed).toBe(4001);
+        expect(oldMessages).not.toHaveBeenCalled();
+        expect(built.roomService.getSnapshot(room.roomId)).toMatchObject({
+          revision: before.revision,
+          mode: before.mode,
+          transport: before.transport,
+        });
+      } finally {
+        oldSocket.close();
+        newSocket?.close();
+      }
+    },
+  );
 
   it("does not transfer host authority when the host disconnects", async () => {
     const room = await createRoom();

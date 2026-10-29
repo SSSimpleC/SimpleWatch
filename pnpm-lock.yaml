@@ -6,8 +6,8 @@ settings:
 
 overrides:
   brace-expansion@5: 5.0.12
-  fast-uri@3: 3.1.8
-  fast-uri@4: 4.1.5
+  fast-uri@3: 3.1.9
+  fast-uri@4: 4.2.3
 
 importers:
   .:
@@ -89,7 +89,7 @@ importers:
         version: 5.12.7
       fastify-type-provider-zod:
         specifier: 7.0.0
-        version: 7.0.0(@fastify/swagger@9.8.1)(fastify@5.12.7)(openapi-types@12.1.3)(zod@4.1.13)
+        version: 7.0.0(@fastify/swagger@9.8.1)(fastify@5.12.7)(openapi-types@12.1.3)(zod@4.6.7)
       jose:
         specifier: 6.2.3
         version: 6.2.3
@@ -106,8 +106,8 @@ importers:
         specifier: 2.9.0
         version: 2.9.0
       zod:
-        specifier: 4.1.13
-        version: 4.1.13
+        specifier: 4.6.7
+        version: 4.6.7
     devDependencies:
       "@types/better-sqlite3":
         specifier: 7.6.13
@@ -141,8 +141,8 @@ importers:
         specifier: 5.101.2
         version: 5.101.2(react@19.2.7)
       livekit-client:
-        specifier: 2.20.1
-        version: 2.20.1(@types/dom-mediacapture-record@1.0.22)
+        specifier: 2.23.0
+        version: 2.23.0(@types/dom-mediacapture-record@1.0.22)
       react:
         specifier: 19.2.7
         version: 19.2.7
@@ -187,8 +187,8 @@ importers:
         specifier: 14.0.1
         version: 14.0.1
       zod:
-        specifier: 4.1.13
-        version: 4.1.13
+        specifier: 4.6.7
+        version: 4.6.7
     devDependencies:
       tsx:
         specifier: 4.21.0
@@ -197,20 +197,20 @@ importers:
   packages/config:
     dependencies:
       zod:
-        specifier: 4.1.13
-        version: 4.1.13
+        specifier: 4.6.7
+        version: 4.6.7
 
   packages/contracts:
     dependencies:
       zod:
-        specifier: 4.1.13
-        version: 4.1.13
+        specifier: 4.6.7
+        version: 4.6.7
 
   packages/media:
     dependencies:
       zod:
-        specifier: 4.1.13
-        version: 4.1.13
+        specifier: 4.6.7
+        version: 4.6.7
     devDependencies:
       tsx:
         specifier: 4.21.0
@@ -981,16 +981,16 @@ packages:
         integrity: sha512-EsshAucklmpuUAfkABPxJNhzj9v2sG7JuzFDL4ML1oJQSV14sqrpTYnsaOudMAw9yOaW53NU3QQTlUQoRs4czw==,
       }
 
-  "@livekit/protocol@1.46.6":
-    resolution:
-      {
-        integrity: sha512-upzlHP1vi/kZ/QqALZTFskQ0ifqc2f15RKucHYOsIHJsaXvEYanG75mAb7o+Yomfs4XhQ4BaRsdY+TFHXpaqrg==,
-      }
-
   "@livekit/protocol@1.50.4":
     resolution:
       {
         integrity: sha512-L1uggNQAqyY21smQY8AllyOYbcv9Me9TaxwuLytL1R8ck9nbYPmQLNwEDi3pOFGAMa5F8I2nUi2Jc59W5awxlA==,
+      }
+
+  "@livekit/protocol@1.52.1":
+    resolution:
+      {
+        integrity: sha512-X8DxKlNbzk6Lh+v630+mjdFHSotdAFwIyzxSRSUql2DbTxCnlpa7JsvFGc6Na3mXiex2OFh0iiQtWwOBP0rIYA==,
       }
 
   "@lukeed/ms@2.0.2":
@@ -2222,16 +2222,16 @@ packages:
         integrity: sha512-g6KuKWmFXc0fID8WWH0jit4g0AGBoJhCkJMb1RmbsSEUNvQ+ZC8D6CUZ+GtF8nMzSPXnhiePyyqqipzNNEnHjg==,
       }
 
-  fast-uri@3.1.8:
+  fast-uri@3.1.9:
     resolution:
       {
-        integrity: sha512-GZMtZUTNRpOVIECoXwLNZS5xUGE+mVNbTB8h/7Rwh2TFWcBQiPzTgyZi05BF9UMZKkLJv8XBRJTlU7zg8+ZfMg==,
+        integrity: sha512-hS/0Wt3Ya043oKXs0sIxrMpKQITXhMLIrVAKKXi4gozGC9v7YRWVnXIZzjNPTO02M9BdxLCWqK1yRXgNziVyJQ==,
       }
 
-  fast-uri@4.1.5:
+  fast-uri@4.2.3:
     resolution:
       {
-        integrity: sha512-vZeoMRB4epNr7QfdHxel7te/RcX16CxyXI07JCCTFWZA2s4v1azGNESRj+2EoaHSaWFL/Z3GmKT2jF6A202jLg==,
+        integrity: sha512-I1PXwP5eAhlNlcdpjt9CgB59op2ZvZfxw+BkqGFVIUOgNpCVTcTqp3HhTX7brxj5vsip+nSY4nTvff+eIA76hg==,
       }
 
   fastify-plugin@6.0.0:
@@ -2557,12 +2557,6 @@ packages:
         integrity: sha512-YYVDInQKFJfR/xa3ojUTl8c2KoTwiL1R5Wg9YCydwH0x0B9grbzlg5HC7mMjCtUJjbQ/YnGEZIhI5tCgfTb4Hw==,
       }
 
-  jose@6.2.5:
-    resolution:
-      {
-        integrity: sha512-2E5L2yRp03FnwreJLJX8/r7mHiZICCf8kG7fAsTWkSQTDAcc46NIZoQLKy+EJ8sPoJlxyS4OQR5H70LjIZZlIQ==,
-      }
-
   js-base64@3.9.2:
     resolution:
       {
@@ -2754,10 +2748,10 @@ packages:
       }
     engines: { node: ">= 12.0.0" }
 
-  livekit-client@2.20.1:
+  livekit-client@2.23.0:
     resolution:
       {
-        integrity: sha512-JxooxLFMkdwqTo4XLer+DCij6S3//Z/GuHSjqdhlj94Vtbh1Eayd7Lyq47qkIE86+xVJhqxIdYnq53lg4oPH9w==,
+        integrity: sha512-j9Kg86nJjBjNFUD+ukp2jwMCGa0k+YD5gU//RzAM+ZY3pbG631QCte7fQjwqWMmtBzhDJL9nKYuOLMv/9IbAxg==,
       }
     peerDependencies:
       "@types/dom-mediacapture-record": ^1
@@ -2855,6 +2849,13 @@ packages:
         integrity: sha512-4pfM1Ff0x50o0tQwb5ucw/RzNyD0/YJME6IVcStalZuMWxdt3sR3huStTtxz4PUmvZfRguvDejasvQ2kifR11g==,
       }
     engines: { node: 20 || >=22 }
+
+  machina@7.0.1:
+    resolution:
+      {
+        integrity: sha512-0Xkgs8NeBvO2hW6bjJT8ewLWrMfh1haMPstaghpASWjXkLjRhtDiaJG1Kb7mslaOHxZYxpH7PIjpmirRVYbMMA==,
+      }
+    engines: { node: ">=22.22" }
 
   magic-string@0.30.21:
     resolution:
@@ -3931,10 +3932,10 @@ packages:
       }
     engines: { node: ">=10" }
 
-  zod@4.1.13:
+  zod@4.6.7:
     resolution:
       {
-        integrity: sha512-AvvthqfqrAhNH9dnfmrfKzX5upOdjUVJYFqNSlkmGf64gRaTzlPwz99IHYnVs28qYAybvAlBV+H7pn0saFY4Ig==,
+        integrity: sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==,
       }
 
   zustand@5.0.14:
@@ -4207,7 +4208,7 @@ snapshots:
     dependencies:
       ajv: 8.20.0
       ajv-formats: 3.0.1(ajv@8.20.0)
-      fast-uri: 3.1.8
+      fast-uri: 3.1.9
 
   "@fastify/cookie@11.1.1":
     dependencies:
@@ -4311,11 +4312,11 @@ snapshots:
 
   "@livekit/mutex@1.1.1": {}
 
-  "@livekit/protocol@1.46.6":
+  "@livekit/protocol@1.50.4":
     dependencies:
       "@bufbuild/protobuf": 1.10.1
 
-  "@livekit/protocol@1.50.4":
+  "@livekit/protocol@1.52.1":
     dependencies:
       "@bufbuild/protobuf": 1.10.1
 
@@ -4700,7 +4701,7 @@ snapshots:
   ajv@8.20.0:
     dependencies:
       fast-deep-equal: 3.1.3
-      fast-uri: 3.1.8
+      fast-uri: 3.1.9
       json-schema-traverse: 1.0.0
       require-from-string: 2.0.2
 
@@ -5024,7 +5025,7 @@ snapshots:
       "@fastify/merge-json-schemas": 0.2.1
       ajv: 8.20.0
       ajv-formats: 3.0.1(ajv@8.20.0)
-      fast-uri: 4.1.5
+      fast-uri: 4.2.3
       json-schema-ref-resolver: 3.0.0
       rfdc: 1.4.1
 
@@ -5034,19 +5035,19 @@ snapshots:
     dependencies:
       fast-decode-uri-component: 1.0.1
 
-  fast-uri@3.1.8: {}
+  fast-uri@3.1.9: {}
 
-  fast-uri@4.1.5: {}
+  fast-uri@4.2.3: {}
 
   fastify-plugin@6.0.0: {}
 
-  fastify-type-provider-zod@7.0.0(@fastify/swagger@9.8.1)(fastify@5.12.7)(openapi-types@12.1.3)(zod@4.1.13):
+  fastify-type-provider-zod@7.0.0(@fastify/swagger@9.8.1)(fastify@5.12.7)(openapi-types@12.1.3)(zod@4.6.7):
     dependencies:
       "@fastify/error": 4.2.0
       "@fastify/swagger": 9.8.1
       fastify: 5.12.7
       openapi-types: 12.1.3
-      zod: 4.1.13
+      zod: 4.6.7
 
   fastify@5.12.7:
     dependencies:
@@ -5218,8 +5219,6 @@ snapshots:
 
   jose@6.2.3: {}
 
-  jose@6.2.5: {}
-
   js-base64@3.9.2: {}
 
   js-tokens@10.0.0: {}
@@ -5239,7 +5238,7 @@ snapshots:
   json-schema-resolver@3.0.0:
     dependencies:
       debug: 4.4.3
-      fast-uri: 3.1.8
+      fast-uri: 3.1.9
       rfdc: 1.4.1
     transitivePeerDependencies:
       - supports-color
@@ -5314,14 +5313,15 @@ snapshots:
       lightningcss-win32-arm64-msvc: 1.33.0
       lightningcss-win32-x64-msvc: 1.33.0
 
-  livekit-client@2.20.1(@types/dom-mediacapture-record@1.0.22):
+  livekit-client@2.23.0(@types/dom-mediacapture-record@1.0.22):
     dependencies:
       "@livekit/mutex": 1.1.1
-      "@livekit/protocol": 1.46.6
+      "@livekit/protocol": 1.52.1
       "@types/dom-mediacapture-record": 1.0.22
       events: 3.3.0
-      jose: 6.2.5
+      jose: 6.2.3
       loglevel: 1.9.2
+      machina: 7.0.1
       sdp-transform: 2.15.0
       tslib: 2.8.1
       typed-emitter: 2.1.0
@@ -5372,6 +5372,8 @@ snapshots:
   lru-cache@10.4.3: {}
 
   lru-cache@11.5.2: {}
+
+  machina@7.0.1: {}
 
   magic-string@0.30.21:
     dependencies:
@@ -5985,7 +5987,7 @@ snapshots:
 
   yocto-queue@0.1.0: {}
 
-  zod@4.1.13: {}
+  zod@4.6.7: {}
 
   zustand@5.0.14(@types/react@19.2.14)(react@19.2.7):
     optionalDependencies:

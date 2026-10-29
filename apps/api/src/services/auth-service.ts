@@ -13,6 +13,12 @@ import {
   verifyTokenHash,
 } from "../security.js";
 import { enqueueMediaSessionKicks } from "./media-session-outbox.js";
+import {
+  enqueueRtcRevocation,
+  getRtcLease,
+  rtcIdentity,
+  type RtcLease,
+} from "./rtc-identity.js";
 
 const IDLE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const ABSOLUTE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -198,6 +204,21 @@ export class AuthService {
       }
 
       const placeholders = prepared.map(() => "?").join(", ");
+      const rtcLeases = this.database
+        .prepare(
+          `SELECT l.*, m.room_id FROM room_device_leases l
+         JOIN room_members m ON m.member_id = l.member_id`,
+        )
+        .all() as Array<RtcLease & { room_id: string }>;
+      for (const lease of rtcLeases) {
+        enqueueRtcRevocation(this.database, {
+          roomId: lease.room_id,
+          memberId: lease.member_id,
+          identity: rtcIdentity(lease),
+          reason: "accounts-reprovisioned",
+          timestamp,
+        });
+      }
       this.database
         .prepare(
           `UPDATE accounts SET enabled = 0
@@ -283,6 +304,15 @@ export class AuthService {
         readonly room_id: string;
         readonly role: "host" | "member";
       }>;
+      const removedIdentities = new Map(
+        activeMembers.map((member) => {
+          const lease = getRtcLease(this.database, member.member_id);
+          return [
+            member.member_id,
+            lease ? rtcIdentity(lease) : member.member_id,
+          ];
+        }),
+      );
       if (passwordHash) {
         this.database
           .prepare(
@@ -342,24 +372,13 @@ export class AuthService {
           dedupeKey: `account-media-revoke:${uuidv7()}`,
           timestamp,
         });
-        this.database
-          .prepare(
-            `INSERT INTO service_outbox(
-              id, kind, dedupe_key, payload_json, state, attempts,
-              not_before, lease_until, last_error, created_at, completed_at
-            ) VALUES (?, 'rtc.remove-participant', ?, ?, 'pending', 0,
-              ?, NULL, NULL, ?, NULL)`,
-          )
-          .run(
-            uuidv7(),
-            `account-rtc-revoke:${uuidv7()}`,
-            JSON.stringify({
-              roomId: member.room_id,
-              memberId: member.member_id,
-            }),
-            timestamp,
-            timestamp,
-          );
+        enqueueRtcRevocation(this.database, {
+          roomId: member.room_id,
+          memberId: member.member_id,
+          identity: removedIdentities.get(member.member_id)!,
+          reason: "account-changed",
+          timestamp,
+        });
       }
     })();
     return row;
@@ -534,7 +553,7 @@ export class AuthService {
     csrfToken: string | undefined,
   ): void {
     if (!csrfToken || !verifyTokenHash(csrfToken, session.csrf_hash)) {
-      throw unauthorized("CSRF Token 无效");
+      throw new AppError(401, "CSRF_INVALID", "CSRF Token 无效");
     }
   }
 
@@ -552,6 +571,21 @@ export class AuthService {
   public logout(sessionToken: string): void {
     const tokenHash = hashToken(sessionToken);
     this.database.transaction(() => {
+      const leases = this.database
+        .prepare(
+          `SELECT l.*, m.room_id FROM room_device_leases l
+         JOIN room_members m ON m.member_id = l.member_id WHERE l.session_hash = ?`,
+        )
+        .all(tokenHash) as Array<RtcLease & { room_id: string }>;
+      for (const lease of leases) {
+        enqueueRtcRevocation(this.database, {
+          roomId: lease.room_id,
+          memberId: lease.member_id,
+          identity: rtcIdentity(lease),
+          reason: "account-logout",
+          timestamp: this.now(),
+        });
+      }
       this.database
         .prepare(
           "UPDATE account_sessions SET revoked_at = ? WHERE id_hash = ? AND revoked_at IS NULL",

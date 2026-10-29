@@ -210,7 +210,15 @@ function roomSnapshot(): RoomSnapshot {
       anchoredAtServerMs: 1_750_000_000_000,
     },
     hostMemberId: ids.host,
-    members: [{ id: ids.host, nickname: "Host", role: "host", online: true }],
+    members: [
+      {
+        id: ids.host,
+        accountId: null,
+        nickname: "Host",
+        role: "host",
+        online: true,
+      },
+    ],
     serverNowMs: 1_750_000_000_000,
   };
 }

@@ -17,7 +17,6 @@ import {
   selectStableClockEstimate,
   type ClockEstimate,
 } from "@simplewatch/sync";
-import type { Room as LiveKitRoom } from "livekit-client";
 import { v7 as uuidv7 } from "uuid";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { Link, useNavigate, useParams } from "react-router";
@@ -52,7 +51,16 @@ import {
 } from "../vod-diagnostics.js";
 export { classifyViewerHealth, type LiveViewerStats } from "../live-stats.js";
 import { averageBitrateMbps, isHighLoadVod } from "../media-performance.js";
-import { loadPreferences, savePreferences } from "../preferences.js";
+import {
+  programOutputVolume,
+  subscribeAudioPreferenceResets,
+  withParticipantVolume,
+} from "../preferences.js";
+import { useAudioPreferences } from "../use-audio-preferences.js";
+import { useRoomVoice } from "../use-room-voice.js";
+import type { VoiceBootstrap } from "../voice-credentials.js";
+import { VoicePanel } from "../components/VoicePanel.js";
+import { currentSessionGeneration } from "../session-generation.js";
 import {
   buildPlaybackProgress,
   buildProgramActivationCommand,
@@ -72,8 +80,15 @@ export function RoomPage() {
   const { roomId = "" } = useParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const { account, adminCsrf, roomCsrf, setRoomCsrf, memberId, setMemberId } =
-    useSession();
+  const {
+    account,
+    setAccount,
+    adminCsrf,
+    roomCsrf,
+    setRoomCsrf,
+    memberId,
+    setMemberId,
+  } = useSession();
   const [snapshot, setSnapshot] = useState<RoomSnapshot | null>(null);
   const [joined, setJoined] = useState(false);
   const [error, setError] = useState("");
@@ -89,8 +104,6 @@ export function RoomPage() {
   const socketRef = useRef<WebSocket | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const screenRef = useRef<HTMLElement | null>(null);
-  const voiceRoomRef = useRef<LiveKitRoom | null>(null);
-  const voiceTracksRef = useRef<HTMLDivElement | null>(null);
   const liveReaderRef = useRef<{
     close(): void;
     getPeerConnection(): RTCPeerConnection | null;
@@ -175,11 +188,31 @@ export function RoomPage() {
   >("idle");
   const [liveRetry, setLiveRetry] = useState(0);
   const [liveStats, setLiveStats] = useState<LiveViewerStats | null>(null);
-  const [voiceState, setVoiceState] = useState<
-    "idle" | "connecting" | "connected" | "error"
-  >("idle");
-  const [microphoneEnabled, setMicrophoneEnabled] = useState(false);
-  const [preferences, setPreferences] = useState(loadPreferences);
+  const { preferences, setPreferences } = useAudioPreferences(
+    account?.id ?? null,
+  );
+  const [transientVoiceVolumes, setTransientVoiceVolumes] = useState<
+    Record<string, number>
+  >({});
+  const [inputDevices, setInputDevices] = useState<
+    Array<{ deviceId: string; label: string }>
+  >([]);
+  const voice = useRoomVoice({
+    accountId: account?.id ?? null,
+    roomId,
+    memberId,
+    enabled: joined && snapshot?.status === "active",
+    members: snapshot?.members ?? [],
+    preferences,
+    transientVolumes: transientVoiceVolumes,
+    onBootstrap: (bootstrap) => {
+      setAccount(bootstrap.account);
+      setRoomCsrf(bootstrap.csrfToken);
+      acceptRoomSnapshot(bootstrap.snapshot);
+    },
+  });
+  const voiceState = voice.state.connection;
+  const anyoneSpeaking = voice.anyoneSpeaking;
   const [publishConfig, setPublishConfig] = useState<{
     url: string;
     token: string;
@@ -274,6 +307,7 @@ export function RoomPage() {
     playbackComparisonRef.current = "normal";
     setPlaybackComparison("normal");
     setJoined(false);
+    setTransientVoiceVolumes({});
     setSnapshot(null);
     setPlaybackReports(null);
     setReportCopyState("");
@@ -286,13 +320,21 @@ export function RoomPage() {
     };
   }, [roomId]);
 
+  useEffect(
+    () => subscribeAudioPreferenceResets(() => setTransientVoiceVolumes({})),
+    [],
+  );
+
   useEffect(() => {
     let active = true;
-    void api<{ snapshot: RoomSnapshot; memberId: string; csrfToken: string }>(
-      `/api/v1/rooms/${roomId}/bootstrap`,
-    )
+    const generation = currentSessionGeneration();
+    const abort = new AbortController();
+    void api<VoiceBootstrap>(`/api/v1/rooms/${roomId}/bootstrap`, {
+      signal: abort.signal,
+    })
       .then((bootstrap) => {
-        if (!active) return;
+        if (!active || generation !== currentSessionGeneration()) return;
+        setAccount(bootstrap.account);
         setRoomCsrf(bootstrap.csrfToken);
         setMemberId(bootstrap.memberId);
         acceptRoomSnapshot(bootstrap.snapshot);
@@ -300,58 +342,52 @@ export function RoomPage() {
         serverClockRef.current.calibrate(bootstrap.snapshot.serverNowMs);
         setJoined(true);
       })
-      .catch(() => setError("当前设备未持有观影席，请返回门厅重新接管"));
+      .catch(() => {
+        if (active && generation === currentSessionGeneration())
+          setError("当前设备未持有观影席，请返回门厅重新接管");
+      });
     return () => {
       active = false;
+      abort.abort();
     };
-  }, [roomId, setMemberId, setRoomCsrf]);
-
-  useEffect(() => savePreferences(preferences), [preferences]);
+  }, [roomId, setAccount, setMemberId, setRoomCsrf]);
 
   useEffect(() => {
     if (videoRef.current)
-      videoRef.current.volume = preferences.programVolume / 100;
-  }, [preferences.programVolume, snapshot?.mode]);
+      videoRef.current.volume = programOutputVolume(
+        preferences,
+        anyoneSpeaking,
+      );
+  }, [
+    preferences.programVolume,
+    preferences.autoDuck,
+    anyoneSpeaking,
+    snapshot?.mode,
+  ]);
 
   useEffect(() => {
-    voiceTracksRef.current
-      ?.querySelectorAll<HTMLAudioElement>("audio[data-participant-id]")
-      .forEach((element) => {
-        element.volume = remoteVolume(
-          element.dataset.participantId ?? "",
-          preferences,
-        );
-      });
-  }, [preferences]);
-
-  useEffect(() => {
-    if (!preferences.pushToTalk || voiceState !== "connected") return;
-    const isTyping = (target: EventTarget | null) =>
-      target instanceof HTMLInputElement ||
-      target instanceof HTMLTextAreaElement ||
-      target instanceof HTMLSelectElement;
-    const down = (event: KeyboardEvent) => {
-      if (event.code === "Space" && !event.repeat && !isTyping(event.target))
-        void voiceRoomRef.current?.localParticipant
-          .setMicrophoneEnabled(true)
-          .then(() => setMicrophoneEnabled(true));
-    };
-    const up = (event: KeyboardEvent) => {
-      if (event.code === "Space" && !isTyping(event.target))
-        void voiceRoomRef.current?.localParticipant
-          .setMicrophoneEnabled(false)
-          .then(() => setMicrophoneEnabled(false));
-    };
-    void voiceRoomRef.current?.localParticipant
-      .setMicrophoneEnabled(false)
-      .then(() => setMicrophoneEnabled(false));
-    addEventListener("keydown", down);
-    addEventListener("keyup", up);
+    let active = true;
+    const refresh = () =>
+      void navigator.mediaDevices
+        ?.enumerateDevices()
+        .then((devices) => {
+          if (active)
+            setInputDevices(
+              devices
+                .filter((device) => device.kind === "audioinput")
+                .map(({ deviceId, label }) => ({ deviceId, label })),
+            );
+        })
+        .catch(() => {
+          if (active) setInputDevices([]);
+        });
+    refresh();
+    navigator.mediaDevices?.addEventListener("devicechange", refresh);
     return () => {
-      removeEventListener("keydown", down);
-      removeEventListener("keyup", up);
+      active = false;
+      navigator.mediaDevices?.removeEventListener("devicechange", refresh);
     };
-  }, [preferences.pushToTalk, voiceState]);
+  }, [voice.state.microphone]);
 
   useEffect(() => {
     sessionStorage.setItem(
@@ -471,9 +507,7 @@ export function RoomPage() {
         refreshRequestRef.current = null;
         if ([4001, 4003, 4010].includes(event.code)) {
           closeLiveProgram();
-          void voiceRoomRef.current?.disconnect().catch(() => undefined);
-          voiceRoomRef.current = null;
-          setVoiceState("idle");
+          void voice.disconnect();
           if (event.code === 4010 && closingRoomRef.current) return;
           setError(
             event.code === 4003
@@ -777,8 +811,6 @@ export function RoomPage() {
 
   useEffect(
     () => () => {
-      void voiceRoomRef.current?.disconnect().catch(() => undefined);
-      voiceRoomRef.current = null;
       closeLiveProgram();
     },
     [],
@@ -1365,73 +1397,6 @@ export function RoomPage() {
     if (event !== "periodic") writeProgramDiagnostics(video, event);
   }
 
-  async function enableVoice() {
-    if (!roomCsrf || voiceState === "connecting") return;
-    setVoiceState("connecting");
-    setError("");
-    try {
-      // connect() and microphone permission remain in this click call chain so
-      // browsers may resume audio playback without a separate hidden gesture.
-      const credential = await api<{
-        url: string;
-        token: string;
-      }>(`/api/v1/rooms/${roomId}/credentials`, {
-        method: "POST",
-        headers: { "x-csrf-token": roomCsrf },
-        body: JSON.stringify({ purpose: "voice" }),
-      });
-      const { Room, RoomEvent, Track } = await import("livekit-client");
-      const voiceRoom = new Room({ adaptiveStream: true, dynacast: true });
-      voiceRoom.on(
-        RoomEvent.TrackSubscribed,
-        (track, _publication, participant) => {
-          if (track.kind !== Track.Kind.Audio) return;
-          const element = track.attach() as HTMLAudioElement;
-          element.dataset.simplewatchVoice = "remote";
-          element.dataset.participantId = participant.identity;
-          element.volume = remoteVolume(participant.identity, preferences);
-          voiceTracksRef.current?.append(element);
-        },
-      );
-      voiceRoom.on(RoomEvent.TrackUnsubscribed, (track) => track.detach());
-      voiceRoom.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
-        const video = videoRef.current;
-        if (video && preferences.autoDuck)
-          video.volume =
-            (preferences.programVolume / 100) * (speakers.length ? 0.4 : 1);
-      });
-      voiceRoom.on(RoomEvent.Disconnected, () => {
-        setVoiceState("idle");
-        setMicrophoneEnabled(false);
-      });
-      await voiceRoom.connect(credential.url, credential.token, {
-        autoSubscribe: true,
-      });
-      await voiceRoom.startAudio();
-      voiceRoomRef.current = voiceRoom;
-      try {
-        await voiceRoom.localParticipant.setMicrophoneEnabled(
-          true,
-          preferences.inputDeviceId
-            ? { deviceId: preferences.inputDeviceId }
-            : undefined,
-        );
-        setMicrophoneEnabled(true);
-      } catch {
-        setMicrophoneEnabled(false);
-        setError("麦克风未授权，已使用只听模式；节目播放不受影响");
-      }
-      setVoiceState("connected");
-    } catch (voiceError) {
-      void voiceRoomRef.current?.disconnect().catch(() => undefined);
-      voiceRoomRef.current = null;
-      setVoiceState("error");
-      setError(
-        voiceError instanceof Error ? voiceError.message : "语音连接失败",
-      );
-    }
-  }
-
   async function enableLiveProgram() {
     if (
       !roomCsrf ||
@@ -1666,13 +1631,16 @@ export function RoomPage() {
   }
 
   async function enableProgramSound() {
+    // Unlock the independent voice graph within the same explicit gesture.
+    // This never opens the microphone or changes the VOD timing controller.
+    voice.enableAudio();
     programEnabledRef.current = true;
     setProgramEnabled(true);
     setError("");
     const video = videoRef.current;
     if (video) {
       video.muted = false;
-      video.volume = preferences.programVolume / 100;
+      video.volume = programOutputVolume(preferences, anyoneSpeaking);
       if (
         latestSnapshotRef.current?.mode === "vod" &&
         playbackComparisonRef.current === "native"
@@ -1930,14 +1898,6 @@ export function RoomPage() {
     }
   }
 
-  async function toggleMicrophone() {
-    const room = voiceRoomRef.current;
-    if (!room) return;
-    const next = !microphoneEnabled;
-    await room.localParticipant.setMicrophoneEnabled(next);
-    setMicrophoneEnabled(next);
-  }
-
   async function removeMember(targetMemberId: string) {
     if (!roomCsrf || !confirm("确认移出这位成员？对方将立即断开。")) return;
     const result = await api<RoomSnapshot>(
@@ -1990,7 +1950,7 @@ export function RoomPage() {
       headers: { "x-csrf-token": roomCsrf },
     });
     closeLiveProgram();
-    await voiceRoomRef.current?.disconnect();
+    await voice.disconnect();
     setMemberId(null);
     void navigate("/", { replace: true });
   }
@@ -2004,7 +1964,7 @@ export function RoomPage() {
         headers: { "x-csrf-token": roomCsrf },
       });
       closeLiveProgram();
-      await voiceRoomRef.current?.disconnect();
+      await voice.disconnect();
       void navigate("/admin", { replace: true });
     } catch (closeError) {
       closingRoomRef.current = false;
@@ -2030,18 +1990,17 @@ export function RoomPage() {
   }
 
   function setParticipantVolume(id: string, value: number) {
-    const next = {
-      ...preferences,
-      participantVolumes: { ...preferences.participantVolumes, [id]: value },
-    };
-    setPreferences(next);
-    voiceTracksRef.current
-      ?.querySelectorAll<HTMLAudioElement>(
-        `audio[data-participant-id="${CSS.escape(id)}"]`,
-      )
-      .forEach((element) => {
-        element.volume = remoteVolume(id, next);
-      });
+    const member = snapshot?.members.find((candidate) => candidate.id === id);
+    if (!member || member.id === memberId) return;
+    if (member.accountId)
+      setPreferences(
+        withParticipantVolume(preferences, member.accountId, value),
+      );
+    else
+      setTransientVoiceVolumes((previous) => ({
+        ...previous,
+        [`member:${id}`]: value,
+      }));
   }
 
   if (!joined)
@@ -2591,22 +2550,6 @@ export function RoomPage() {
                 }
               />
             </label>
-            <label>
-              通话音量{" "}
-              <input
-                aria-label="通话音量"
-                type="range"
-                min="0"
-                max="100"
-                value={preferences.callVolume}
-                onChange={(event) =>
-                  setPreferences({
-                    ...preferences,
-                    callVolume: Number(event.target.value),
-                  })
-                }
-              />
-            </label>
           </div>
           {isHost && (
             <HostProgramQueue
@@ -2739,21 +2682,6 @@ export function RoomPage() {
                   <small>{member.role === "host" ? "放映主持" : "观众"}</small>
                 </span>
                 <i className={member.online ? "present" : ""} />
-                {voiceState === "connected" && member.id !== memberId && (
-                  <input
-                    aria-label={`${member.nickname} 通话音量`}
-                    type="range"
-                    min="0"
-                    max="100"
-                    value={preferences.participantVolumes[member.id] ?? 100}
-                    onChange={(event) =>
-                      setParticipantVolume(
-                        member.id,
-                        Number(event.target.value),
-                      )
-                    }
-                  />
-                )}
                 {isHost && member.id !== memberId && (
                   <span className="member-actions">
                     <button onClick={() => void removeMember(member.id)}>
@@ -2764,33 +2692,84 @@ export function RoomPage() {
               </li>
             ))}
           </ol>
-          <div className="voice-card">
-            <span>VOICE CHANNEL</span>
-            <strong>
-              {voiceState === "connected"
-                ? microphoneEnabled
-                  ? "麦克风已接通"
-                  : "只听模式"
-                : voiceState === "connecting"
-                  ? "正在建立安全通道"
-                  : voiceState === "error"
-                    ? "语音暂不可用"
-                    : "尚未进入语音席"}
-            </strong>
-            {voiceState === "connected" ? (
-              <button onClick={() => void toggleMicrophone()}>
-                {microphoneEnabled ? "静音" : "打开麦克风"}
-              </button>
-            ) : (
-              <button
-                disabled={voiceState === "connecting"}
-                onClick={() => void enableVoice()}
-              >
-                加入语音通话
-              </button>
-            )}
-            <div ref={voiceTracksRef} hidden aria-hidden="true" />
-          </div>
+          <VoicePanel
+            preferences={preferences}
+            onPreferencesChange={setPreferences}
+            selfName={account?.username ?? "自己"}
+            participants={(snapshot?.members ?? [])
+              .filter((member) => member.id !== memberId)
+              .map((member) => {
+                const participant = voice.state.participants.find(
+                  (value) => value.memberId === member.id,
+                );
+                return {
+                  ...member,
+                  volume: member.accountId
+                    ? (preferences.participantVolumes[member.accountId] ?? 100)
+                    : (transientVoiceVolumes[`member:${member.id}`] ?? 100),
+                  connected: participant?.connected ?? false,
+                  speaking: participant?.speaking ?? false,
+                  muted: participant?.muted ?? true,
+                  level: participant?.level ?? 0,
+                };
+              })}
+            connection={voiceState === "closed" ? "idle" : voiceState}
+            output={voice.state.output}
+            microphone={voice.state.microphone}
+            inputDevices={inputDevices}
+            effectiveInputDeviceId={voice.state.activeInputDeviceId}
+            microphoneLevel={voice.state.inputLevel}
+            microphoneOverloaded={voice.state.inputOverloaded}
+            outputOverloaded={voice.state.outputOverloaded}
+            channels={
+              voice.state.captureChannelsConfirmed
+                ? voice.state.captureChannels
+                : null
+            }
+            error={voice.state.error}
+            microphoneError={voice.state.microphoneError}
+            diagnostics={
+              voice.diagnostics
+                ? [
+                    { label: "编码目标", value: "Opus 96 kbps" },
+                    {
+                      label: "实际发送",
+                      value: `${voice.diagnostics.sendBitrateKbps?.toFixed(1) ?? "—"} kbps`,
+                    },
+                    {
+                      label: "实际接收",
+                      value: `${voice.diagnostics.receiveBitrateKbps?.toFixed(1) ?? "—"} kbps`,
+                    },
+                    {
+                      label: "往返",
+                      value: `${voice.diagnostics.roundTripTimeMs?.toFixed(0) ?? "—"} ms`,
+                    },
+                    {
+                      label: "丢包",
+                      value: `${voice.diagnostics.packetLossPercent?.toFixed(1) ?? "—"}%`,
+                    },
+                    {
+                      label: "抖动",
+                      value: `${voice.diagnostics.jitterMs?.toFixed(1) ?? "—"} ms`,
+                    },
+                    {
+                      label: "接收缓冲",
+                      value: `${voice.diagnostics.jitterBufferMs?.toFixed(1) ?? "—"} ms`,
+                    },
+                    {
+                      label: "音频引擎",
+                      value: voice.diagnostics.contextState,
+                    },
+                  ]
+                : []
+            }
+            onEnableAudio={voice.enableAudio}
+            onToggleMicrophone={voice.toggleMicrophone}
+            onRetry={voice.retry}
+            onTakeover={voice.takeOverTab}
+            onPushToTalk={voice.pressToTalk}
+            onParticipantVolumeChange={setParticipantVolume}
+          />
           {error && <output className="room-error">{error}</output>}
         </aside>
       </div>
@@ -2808,16 +2787,6 @@ export function RoomPage() {
         <span>同步锚点 {snapshot?.transport?.anchoredAtServerMs ?? "—"}</span>
       </footer>
     </main>
-  );
-}
-
-function remoteVolume(
-  participantId: string,
-  preferences: ReturnType<typeof loadPreferences>,
-) {
-  return (
-    (preferences.callVolume / 100) *
-    ((preferences.participantVolumes[participantId] ?? 100) / 100)
   );
 }
 

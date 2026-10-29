@@ -14,6 +14,9 @@ const credentialResponseSchema = z.object({
   url: z.url(),
   token: z.string().min(1),
   path: z.string().optional(),
+  identity: z.string().optional(),
+  memberId: z.string().uuid().optional(),
+  accountId: z.string().uuid().optional(),
   expiresAt: z.iso.datetime(),
 });
 
@@ -83,12 +86,11 @@ export function registerTransportRoutes(
       ) {
         const roomId = event.room.name.slice("voice:".length);
         const parsed = z.string().uuid().safeParse(roomId);
-        const member = z.string().uuid().safeParse(event.participant.identity);
-        if (parsed.success && member.success) {
+        if (parsed.success) {
           outboxService.enqueueIfRtcMemberInactive(
             parsed.data,
-            member.data,
-            `webhook:${event.id || `${roomId}:${member.data}:${event.createdAt}`}`,
+            event.participant.identity,
+            `webhook:${event.id || `${roomId}:${event.participant.identity}:${event.createdAt}`}`,
           );
         }
       }

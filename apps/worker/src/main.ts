@@ -93,15 +93,19 @@ while (true) {
   if (Date.now() >= nextRtcReconciliationAt) {
     nextRtcReconciliationAt = Date.now() + 15_000;
     try {
-      const response = await callApi(
-        "/api/v1/internal/rtc/reconciliation-snapshot",
-        { method: "GET" },
-      );
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const snapshot = (await response.json()) as {
-        rooms: Array<{ roomId: string; activeMemberIds: string[] }>;
-      };
-      await reconcileRtcParticipants(snapshot.rooms, livekit);
+      await reconcileRtcParticipants(livekit, async (roomId, identities) => {
+        const response = await callApi(
+          "/api/v1/internal/rtc/validate-participants",
+          {
+            method: "POST",
+            body: JSON.stringify({ roomId, identities }),
+          },
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return z
+          .object({ invalidIdentities: z.array(z.string()) })
+          .parse(await response.json()).invalidIdentities;
+      });
     } catch (error) {
       console.error("RTC 对账暂不可用", error);
     }

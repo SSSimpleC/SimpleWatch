@@ -314,7 +314,7 @@ test("page-local comparisons preserve authenticated media and can return to norm
       .click();
     await expect
       .poll(async () => (await latestFrame(viewer.page))?.mediaTime ?? -1)
-      .toBeGreaterThan(0.3);
+      .toBeGreaterThan(5);
     await seekWithKeyboard(host.page, 35);
     await expect
       .poll(async () => (await latestFrame(host.page))?.mediaTime ?? -1)
@@ -411,7 +411,10 @@ test("in-room reports and update notices preserve continuous playback and exact 
   const host = await createClient(browser);
   const viewer = await createClient(browser);
   let browserVersionRequests = 0;
-  const versionPath = resolve("dist/web/player-version.json");
+  const versionPath = resolve(
+    process.env.PLAYER_GATE_WEB_ROOT ?? "dist/web",
+    "player-version.json",
+  );
   const originalVersion = await readFile(versionPath);
   let versionReplaced = false;
   viewer.page.on("request", (request) => {
@@ -439,9 +442,17 @@ test("in-room reports and update notices preserve continuous playback and exact 
     await host.page
       .getByRole("button", { name: "▶ 播放", exact: true })
       .click();
+    // A historical first frame is not evidence that presentation is still
+    // advancing when we copy the report. Establish a fresh steady-state frame
+    // after startup, while retaining the strict playing/continuity assertions.
     await expect
-      .poll(async () => (await latestFrame(viewer.page))?.mediaTime ?? -1)
-      .toBeGreaterThan(1);
+      .poll(async () => {
+        const frame = await latestFrame(viewer.page);
+        return Boolean(
+          frame && frame.mediaTime > 3 && Date.now() - frame.observedAtMs < 250,
+        );
+      })
+      .toBe(true);
     await expect(
       viewer.page.getByRole("status").filter({ hasText: /^正在播放/ }),
     ).toBeVisible();
@@ -1247,8 +1258,30 @@ async function attachEvidence(
           value.start(index),
           value.end(index),
         ]);
+      const rectangle = video?.getBoundingClientRect();
+      const style = video ? getComputedStyle(video) : null;
       return {
         visibility: document.visibilityState,
+        layout: {
+          focused: document.hasFocus(),
+          viewport: [window.innerWidth, window.innerHeight],
+          scroll: [window.scrollX, window.scrollY],
+          videoRectangle: rectangle
+            ? {
+                x: rectangle.x,
+                y: rectangle.y,
+                width: rectangle.width,
+                height: rectangle.height,
+                top: rectangle.top,
+                right: rectangle.right,
+                bottom: rectangle.bottom,
+                left: rectangle.left,
+              }
+            : null,
+          videoDisplay: style?.display ?? null,
+          videoVisibility: style?.visibility ?? null,
+          videoOpacity: style?.opacity ?? null,
+        },
         video: video
           ? {
               currentTime: video.currentTime,

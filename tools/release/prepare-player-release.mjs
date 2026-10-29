@@ -61,7 +61,7 @@ for (const file of rootFiles) {
 const sourceSha256 = createHash("sha256")
   .update(entries.map(({ file, sha256 }) => `${sha256}  ${file}\n`).join(""))
   .digest("hex");
-const releaseTag = `20261023-player-${sourceSha256.slice(0, 12)}`;
+const releaseTag = `20261029-voice-${sourceSha256.slice(0, 12)}`;
 const releases = join(repository, "artifacts/releases");
 mkdirSync(releases, { recursive: true });
 const output = mkdtempSync(join(releases, `${releaseTag}-`));

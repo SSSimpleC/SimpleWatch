@@ -8,6 +8,7 @@ import {
   LEGACY_MEDIA_SESSION_KICK_LIMIT,
   uniqueMediaSessionIds,
 } from "./media-session-outbox.js";
+import { isRtcIdentityActive, parseRtcIdentity } from "./rtc-identity.js";
 
 export type OutboxKind = "rtc.remove-participant" | "mediamtx.kick-sessions";
 export const MAX_OUTBOX_ATTEMPTS = 5;
@@ -165,6 +166,7 @@ export class OutboxService {
     roomId: string,
     memberId: string,
     dedupeKey = uuidv7(),
+    rtcIdentity?: string,
   ): void {
     const timestamp = this.now();
     this.database
@@ -179,7 +181,11 @@ export class OutboxService {
       .run(
         uuidv7(),
         `rtc-remove:${dedupeKey}`,
-        JSON.stringify({ roomId, memberId }),
+        JSON.stringify({
+          roomId,
+          memberId,
+          ...(rtcIdentity ? { rtcIdentity } : {}),
+        }),
         timestamp,
         timestamp,
       );
@@ -187,19 +193,24 @@ export class OutboxService {
 
   public enqueueIfRtcMemberInactive(
     roomId: string,
-    memberId: string,
+    identity: string,
     dedupeKey: string,
   ): boolean {
-    const active = this.database
-      .prepare(
-        `SELECT 1 FROM rooms r JOIN room_members m ON m.room_id = r.id
-         WHERE r.id = ? AND m.member_id = ? AND r.status = 'active'
-           AND m.left_at IS NULL AND m.kicked_at IS NULL`,
-      )
-      .get(roomId, memberId);
-    if (active) return false;
-    this.enqueueRemoveParticipant(roomId, memberId, dedupeKey);
+    if (isRtcIdentityActive(this.database, roomId, identity, this.now()))
+      return false;
+    const memberId = parseRtcIdentity(identity)?.memberId ?? identity;
+    this.enqueueRemoveParticipant(roomId, memberId, dedupeKey, identity);
     return true;
+  }
+
+  public invalidRtcIdentities(
+    roomId: string,
+    identities: readonly string[],
+  ): string[] {
+    const now = this.now();
+    return [...new Set(identities)].filter(
+      (identity) => !isRtcIdentityActive(this.database, roomId, identity, now),
+    );
   }
 
   public getRtcReconciliationSnapshot(): Array<{

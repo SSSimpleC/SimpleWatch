@@ -12,8 +12,10 @@
     "playwright.fullstack.config.ts",
     "playwright.focused.config.ts",
     "playwright.player.config.ts",
+    "playwright.voice.config.ts",
     "playwright.server.config.ts",
     "vitest.coverage.config.ts",
+    "vitest.config.ts",
     "tests/**/*.ts"
   ]
 }

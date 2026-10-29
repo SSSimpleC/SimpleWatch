@@ -7,6 +7,7 @@ export interface LiveKitRoomAdmin {
     options?: { revokeTokenTs?: bigint },
   ): Promise<void>;
   listParticipants?(room: string): Promise<Array<{ identity: string }>>;
+  listRooms?(): Promise<Array<{ name: string }>>;
 }
 
 export interface OutboxItem {
@@ -24,7 +25,8 @@ interface OutboxDependencies {
 
 const rtcPayloadSchema = z.object({
   roomId: z.string().uuid(),
-  memberId: z.string().uuid(),
+  memberId: z.string().min(1).max(512),
+  rtcIdentity: z.string().min(1).max(512).optional(),
 });
 
 const mediaPayloadSchema = z.object({
@@ -44,7 +46,7 @@ export async function processOutboxItem(
     try {
       await dependencies.livekit.removeParticipant(
         `voice:${payload.roomId}`,
-        payload.memberId,
+        payload.rtcIdentity ?? payload.memberId,
       );
     } catch (error) {
       // LiveKit 对已经离开的成员返回 not found；撤销操作应当幂等，
@@ -96,19 +98,45 @@ export async function processOutboxItem(
 }
 
 export async function reconcileRtcParticipants(
-  rooms: Array<{ roomId: string; activeMemberIds: string[] }>,
-  livekit: Required<Pick<LiveKitRoomAdmin, "listParticipants">> &
+  livekit: Required<Pick<LiveKitRoomAdmin, "listParticipants" | "listRooms">> &
     Pick<LiveKitRoomAdmin, "removeParticipant">,
+  validate: (roomId: string, identities: string[]) => Promise<string[]>,
 ): Promise<number> {
   let removed = 0;
+  const rooms = await livekit.listRooms();
   for (const room of rooms) {
-    const active = new Set(room.activeMemberIds);
-    const roomName = `voice:${room.roomId}`;
+    if (!room.name.startsWith("voice:")) continue;
+    const roomName = room.name;
+    const parsedRoomId = z
+      .string()
+      .uuid()
+      .safeParse(roomName.slice("voice:".length));
     const participants = await livekit.listParticipants(roomName);
-    for (const participant of participants) {
-      if (!active.has(participant.identity)) {
-        await livekit.removeParticipant(roomName, participant.identity);
-        removed += 1;
+    const identities = [
+      ...new Set(participants.map((participant) => participant.identity)),
+    ];
+    for (let index = 0; index < identities.length; index += 100) {
+      const batch = identities.slice(index, index + 100);
+      // Validate AFTER enumeration, never kick a newly acquired lease using an old snapshot.
+      const invalid = parsedRoomId.success
+        ? await validate(parsedRoomId.data, batch)
+        : batch;
+      for (const identity of invalid) {
+        if (!batch.includes(identity))
+          throw new Error("RTC 校验返回未请求的 identity");
+        try {
+          await livekit.removeParticipant(roomName, identity);
+          removed += 1;
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : String(error);
+          if (
+            !/participant.+(?:does not exist|not found)|not found/i.test(
+              message,
+            )
+          )
+            throw error;
+        }
       }
     }
   }

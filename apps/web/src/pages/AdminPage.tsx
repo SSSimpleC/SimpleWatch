@@ -17,6 +17,8 @@ import {
   type MediaItem,
 } from "../api.js";
 import { useSession } from "../store.js";
+import { logoutAccount } from "../session-lifecycle.js";
+import { currentSessionGeneration } from "../session-generation.js";
 import {
   AdminEdgeView,
   adminViewFromSearch,
@@ -63,8 +65,12 @@ export function AdminPage() {
       return;
     }
     if (account?.role === "host" && adminCsrf) return;
-    void api<AccountSession>("/api/v1/auth/session")
+    let active = true;
+    const generation = currentSessionGeneration();
+    const abort = new AbortController();
+    void api<AccountSession>("/api/v1/auth/session", { signal: abort.signal })
       .then((session) => {
+        if (!active || generation !== currentSessionGeneration()) return;
         if (session.account.role !== "host") {
           purgeAdminQueries(queryClient);
           void navigate("/", { replace: true });
@@ -74,9 +80,14 @@ export function AdminPage() {
         setAdminCsrf(session.csrfToken);
       })
       .catch(() => {
+        if (!active || generation !== currentSessionGeneration()) return;
         purgeAdminQueries(queryClient);
         void navigate("/", { replace: true });
       });
+    return () => {
+      active = false;
+      abort.abort();
+    };
   }, [
     account?.role,
     adminCsrf,
@@ -381,15 +392,16 @@ export function AdminPage() {
   }
 
   async function logout() {
-    if (!adminCsrf) return;
-    await api<void>("/api/v1/auth/logout", {
-      method: "POST",
-      headers: { "x-csrf-token": adminCsrf },
-      body: "{}",
-    });
-    purgeAdminQueries(queryClient);
-    useSession.getState().clear();
-    void navigate("/", { replace: true });
+    try {
+      await logoutAccount(queryClient);
+      void navigate("/", { replace: true });
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? `退出尚未完成：${error.message}`
+          : "退出尚未完成，请重试",
+      );
+    }
   }
 
   if (!isAdmin) {
